@@ -1,56 +1,101 @@
 # NanoClaw deployment on myia-ai-01
-# Docker Compose for the NanoClaw assistant connected to RooSync cluster
+# Two experiments with distinct security profiles (see issue #921)
+#
+# Exp. 1 (cluster): Internal network only, RooSync + sk-agent MCPs, no web
+# Exp. 2 (explorer): Web access (filtered), Playwright, no internal MCPs
 #
 # Usage:
 #   cd deploy && docker compose up -d
-#   docker compose logs -f nanoclaw
+#   docker compose logs -f nanoclaw-cluster nanoclaw-explorer
 #   docker compose down
 
+# ─── Shared config ───────────────────────────────────────────────
+x-common: &common
+  build:
+    context: ..
+    dockerfile: container/Dockerfile
+  restart: unless-stopped
+  env_file:
+    - .env
+  environment: &common-env
+    NODE_ENV: production
+    ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY}
+    ANTHROPIC_BASE_URL: ${ANTHROPIC_BASE_URL:-https://api.anthropic.com}
+    AGENT_BROWSER_EXECUTABLE_PATH: /usr/bin/chromium
+  deploy:
+    resources:
+      limits:
+        memory: 4G
+        cpus: "2.0"
+      reservations:
+        memory: 1G
+        cpus: "0.5"
+
+# ─── Services ────────────────────────────────────────────────────
 services:
-  nanoclaw:
-    build:
-      context: ..
-      dockerfile: container/Dockerfile
-    container_name: nanoclaw
-    restart: unless-stopped
 
-    # Environment
-    env_file:
-      - .env
+  # ── Exp. 1: Cluster Manager ──────────────────────────────────
+  # Manages the 5 executor machines from ai-01.
+  # Internal network ONLY — no web access.
+  # MCPs: roo-state-manager, sk-agent, desktop-control (future)
+  nanoclaw-cluster:
+    <<: *common
+    container_name: nanoclaw-cluster
     environment:
-      - NODE_ENV=production
-      - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY}
-      # Use z.ai endpoint for Claude API (local LLM proxy)
-      - ANTHROPIC_BASE_URL=${ANTHROPIC_BASE_URL:-https://api.anthropic.com}
-      # Container isolation
-      - AGENT_BROWSER_EXECUTABLE_PATH=/usr/bin/chromium
-
-    # Volumes
+      <<: *common-env
+      NANOCLAW_ROLE: cluster-manager
     volumes:
-      # Group workspaces (persistent)
-      - nanoclaw-groups:/workspace/group
-      # Global memory
-      - nanoclaw-global:/workspace/global
+      # Group workspaces (persistent, isolated per experiment)
+      - cluster-groups:/workspace/group
+      # Global memory (shared knowledge base)
+      - cluster-global:/workspace/global
       # IPC for task processing
-      - nanoclaw-ipc:/workspace/ipc
-      # RooSync shared state (read-only bridge)
+      - cluster-ipc:/workspace/ipc
+      # RooSync shared state (read-only bridge to coordination layer)
       - ${ROOSYNC_SHARED_PATH:-/mnt/g/.shared-state}:/workspace/extra/roosync:ro
-
-    # Networking
     ports:
-      - "3100:3100"  # Health check / API (if enabled)
+      - "3101:3100"  # Health check / API
+    networks:
+      - internal
 
-    # Resource limits
-    deploy:
-      resources:
-        limits:
-          memory: 4G
-          cpus: "2.0"
-        reservations:
-          memory: 1G
-          cpus: "0.5"
+  # ── Exp. 2: Web Explorer ─────────────────────────────────────
+  # Explores the web, researches, synthesizes information.
+  # Web access (filtered) — no internal system access.
+  # MCPs: sk-agent, playwright
+  nanoclaw-explorer:
+    <<: *common
+    container_name: nanoclaw-explorer
+    environment:
+      <<: *common-env
+      NANOCLAW_ROLE: web-explorer
+    volumes:
+      # Group workspaces (persistent, isolated per experiment)
+      - explorer-groups:/workspace/group
+      # Global memory
+      - explorer-global:/workspace/global
+      # IPC for task processing
+      - explorer-ipc:/workspace/ipc
+      # NO RooSync mount — explorer has no cluster access
+    ports:
+      - "3102:3100"  # Health check / API
+    networks:
+      - web
 
+# ─── Networks ────────────────────────────────────────────────────
+networks:
+  # Internal: access to vLLM, Qdrant, roo-state-manager — NO internet
+  internal:
+    driver: bridge
+    internal: true  # No outbound internet access
+  # Web: internet access (optionally filtered via proxy) — NO internal services
+  web:
+    driver: bridge
+
+# ─── Volumes ─────────────────────────────────────────────────────
 volumes:
-  nanoclaw-groups:
-  nanoclaw-global:
-  nanoclaw-ipc:
+  cluster-groups:
+  cluster-global:
+  cluster-ipc:
+  explorer-groups:
+  explorer-global:
+  explorer-ipc:
