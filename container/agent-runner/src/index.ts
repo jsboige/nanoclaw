@@ -471,6 +471,7 @@ async function runQuery(
             NANOCLAW_IS_MAIN: containerInput.isMain ? '1' : '0',
           },
         },
+        ...buildExtraMcpServers(),
       },
       hooks: {
         PreCompact: [
@@ -588,6 +589,49 @@ async function runScript(script: string): Promise<ScriptResult | null> {
 }
 
 /**
+ * Build extra MCP servers based on what's available in the container.
+ * roo-state-manager: mounted at /workspace/extra/roo-state-manager/ by container-runner
+ */
+function buildExtraMcpServers(): Record<string, { command: string; args: string[]; env?: Record<string, string> }> {
+  const servers: Record<string, { command: string; args: string[]; env?: Record<string, string> }> = {};
+
+  // roo-state-manager — cluster visibility (dashboards, conversations, search)
+  const rsmPath = '/workspace/extra/roo-state-manager/build/index.js';
+  if (fs.existsSync(rsmPath)) {
+    log('MCP: roo-state-manager available — adding to servers');
+    const rsmDir = '/workspace/extra/roo-state-manager';
+    servers['roo-state-manager'] = {
+      command: 'sh',
+      args: ['-c', `cd ${rsmDir} && node build/index.js`],
+      env: {
+        // Pass through env vars set by container-runner
+        QDRANT_URL: process.env.QDRANT_URL || '',
+        QDRANT_API_KEY: process.env.QDRANT_API_KEY || '',
+        QDRANT_COLLECTION_NAME: process.env.QDRANT_COLLECTION_NAME || 'roo_tasks_semantic_index',
+        EMBEDDING_API_BASE_URL: process.env.EMBEDDING_API_BASE_URL || '',
+        EMBEDDING_API_KEY: process.env.EMBEDDING_API_KEY || '',
+        EMBEDDING_MODEL: process.env.EMBEDDING_MODEL || 'qwen3-4b-awq-embedding',
+        EMBEDDING_DIMENSIONS: process.env.EMBEDDING_DIMENSIONS || '2560',
+        OPENAI_BASE_URL: process.env.OPENAI_BASE_URL || '',
+        OPENAI_API_KEY: process.env.OPENAI_API_KEY || '',
+        OPENAI_CHAT_MODEL_ID: process.env.OPENAI_CHAT_MODEL_ID || '',
+        ROOSYNC_SHARED_PATH: process.env.ROOSYNC_SHARED_PATH || '',
+        ROOSYNC_MACHINE_ID: process.env.ROOSYNC_MACHINE_ID || 'nanoclaw-cluster',
+        ROOSYNC_CONFLICT_STRATEGY: process.env.ROOSYNC_CONFLICT_STRATEGY || 'manual',
+        ROOSYNC_LOG_LEVEL: process.env.ROOSYNC_LOG_LEVEL || 'info',
+        ROOSYNC_AUTO_SYNC: 'false',
+        // Workspace path for roo-state-manager context
+        WORKSPACE_PATH: '/workspace/project',
+        // Accept self-signed certs for internal services
+        NODE_TLS_REJECT_UNAUTHORIZED: '0',
+      },
+    };
+  }
+
+  return servers;
+}
+
+/**
  * Build the allowed tools list based on NANOCLAW_ROLE.
  * cluster-manager: no WebSearch/WebFetch (network isolation at SDK level)
  * web-explorer: full web access
@@ -612,6 +656,7 @@ function buildAllowedTools(): string[] {
     'Skill',
     'NotebookEdit',
     'mcp__nanoclaw__*',
+    'mcp__roo-state-manager__*',
   ];
 
   const role = process.env.NANOCLAW_ROLE;

@@ -228,6 +228,26 @@ function buildVolumeMounts(
     readonly: false,
   });
 
+  // Mount roo-state-manager (pre-built with Linux node_modules) if available
+  const rooStateMgrDir = path.join(projectRoot, 'deploy', 'roo-state-manager');
+  if (fs.existsSync(path.join(rooStateMgrDir, 'build', 'index.js'))) {
+    mounts.push({
+      hostPath: rooStateMgrDir,
+      containerPath: '/workspace/extra/roo-state-manager',
+      readonly: true,
+    });
+  }
+
+  // Mount RooSync shared state (Google Drive) for cluster visibility (main only, read-only)
+  const roosyncSharedPath = process.env.ROOSYNC_SHARED_PATH;
+  if (isMain && roosyncSharedPath && fs.existsSync(roosyncSharedPath)) {
+    mounts.push({
+      hostPath: roosyncSharedPath,
+      containerPath: '/workspace/roosync',
+      readonly: true,
+    });
+  }
+
   // Additional mounts validated against external allowlist (tamper-proof from containers)
   if (group.containerConfig?.additionalMounts) {
     const validatedMounts = validateAdditionalMounts(
@@ -295,6 +315,31 @@ function buildContainerArgs(
     if (process.env[key]) {
       args.push('-e', `${key}=${process.env[key]}`);
     }
+  }
+
+  // Pass roo-state-manager env vars (Qdrant, embeddings, RooSync, LLM for synthesis)
+  for (const key of [
+    'QDRANT_URL',
+    'QDRANT_API_KEY',
+    'QDRANT_COLLECTION_NAME',
+    'EMBEDDING_API_BASE_URL',
+    'EMBEDDING_API_KEY',
+    'EMBEDDING_MODEL',
+    'EMBEDDING_DIMENSIONS',
+    'OPENAI_BASE_URL',
+    'OPENAI_API_KEY',
+    'OPENAI_CHAT_MODEL_ID',
+    'ROOSYNC_MACHINE_ID',
+    'ROOSYNC_CONFLICT_STRATEGY',
+    'ROOSYNC_LOG_LEVEL',
+  ]) {
+    if (process.env[key]) {
+      args.push('-e', `${key}=${process.env[key]}`);
+    }
+  }
+  // RooSync shared path is mounted at a fixed container path
+  if (process.env.ROOSYNC_SHARED_PATH) {
+    args.push('-e', 'ROOSYNC_SHARED_PATH=/workspace/roosync');
   }
 
   // Runtime-specific args for host gateway resolution
