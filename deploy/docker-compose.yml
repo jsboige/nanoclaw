@@ -1,0 +1,56 @@
+# NanoClaw deployment on myia-ai-01
+# Docker Compose for the NanoClaw assistant connected to RooSync cluster
+#
+# Usage:
+#   cd deploy && docker compose up -d
+#   docker compose logs -f nanoclaw
+#   docker compose down
+
+services:
+  nanoclaw:
+    build:
+      context: ..
+      dockerfile: container/Dockerfile
+    container_name: nanoclaw
+    restart: unless-stopped
+
+    # Environment
+    env_file:
+      - .env
+    environment:
+      - NODE_ENV=production
+      - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY}
+      # Use z.ai endpoint for Claude API (local LLM proxy)
+      - ANTHROPIC_BASE_URL=${ANTHROPIC_BASE_URL:-https://api.anthropic.com}
+      # Container isolation
+      - AGENT_BROWSER_EXECUTABLE_PATH=/usr/bin/chromium
+
+    # Volumes
+    volumes:
+      # Group workspaces (persistent)
+      - nanoclaw-groups:/workspace/group
+      # Global memory
+      - nanoclaw-global:/workspace/global
+      # IPC for task processing
+      - nanoclaw-ipc:/workspace/ipc
+      # RooSync shared state (read-only bridge)
+      - ${ROOSYNC_SHARED_PATH:-/mnt/g/.shared-state}:/workspace/extra/roosync:ro
+
+    # Networking
+    ports:
+      - "3100:3100"  # Health check / API (if enabled)
+
+    # Resource limits
+    deploy:
+      resources:
+        limits:
+          memory: 4G
+          cpus: "2.0"
+        reservations:
+          memory: 1G
+          cpus: "0.5"
+
+volumes:
+  nanoclaw-groups:
+  nanoclaw-global:
+  nanoclaw-ipc:

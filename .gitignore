@@ -36,3 +36,7 @@ groups/global/*
 .nanoclaw/
 
 agents-sdk-docs
+
+# Fork-specific
+deploy/.env
+.claude/local/
