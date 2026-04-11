@@ -19,9 +19,12 @@ x-common: &common
     - .env
   environment: &common-env
     NODE_ENV: production
-    ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY}
-    ANTHROPIC_BASE_URL: ${ANTHROPIC_BASE_URL:-https://api.anthropic.com}
     AGENT_BROWSER_EXECUTABLE_PATH: /usr/bin/chromium
+    # Local LLMs (intensive use, no quota)
+    LOCAL_MEDIUM_BASE_URL: ${LOCAL_MEDIUM_BASE_URL}
+    LOCAL_MEDIUM_API_KEY: ${LOCAL_MEDIUM_API_KEY}
+    LOCAL_MINI_BASE_URL: ${LOCAL_MINI_BASE_URL}
+    LOCAL_MINI_API_KEY: ${LOCAL_MINI_API_KEY}
   deploy:
     resources:
       limits:
@@ -44,6 +47,9 @@ services:
     environment:
       <<: *common-env
       NANOCLAW_ROLE: cluster-manager
+      # z.ai flagship (GLM-5.1 / GLM-5-turbo) — dedicated key
+      ANTHROPIC_API_KEY: ${CLUSTER_Z_AI_API_KEY}
+      ANTHROPIC_BASE_URL: ${CLUSTER_Z_AI_BASE_URL}
     volumes:
       # Group workspaces (persistent, isolated per experiment)
       - cluster-groups:/workspace/group
@@ -68,6 +74,9 @@ services:
     environment:
       <<: *common-env
       NANOCLAW_ROLE: web-explorer
+      # z.ai flagship (GLM-5.1 / GLM-5-turbo) — dedicated key
+      ANTHROPIC_API_KEY: ${EXPLORER_Z_AI_API_KEY}
+      ANTHROPIC_BASE_URL: ${EXPLORER_Z_AI_BASE_URL}
     volumes:
       # Group workspaces (persistent, isolated per experiment)
       - explorer-groups:/workspace/group

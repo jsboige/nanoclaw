@@ -22,6 +22,20 @@ avec des profils de securite opposes (issue parente: [roo-extensions#921](https:
 | **RooSync** | Oui (volume RO) | Non |
 | **Risque** | Acces critique cluster → sandboxe serre | Acces web libre → pas d'acces systeme |
 
+## Modeles LLM disponibles
+
+| Provider | Modele | Endpoint | Usage |
+|----------|--------|----------|-------|
+| **z.ai** (flagship) | GLM-5.1 ou GLM-5-turbo | `ANTHROPIC_BASE_URL` dans `.env` | Raisonnement principal, taches critiques |
+| **Local medium** | Qwen3.5-35B-A3B | `LOCAL_MEDIUM_BASE_URL` | Usage intensif, pas de quota (vLLM GPU 0+1) |
+| **Local mini** | OmniCoder3 | `LOCAL_MINI_BASE_URL` | Code, taches rapides (vLLM GPU 2) |
+| **sk-agent** | Multi-agents (11 agents) | Container dedie | Deliberation, review, analyse |
+
+Chaque experience a sa propre cle z.ai dans `.env`. Les modeles locaux sont partages.
+L'agent etudiera le choix optimal entre GLM-5.1 et GLM-5-turbo selon les taches.
+
+---
+
 ## Architecture upstream (reference)
 
 Voir [CLAUDE.upstream.md](CLAUDE.upstream.md) pour la documentation upstream complete.
@@ -183,6 +197,59 @@ Le dashboard est accessible via `roosync_dashboard(type: "workspace")` depuis ro
 
 ---
 
+## Posture operationnelle — REGLE ABSOLUE
+
+**Les deux claws agissent pour le compte de l'utilisateur. Ils doivent etre :**
+
+1. **EXTREMEMENT PRUDENTS** dans toutes leurs manipulations — chaque action est potentiellement
+   irreversible sur des workspaces de production
+2. **EXTREMEMENT VIGILANTS** sur la qualite et la coherence du travail effectue
+3. **TRES EXIGEANTS** dans le controle et la validation — ne jamais presumer que quelque chose
+   fonctionne sans verification explicite
+4. **TRANSPARENTS** — soumettre TOUS les arbitrages importants a l'utilisateur via le canal
+   de communication avant d'agir
+
+### Pour le Cluster Manager en particulier
+
+Le cluster manager reproduit le travail que l'utilisateur fait manuellement en passant sur chaque
+workspace VS Code actif et en relancant les conversations de taches. Il doit :
+- **Verifier** avant d'agir (lire le dashboard, les issues, l'etat git)
+- **Ne jamais presumer** qu'une tache est terminee sans preuve
+- **Soumettre les decisions** qui engagent le projet (merges, fermetures, escalades)
+- **Rapporter** systematiquement ce qu'il a fait et ce qu'il a observe
+
+### Communication avec l'utilisateur
+
+Le canal de communication avec l'utilisateur est **a determiner** (PAS WhatsApp).
+Options a evaluer : Telegram, Discord, Slack, Gmail, ou webhook custom.
+L'agent doit proposer des options et en discuter avec l'utilisateur.
+
+---
+
+## Chantiers ouverts (a investiguer par les agents)
+
+### Exp. 1 — Cluster Manager
+- **Desktop MCP :** Trouver/integrer une solution MCP pour piloter les machines et les workspaces
+  VS Code de l'exterieur (RDP, VNC, ou solution screenshot-based). L'objectif est de pouvoir
+  relancer des conversations Claude Code / Roo sur les differents workspaces VS Code actifs
+  sur les 6 machines du cluster.
+- **roo-state-manager dans le container :** Brancher le MCP roo-state-manager pour donner
+  acces aux dashboards, inbox, conversation_browser depuis le container.
+- **sk-agent :** Integrer le container sk-agent pour la deliberation multi-perspective.
+
+### Exp. 2 — Web Explorer
+- **Outils web :** Evaluer et integrer les outils necessaires pour la recherche web
+  (Playwright, extraction de contenu, synthese).
+- **sk-agent :** Integrer sk-agent pour les analyses et deliberations.
+
+### Les deux
+- **Canal de communication :** Choisir le bon canal pour interagir avec l'utilisateur
+  (pas WhatsApp pour raisons de vie privee — Meta exploite les conversations audio).
+- **Choix du modele z.ai :** Tester GLM-5.1 vs GLM-5-turbo, determiner lequel est optimal
+  pour chaque type de tache.
+
+---
+
 ## Regles
 
 1. Ne pas modifier les fichiers upstream sans raison — preferer des ajouts dans `deploy/` et `.claude/`
@@ -190,3 +257,6 @@ Le dashboard est accessible via `roosync_dashboard(type: "workspace")` depuis ro
 3. Garder la synchronisation upstream facile (pas de divergence inutile)
 4. Les credentials Docker/API vont dans `.env` (gitignored), jamais dans le code
 5. Les deux experiences sont ISOLEES — ne jamais partager volumes ou reseaux entre elles
+6. **Prudence maximale** — verifier avant d'agir, valider apres avoir agi
+7. **Arbitrages au canal** — toute decision impactante doit etre soumise a l'utilisateur
+8. **Pas de WhatsApp** — canal de communication a determiner
