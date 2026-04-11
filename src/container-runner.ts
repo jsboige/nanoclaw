@@ -247,6 +247,12 @@ function buildContainerArgs(
 ): string[] {
   const args: string[] = ['run', '-i', '--rm', '--name', containerName];
 
+  // Use custom Docker network if specified (e.g., nanoclaw-cluster, nanoclaw-explorer)
+  const containerNetwork = process.env.CONTAINER_NETWORK;
+  if (containerNetwork) {
+    args.push('--network', containerNetwork);
+  }
+
   // Pass host timezone so container's local time matches the user's
   args.push('-e', `TZ=${TIMEZONE}`);
 
@@ -265,6 +271,30 @@ function buildContainerArgs(
     args.push('-e', 'ANTHROPIC_API_KEY=placeholder');
   } else {
     args.push('-e', 'CLAUDE_CODE_OAUTH_TOKEN=placeholder');
+  }
+
+  // Pass NanoClaw role so agent-runner can adjust allowed tools
+  const nanoClawRole = process.env.NANOCLAW_ROLE;
+  if (nanoClawRole) {
+    args.push('-e', `NANOCLAW_ROLE=${nanoClawRole}`);
+  }
+
+  // Pass model override for non-Anthropic providers (e.g., z.ai uses glm-5-turbo)
+  const anthropicModel = process.env.ANTHROPIC_MODEL;
+  if (anthropicModel) {
+    args.push('-e', `ANTHROPIC_MODEL=${anthropicModel}`);
+  }
+
+  // Pass local LLM endpoints so container agents can call them via curl
+  for (const key of [
+    'LOCAL_MEDIUM_BASE_URL',
+    'LOCAL_MEDIUM_API_KEY',
+    'LOCAL_MINI_BASE_URL',
+    'LOCAL_MINI_API_KEY',
+  ]) {
+    if (process.env[key]) {
+      args.push('-e', `${key}=${process.env[key]}`);
+    }
   }
 
   // Runtime-specific args for host gateway resolution

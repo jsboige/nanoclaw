@@ -435,11 +435,18 @@ async function runQuery(
     log(`Additional directories: ${extraDirs.join(', ')}`);
   }
 
+  // Use model from env if specified (e.g., glm-5-turbo for z.ai)
+  const model = process.env.ANTHROPIC_MODEL;
+  if (model) {
+    log(`Using model: ${model}`);
+  }
+
   for await (const message of query({
     prompt: stream,
     options: {
       cwd: '/workspace/group',
       additionalDirectories: extraDirs.length > 0 ? extraDirs : undefined,
+      model: model || undefined,
       resume: sessionId,
       resumeSessionAt: resumeAt,
       systemPrompt: globalClaudeMd
@@ -449,27 +456,7 @@ async function runQuery(
             append: globalClaudeMd,
           }
         : undefined,
-      allowedTools: [
-        'Bash',
-        'Read',
-        'Write',
-        'Edit',
-        'Glob',
-        'Grep',
-        'WebSearch',
-        'WebFetch',
-        'Task',
-        'TaskOutput',
-        'TaskStop',
-        'TeamCreate',
-        'TeamDelete',
-        'SendMessage',
-        'TodoWrite',
-        'ToolSearch',
-        'Skill',
-        'NotebookEdit',
-        'mcp__nanoclaw__*',
-      ],
+      allowedTools: buildAllowedTools(),
       env: sdkEnv,
       permissionMode: 'bypassPermissions',
       allowDangerouslySkipPermissions: true,
@@ -598,6 +585,44 @@ async function runScript(script: string): Promise<ScriptResult | null> {
       },
     );
   });
+}
+
+/**
+ * Build the allowed tools list based on NANOCLAW_ROLE.
+ * cluster-manager: no WebSearch/WebFetch (network isolation at SDK level)
+ * web-explorer: full web access
+ * default: all tools
+ */
+function buildAllowedTools(): string[] {
+  const baseTools = [
+    'Bash',
+    'Read',
+    'Write',
+    'Edit',
+    'Glob',
+    'Grep',
+    'Task',
+    'TaskOutput',
+    'TaskStop',
+    'TeamCreate',
+    'TeamDelete',
+    'SendMessage',
+    'TodoWrite',
+    'ToolSearch',
+    'Skill',
+    'NotebookEdit',
+    'mcp__nanoclaw__*',
+  ];
+
+  const role = process.env.NANOCLAW_ROLE;
+  if (role === 'cluster-manager') {
+    log('Role: cluster-manager — WebSearch/WebFetch disabled');
+    return baseTools;
+  }
+
+  // web-explorer or default: include web tools
+  log(`Role: ${role || 'default'} — all tools enabled`);
+  return ['WebSearch', 'WebFetch', ...baseTools];
 }
 
 async function main(): Promise<void> {
