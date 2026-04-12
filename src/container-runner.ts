@@ -238,13 +238,14 @@ function buildVolumeMounts(
     });
   }
 
-  // Mount RooSync shared state (Google Drive) for cluster visibility (main only, read-only)
+  // Mount RooSync shared state (Google Drive) for cluster coordination (main only, read-write)
+  // Read-write so the agent can post to dashboards, send intercom messages, update state
   const roosyncSharedPath = process.env.ROOSYNC_SHARED_PATH;
   if (isMain && roosyncSharedPath && fs.existsSync(roosyncSharedPath)) {
     mounts.push({
       hostPath: roosyncSharedPath,
       containerPath: '/workspace/roosync',
-      readonly: true,
+      readonly: false,
     });
   }
 

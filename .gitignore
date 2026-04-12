@@ -40,3 +40,7 @@ agents-sdk-docs
 # Fork-specific
 deploy/.env
 .claude/local/
+
+# roo-state-manager Linux build artifacts (prepared via scripts/prepare-roo-state-manager.sh)
+# Contains 83MB of Linux-native node_modules — not suitable for git
+deploy/roo-state-manager/

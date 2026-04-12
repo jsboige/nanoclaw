@@ -1,0 +1,20 @@
+# Force LF line endings for all text files
+# Prevents Prettier reformatting noise on Windows checkouts
+* text=auto eol=lf
+
+# Specific text files
+*.ts eol=lf
+*.js eol=lf
+*.cjs eol=lf
+*.json eol=lf
+*.md eol=lf
+*.sh eol=lf
+*.yml eol=lf
+*.yaml eol=lf
+
+# Binary files (don't touch)
+*.png binary
+*.jpg binary
+*.gif binary
+*.ico binary
+*.db binary
