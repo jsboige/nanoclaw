@@ -25,6 +25,13 @@ groups/global/*
 # Temp files
 .tmp-*
 
+# Playwright MCP artifacts (debug screenshots, console logs, snapshots)
+.playwright-mcp/
+*-screenshot.png
+id-switcher-check.png
+menu-state.png
+switcher-open.png
+
 # OS
 .DS_Store
 

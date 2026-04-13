@@ -311,8 +311,16 @@ function buildContainerArgs(
   }
 
   // Git / GitHub identity — lets the agent commit and call `gh` inside containers.
+  // GH_TOKEN is the default (primary identity). GH_TOKEN_<IDENTITY> lets the
+  // agent impersonate any of our GitHub accounts by exporting the matching var
+  // to GH_TOKEN before a `gh` call.
   for (const key of ['GIT_USER_NAME', 'GIT_USER_EMAIL', 'GH_TOKEN']) {
     if (process.env[key]) {
+      args.push('-e', `${key}=${process.env[key]}`);
+    }
+  }
+  for (const key of Object.keys(process.env)) {
+    if (key.startsWith('GH_TOKEN_') && process.env[key]) {
       args.push('-e', `${key}=${process.env[key]}`);
     }
   }
