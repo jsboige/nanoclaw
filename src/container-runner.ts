@@ -228,26 +228,9 @@ function buildVolumeMounts(
     readonly: false,
   });
 
-  // Mount roo-state-manager (pre-built with Linux node_modules) if available
-  const rooStateMgrDir = path.join(projectRoot, 'deploy', 'roo-state-manager');
-  if (fs.existsSync(path.join(rooStateMgrDir, 'build', 'index.js'))) {
-    mounts.push({
-      hostPath: rooStateMgrDir,
-      containerPath: '/workspace/extra/roo-state-manager',
-      readonly: true,
-    });
-  }
-
-  // Mount RooSync shared state (Google Drive) for cluster coordination (main only, read-write)
-  // Read-write so the agent can post to dashboards, send intercom messages, update state
-  const roosyncSharedPath = process.env.ROOSYNC_SHARED_PATH;
-  if (isMain && roosyncSharedPath && fs.existsSync(roosyncSharedPath)) {
-    mounts.push({
-      hostPath: roosyncSharedPath,
-      containerPath: '/workspace/roosync',
-      readonly: false,
-    });
-  }
+  // roo-state-manager is accessed via HTTP streamable proxy (ROO_STATE_MANAGER_URL),
+  // not via stdio in the container. No local mount needed — the proxy on the host
+  // handles GDrive access that Docker Desktop cannot propagate.
 
   // Additional mounts validated against external allowlist (tamper-proof from containers)
   if (group.containerConfig?.additionalMounts) {
@@ -318,29 +301,20 @@ function buildContainerArgs(
     }
   }
 
-  // Pass roo-state-manager env vars (Qdrant, embeddings, RooSync, LLM for synthesis)
-  for (const key of [
-    'QDRANT_URL',
-    'QDRANT_API_KEY',
-    'QDRANT_COLLECTION_NAME',
-    'EMBEDDING_API_BASE_URL',
-    'EMBEDDING_API_KEY',
-    'EMBEDDING_MODEL',
-    'EMBEDDING_DIMENSIONS',
-    'OPENAI_BASE_URL',
-    'OPENAI_API_KEY',
-    'OPENAI_CHAT_MODEL_ID',
-    'ROOSYNC_MACHINE_ID',
-    'ROOSYNC_CONFLICT_STRATEGY',
-    'ROOSYNC_LOG_LEVEL',
-  ]) {
+  // MCP proxy access (shared base URL + bearer). Agent-runner builds per-server
+  // URLs as {BASE}/{server}/mcp and selects which MCPs are wired up per role.
+  // See docs/MCP_ACCESS.md for the 2-tier proxy architecture.
+  for (const key of ['MCP_PROXY_BASE_URL', 'MCP_PROXY_BEARER']) {
     if (process.env[key]) {
       args.push('-e', `${key}=${process.env[key]}`);
     }
   }
-  // RooSync shared path is mounted at a fixed container path
-  if (process.env.ROOSYNC_SHARED_PATH) {
-    args.push('-e', 'ROOSYNC_SHARED_PATH=/workspace/roosync');
+
+  // Git / GitHub identity — lets the agent commit and call `gh` inside containers.
+  for (const key of ['GIT_USER_NAME', 'GIT_USER_EMAIL', 'GH_TOKEN']) {
+    if (process.env[key]) {
+      args.push('-e', `${key}=${process.env[key]}`);
+    }
   }
 
   // Runtime-specific args for host gateway resolution
