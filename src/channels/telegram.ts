@@ -8,6 +8,10 @@ import { ASSISTANT_NAME, TRIGGER_PATTERN } from '../config.js';
 import { readEnvFile } from '../env.js';
 import { resolveGroupFolderPath } from '../group-folder.js';
 import { logger } from '../logger.js';
+import {
+  isTranscriptionEnabled,
+  transcribeAudioFile,
+} from '../transcription.js';
 import { registerChannel, ChannelOpts } from './registry.js';
 import {
   Channel,
@@ -59,14 +63,14 @@ export class TelegramChannel implements Channel {
 
   /**
    * Download a Telegram file to the group's attachments directory.
-   * Returns the container-relative path (e.g. /workspace/group/attachments/photo_123.jpg)
-   * or null if the download fails.
+   * Returns both the container-relative path (for the agent prompt) and the
+   * local disk path (for transcription, etc.), or null if the download fails.
    */
   private async downloadFile(
     fileId: string,
     groupFolder: string,
     filename: string,
-  ): Promise<string | null> {
+  ): Promise<{ workspacePath: string; localPath: string } | null> {
     if (!this.bot) return null;
 
     try {
@@ -101,7 +105,10 @@ export class TelegramChannel implements Channel {
       fs.writeFileSync(destPath, buffer);
 
       logger.info({ fileId, dest: destPath }, 'Telegram file downloaded');
-      return `/workspace/group/attachments/${finalName}`;
+      return {
+        workspacePath: `/workspace/group/attachments/${finalName}`,
+        localPath: destPath,
+      };
     } catch (err) {
       logger.error({ fileId, err }, 'Failed to download Telegram file');
       return null;
@@ -239,7 +246,7 @@ export class TelegramChannel implements Channel {
     const storeMedia = (
       ctx: any,
       placeholder: string,
-      opts?: { fileId?: string; filename?: string },
+      opts?: { fileId?: string; filename?: string; transcribe?: boolean },
     ) => {
       const chatJid = `tg:${ctx.chat.id}`;
       const group = this.opts.registeredGroups()[chatJid];
@@ -282,12 +289,22 @@ export class TelegramChannel implements Channel {
           opts.filename ||
           `${placeholder.replace(/[\[\] ]/g, '').toLowerCase()}_${msgId}`;
         this.downloadFile(opts.fileId, group.folder, filename).then(
-          (filePath) => {
-            if (filePath) {
-              deliver(`${placeholder} (${filePath})${caption}`);
-            } else {
+          async (paths) => {
+            if (!paths) {
               deliver(`${placeholder}${caption}`);
+              return;
             }
+            const { workspacePath, localPath } = paths;
+            if (opts.transcribe && isTranscriptionEnabled()) {
+              const transcript = await transcribeAudioFile(localPath);
+              if (transcript) {
+                deliver(
+                  `[Voice: ${transcript}] (${workspacePath})${caption}`,
+                );
+                return;
+              }
+            }
+            deliver(`${placeholder} (${workspacePath})${caption}`);
           },
         );
         return;
@@ -315,6 +332,7 @@ export class TelegramChannel implements Channel {
       storeMedia(ctx, '[Voice message]', {
         fileId: ctx.message.voice?.file_id,
         filename: `voice_${ctx.message.message_id}`,
+        transcribe: true,
       });
     });
     this.bot.on('message:audio', (ctx) => {
@@ -323,6 +341,7 @@ export class TelegramChannel implements Channel {
       storeMedia(ctx, '[Audio]', {
         fileId: ctx.message.audio?.file_id,
         filename: name,
+        transcribe: true,
       });
     });
     this.bot.on('message:document', (ctx) => {

@@ -31,6 +31,12 @@ vi.mock('../group-folder.js', () => ({
   ),
 }));
 
+// Mock transcription module (default: disabled, so legacy [Voice message] content is preserved)
+vi.mock('../transcription.js', () => ({
+  isTranscriptionEnabled: vi.fn(() => false),
+  transcribeAudioFile: vi.fn(async () => null),
+}));
+
 // --- Grammy mock ---
 
 type Handler = (...args: any[]) => any;
@@ -78,7 +84,15 @@ vi.mock('grammy', () => ({
 }));
 
 import fs from 'fs';
+import path from 'path';
 import { TelegramChannel, TelegramChannelOpts } from './telegram.js';
+import {
+  isTranscriptionEnabled,
+  transcribeAudioFile,
+} from '../transcription.js';
+
+const isTranscriptionEnabledMock = vi.mocked(isTranscriptionEnabled);
+const transcribeAudioFileMock = vi.mocked(transcribeAudioFile);
 
 // --- Test helpers ---
 
@@ -195,6 +209,10 @@ const flushPromises = () => new Promise((resolve) => setTimeout(resolve, 0));
 describe('TelegramChannel', () => {
   beforeEach(() => {
     vi.clearAllMocks();
+
+    // Reset transcription mock defaults (disabled unless a test opts in)
+    isTranscriptionEnabledMock.mockReturnValue(false);
+    transcribeAudioFileMock.mockResolvedValue(null);
 
     // Mock fs operations used by downloadFile
     vi.spyOn(fs, 'mkdirSync').mockReturnValue(undefined);
@@ -808,6 +826,65 @@ describe('TelegramChannel', () => {
       await flushPromises();
 
       expect(currentBot().api.getFile).toHaveBeenCalledWith('voice_id');
+      expect(opts.onMessage).toHaveBeenCalledWith(
+        'tg:100200300',
+        expect.objectContaining({
+          content: '[Voice message] (/workspace/group/attachments/voice_1.oga)',
+        }),
+      );
+    });
+
+    it('transcribes voice message when ASR enabled', async () => {
+      isTranscriptionEnabledMock.mockReturnValue(true);
+      transcribeAudioFileMock.mockResolvedValueOnce('Hello from the voice');
+
+      const opts = createTestOpts();
+      const channel = new TelegramChannel('test-token', opts);
+      await channel.connect();
+
+      currentBot().api.getFile.mockResolvedValueOnce({
+        file_path: 'voice/file_0.oga',
+      });
+
+      const ctx = createMediaCtx({
+        extra: { voice: { file_id: 'voice_id' } },
+      });
+      await triggerMediaMessage('message:voice', ctx);
+      await flushPromises();
+      // Additional tick for the async transcription chain
+      await flushPromises();
+
+      expect(transcribeAudioFileMock).toHaveBeenCalledWith(
+        path.join('/tmp/test-groups/test-group/attachments', 'voice_1.oga'),
+      );
+      expect(opts.onMessage).toHaveBeenCalledWith(
+        'tg:100200300',
+        expect.objectContaining({
+          content:
+            '[Voice: Hello from the voice] (/workspace/group/attachments/voice_1.oga)',
+        }),
+      );
+    });
+
+    it('falls back to placeholder when transcription fails', async () => {
+      isTranscriptionEnabledMock.mockReturnValue(true);
+      transcribeAudioFileMock.mockResolvedValueOnce(null);
+
+      const opts = createTestOpts();
+      const channel = new TelegramChannel('test-token', opts);
+      await channel.connect();
+
+      currentBot().api.getFile.mockResolvedValueOnce({
+        file_path: 'voice/file_0.oga',
+      });
+
+      const ctx = createMediaCtx({
+        extra: { voice: { file_id: 'voice_id' } },
+      });
+      await triggerMediaMessage('message:voice', ctx);
+      await flushPromises();
+      await flushPromises();
+
       expect(opts.onMessage).toHaveBeenCalledWith(
         'tg:100200300',
         expect.objectContaining({
