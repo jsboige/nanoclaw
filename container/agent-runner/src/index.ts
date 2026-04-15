@@ -63,6 +63,10 @@ interface SDKUserMessage {
 const IPC_INPUT_DIR = '/workspace/ipc/input';
 const IPC_INPUT_CLOSE_SENTINEL = path.join(IPC_INPUT_DIR, '_close');
 const IPC_POLL_MS = 500;
+// After _close, the parent `for await (query)` can get stuck if subagents keep
+// producing messages (Task tool cascades). Force-exit after this grace period
+// so the host can respawn a fresh container and drain pending IPC inputs.
+const CLOSE_GRACE_MS = 60_000;
 
 /**
  * Push-based async iterable for streaming user messages to the SDK.
@@ -389,13 +393,29 @@ async function runQuery(
   // Poll IPC for follow-up messages and _close sentinel during the query
   let ipcPolling = true;
   let closedDuringQuery = false;
+  let graceTimer: NodeJS.Timeout | null = null;
   const pollIpcDuringQuery = () => {
     if (!ipcPolling) return;
     if (shouldClose()) {
+      if (closedDuringQuery) {
+        // Second _close while still in the same query — the `for await` is
+        // stuck (subagents cascade, etc). Force-exit so the host can respawn.
+        log('Second close sentinel detected, forcing process exit');
+        process.exit(0);
+      }
       log('Close sentinel detected during query, ending stream');
       closedDuringQuery = true;
       stream.end();
-      ipcPolling = false;
+      // Start a grace timer: if the query hasn't returned by then, the parent
+      // is stuck on subagents — force-exit.
+      graceTimer = setTimeout(() => {
+        log(
+          `Query did not return within ${CLOSE_GRACE_MS}ms after close, forcing process exit`,
+        );
+        process.exit(0);
+      }, CLOSE_GRACE_MS);
+      // Keep polling so a second _close can escalate to hard exit.
+      setTimeout(pollIpcDuringQuery, IPC_POLL_MS);
       return;
     }
     const messages = drainIpcInput();
@@ -532,6 +552,10 @@ async function runQuery(
   }
 
   ipcPolling = false;
+  if (graceTimer) {
+    clearTimeout(graceTimer);
+    graceTimer = null;
+  }
   log(
     `Query done. Messages: ${messageCount}, results: ${resultCount}, lastAssistantUuid: ${lastAssistantUuid || 'none'}, closedDuringQuery: ${closedDuringQuery}`,
   );
