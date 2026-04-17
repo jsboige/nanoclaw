@@ -73,7 +73,8 @@ export const ROOSYNC_INBOX_POLL_INTERVAL = Math.max(
   parseInt(process.env.ROOSYNC_INBOX_POLL_INTERVAL || '15000', 10) || 15000,
 );
 // Optional JID override. If empty, watcher injects into the registered main group.
-export const ROOSYNC_INBOX_TARGET_JID = process.env.ROOSYNC_INBOX_TARGET_JID || '';
+export const ROOSYNC_INBOX_TARGET_JID =
+  process.env.ROOSYNC_INBOX_TARGET_JID || '';
 export const MAX_CONCURRENT_CONTAINERS = Math.max(
   1,
   parseInt(process.env.MAX_CONCURRENT_CONTAINERS || '5', 10) || 5,

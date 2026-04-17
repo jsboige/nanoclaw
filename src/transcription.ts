@@ -87,10 +87,7 @@ export async function transcribeAudioFile(
       return null;
     }
 
-    logger.info(
-      { localPath, chars: text.length },
-      'Transcribed voice message',
-    );
+    logger.info({ localPath, chars: text.length }, 'Transcribed voice message');
     return text;
   } catch (err) {
     logger.error({ localPath, err }, 'Transcription error');

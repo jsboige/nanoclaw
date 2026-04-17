@@ -10,12 +10,9 @@ const env = readEnvFile([
   'ROOSYNC_INBOX_POLL_INTERVAL',
 ]);
 
-const SHARED =
-  process.env.ROOSYNC_SHARED_PATH || env.ROOSYNC_SHARED_PATH || '';
-const MACHINE =
-  process.env.ROOSYNC_MACHINE_ID || env.ROOSYNC_MACHINE_ID || '';
-const WORKSPACE =
-  process.env.ROOSYNC_WORKSPACE || env.ROOSYNC_WORKSPACE || '';
+const SHARED = process.env.ROOSYNC_SHARED_PATH || env.ROOSYNC_SHARED_PATH || '';
+const MACHINE = process.env.ROOSYNC_MACHINE_ID || env.ROOSYNC_MACHINE_ID || '';
+const WORKSPACE = process.env.ROOSYNC_WORKSPACE || env.ROOSYNC_WORKSPACE || '';
 const POLL_MS = Math.max(
   1000,
   parseInt(

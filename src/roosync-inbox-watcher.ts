@@ -291,4 +291,3 @@ function saveProcessed(stateFile: string, ids: string[] | Set<string>): void {
     logger.error({ err, stateFile }, 'RooSync inbox: failed to save state');
   }
 }
-

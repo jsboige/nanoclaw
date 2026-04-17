@@ -298,9 +298,7 @@ export class TelegramChannel implements Channel {
             if (opts.transcribe && isTranscriptionEnabled()) {
               const transcript = await transcribeAudioFile(localPath);
               if (transcript) {
-                deliver(
-                  `[Voice: ${transcript}] (${workspacePath})${caption}`,
-                );
+                deliver(`[Voice: ${transcript}] (${workspacePath})${caption}`);
                 return;
               }
             }
