@@ -62,6 +62,18 @@ export const MAX_MESSAGES_PER_PROMPT = Math.max(
 );
 export const IPC_POLL_INTERVAL = 1000;
 export const IDLE_TIMEOUT = parseInt(process.env.IDLE_TIMEOUT || '1800000', 10); // 30min default — how long to keep container alive after last result
+
+// RooSync inbox watcher — wakes the bot when a dashboard mention is dispatched
+// to its machineId/workspace. Empty ROOSYNC_SHARED_PATH disables the watcher.
+export const ROOSYNC_SHARED_PATH = process.env.ROOSYNC_SHARED_PATH || '';
+export const ROOSYNC_MACHINE_ID = process.env.ROOSYNC_MACHINE_ID || '';
+export const ROOSYNC_WORKSPACE = process.env.ROOSYNC_WORKSPACE || '';
+export const ROOSYNC_INBOX_POLL_INTERVAL = Math.max(
+  1000,
+  parseInt(process.env.ROOSYNC_INBOX_POLL_INTERVAL || '15000', 10) || 15000,
+);
+// Optional JID override. If empty, watcher injects into the registered main group.
+export const ROOSYNC_INBOX_TARGET_JID = process.env.ROOSYNC_INBOX_TARGET_JID || '';
 export const MAX_CONCURRENT_CONTAINERS = Math.max(
   1,
   parseInt(process.env.MAX_CONCURRENT_CONTAINERS || '5', 10) || 5,

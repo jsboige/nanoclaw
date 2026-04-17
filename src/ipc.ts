@@ -3,11 +3,27 @@ import path from 'path';
 
 import { CronExpressionParser } from 'cron-parser';
 
-import { DATA_DIR, IPC_POLL_INTERVAL, TIMEZONE } from './config.js';
+import {
+  DATA_DIR,
+  IPC_POLL_INTERVAL,
+  ROOSYNC_INBOX_TARGET_JID,
+  TIMEZONE,
+} from './config.js';
 import { AvailableGroup } from './container-runner.js';
-import { createTask, deleteTask, getTaskById, updateTask } from './db.js';
+import {
+  createTask,
+  deleteTask,
+  getTaskById,
+  storeMessageDirect,
+  updateTask,
+} from './db.js';
 import { isValidGroupFolder } from './group-folder.js';
 import { logger } from './logger.js';
+import {
+  buildSyntheticMessage,
+  InboxMessage,
+  resolveTargetJid,
+} from './roosync-inbox-watcher.js';
 import { RegisteredGroup } from './types.js';
 
 export interface IpcDeps {
@@ -92,6 +108,43 @@ export function startIpcWatcher(deps: IpcDeps): void {
                     'Unauthorized IPC message attempt blocked',
                   );
                 }
+              } else if (
+                data.type === 'inject_synthetic_message' &&
+                data.inboxMsg &&
+                isMain
+              ) {
+                const inboxMsg = data.inboxMsg as InboxMessage;
+                const targetJid = resolveTargetJid(
+                  registeredGroups,
+                  ROOSYNC_INBOX_TARGET_JID,
+                );
+                if (!targetJid) {
+                  logger.warn(
+                    { msgId: inboxMsg.id, sourceGroup },
+                    'inject_synthetic_message: no main group JID resolvable',
+                  );
+                } else {
+                  const synthetic = buildSyntheticMessage(
+                    inboxMsg,
+                    targetJid,
+                    new Date(),
+                  );
+                  storeMessageDirect(synthetic);
+                  logger.info(
+                    {
+                      msgId: inboxMsg.id,
+                      syntheticId: synthetic.id,
+                      targetJid,
+                      sourceGroup,
+                    },
+                    'RooSync inbox mention injected via IPC (standalone watcher)',
+                  );
+                }
+              } else if (data.type === 'inject_synthetic_message' && !isMain) {
+                logger.warn(
+                  { sourceGroup },
+                  'Unauthorized inject_synthetic_message attempt blocked',
+                );
               }
               fs.unlinkSync(filePath);
             } catch (err) {

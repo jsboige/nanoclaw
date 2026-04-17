@@ -724,6 +724,10 @@ async function main(): Promise<void> {
     },
   });
   startSessionCleanup();
+  // RooSync inbox watcher runs as a SEPARATE user-session process (scheduled
+  // task) because the service runs as LocalSystem which can't see the user's
+  // mapped Google Drive. The standalone watcher writes IPC files that this
+  // process consumes via the IPC handler (inject_synthetic_message type).
   queue.setProcessMessagesFn(processGroupMessages);
   recoverPendingMessages();
   startMessageLoop().catch((err) => {
