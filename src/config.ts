@@ -25,13 +25,12 @@ export const SCHEDULER_POLL_INTERVAL = 60000;
 const PROJECT_ROOT = process.cwd();
 const HOME_DIR = process.env.HOME || os.homedir();
 
-// Mount security: allowlist stored OUTSIDE project root, never mounted into containers
-export const MOUNT_ALLOWLIST_PATH = path.join(
-  HOME_DIR,
-  '.config',
-  'nanoclaw',
-  'mount-allowlist.json',
-);
+// Mount security: allowlist stored OUTSIDE project root, never mounted into containers.
+// Override via NANOCLAW_MOUNT_ALLOWLIST_PATH — required when the service runs as
+// LocalSystem (os.homedir() returns C:\Windows\system32\config\systemprofile).
+export const MOUNT_ALLOWLIST_PATH =
+  process.env.NANOCLAW_MOUNT_ALLOWLIST_PATH ||
+  path.join(HOME_DIR, '.config', 'nanoclaw', 'mount-allowlist.json');
 export const SENDER_ALLOWLIST_PATH = path.join(
   HOME_DIR,
   '.config',
