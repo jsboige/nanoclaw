@@ -301,6 +301,14 @@ function buildContainerArgs(
     }
   }
 
+  // Pass ASR endpoint (whisper-api) so agents can transcribe audio attachments
+  // a posteriori via curl: POST $ASR_BASE_URL/audio/transcriptions with Bearer auth.
+  for (const key of ['ASR_BASE_URL', 'ASR_API_KEY', 'ASR_MODEL']) {
+    if (process.env[key]) {
+      args.push('-e', `${key}=${process.env[key]}`);
+    }
+  }
+
   // MCP proxy access (shared base URL + bearer). Agent-runner builds per-server
   // URLs as {BASE}/{server}/mcp and selects which MCPs are wired up per role.
   // See docs/MCP_ACCESS.md for the 2-tier proxy architecture.
