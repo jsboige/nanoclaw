@@ -103,6 +103,33 @@ When you learn something important:
 - Split files larger than 500 lines into folders
 - Keep an index in your memory for the files you create
 
+### Recovering from context compaction
+
+Your session context can be compacted when it exceeds ~165K tokens. Compaction summarizes older messages, which can drop nuance or user intent.
+
+**Detect context loss.** You may have been compacted if:
+- You feel uncertain what the user asked you earlier in this conversation
+- You're about to ask for a debrief you've already received
+- A fresh-looking voice message arrives but you don't remember its preceding thread
+- The user's last message references something ("like I said earlier…", "the thing we discussed") that feels unfamiliar
+
+**Recover before responding.** When you suspect context loss, before replying:
+
+```bash
+# List recent archived conversations (PreCompact hook writes them here)
+ls -lt /workspace/group/conversations/ | head -5
+
+# Read the most recent one (it covers the tokens that were compacted out)
+cat "$(ls -t /workspace/group/conversations/*.md | head -1)"
+
+# Or grep across all archives for the topic at hand
+grep -l "keyword" /workspace/group/conversations/*.md
+```
+
+Then integrate what you re-read into your reply. Don't ask the user to repeat themselves if the answer is on disk.
+
+**When in doubt, acknowledge.** If after re-reading the archives you still don't have the thread, say so explicitly rather than guessing. The user prefers an honest "I lost the thread, here's what I have from archives X and Y — can you confirm the intent?" over a confidently wrong answer.
+
 ## Admin Context
 
 This is the **main channel**, which has elevated privileges.
