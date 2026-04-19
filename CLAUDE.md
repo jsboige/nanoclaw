@@ -226,27 +226,22 @@ L'agent doit proposer des options et en discuter avec l'utilisateur.
 
 ---
 
-## Chantiers ouverts (a investiguer par les agents)
+## Chantiers ouverts
 
-### Exp. 1 — Cluster Manager
-- **Desktop MCP :** Trouver/integrer une solution MCP pour piloter les machines et les workspaces
-  VS Code de l'exterieur (RDP, VNC, ou solution screenshot-based). L'objectif est de pouvoir
-  relancer des conversations Claude Code / Roo sur les differents workspaces VS Code actifs
-  sur les 6 machines du cluster.
-- **roo-state-manager dans le container :** Brancher le MCP roo-state-manager pour donner
-  acces aux dashboards, inbox, conversation_browser depuis le container.
-- **sk-agent :** Integrer le container sk-agent pour la deliberation multi-perspective.
+Les taches actives sont trackees comme issues GitHub sur ce repo. **Consulter les issues
+ouvertes en debut de session pour identifier les prochaines taches.**
 
-### Exp. 2 — Web Explorer
-- **Outils web :** Evaluer et integrer les outils necessaires pour la recherche web
-  (Playwright, extraction de contenu, synthese).
-- **sk-agent :** Integrer sk-agent pour les analyses et deliberations.
+```bash
+gh issue list --repo jsboige/nanoclaw --state open
+```
 
-### Les deux
-- **Canal de communication :** Choisir le bon canal pour interagir avec l'utilisateur
-  (pas WhatsApp pour raisons de vie privee — Meta exploite les conversations audio).
-- **Choix du modele z.ai :** Tester GLM-5.1 vs GLM-5-turbo, determiner lequel est optimal
-  pour chaque type de tache.
+Les taches cross-repo (coordination cluster, bilans globaux) peuvent aussi vivre sur
+[`jsboige/roo-extensions`](https://github.com/jsboige/roo-extensions/issues) — les issues
+nanoclaw qui y sont liees referencent l'issue miroir dans leur body (`Related:`).
+
+Le dashboard RooSync workspace-nanoclaw (`roosync_dashboard(type: "workspace")`) reste
+le canal d'intercom temps reel pour les echanges avec le bot `nanoclaw-cluster` et avec
+le coordinateur.
 
 ---
 
