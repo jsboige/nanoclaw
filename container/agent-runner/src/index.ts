@@ -620,7 +620,7 @@ async function runScript(script: string): Promise<ScriptResult | null> {
 
 type ExtraMcpServer =
   | { command: string; args: string[]; env?: Record<string, string> }
-  | { type: 'http'; url: string; headers?: Record<string, string> };
+  | { type: 'http'; url: string; headers?: Record<string, string>; timeout?: number };
 
 /**
  * Extra MCP servers reachable via the ai-01 proxy container (TBXark on port 9090),
@@ -656,6 +656,10 @@ function buildExtraMcpServers(): Record<string, ExtraMcpServer> {
       type: 'http',
       url,
       headers: { Authorization: `Bearer ${token}` },
+      // 30 min — matches roo-state-manager LLM condense timeout (openai.ts:82).
+      // Long-running tool calls like roosync_dashboard condense invoke Qwen3.6
+      // thinking mode which can take >30s on 40KB prompts.
+      timeout: 1800,
     };
   }
 
