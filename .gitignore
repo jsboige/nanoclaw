@@ -28,6 +28,25 @@ groups/*
 # Temp files
 .tmp-*
 
+# Pre-migration snapshots (contain env.plain with secrets)
+.v1-backup/
+.upgrade-worktree/
+.migrate-worktree/
+
+# Playwright MCP artifacts (debug screenshots, console logs, snapshots)
+.playwright-mcp/
+*-screenshot.png
+id-switcher-check.png
+menu-state.png
+switcher-open.png
+
+# Fork-specific (pre-v2)
+deploy/.env
+.claude/local/
+
+# roo-state-manager Linux build artifacts
+deploy/roo-state-manager/
+
 # OS
 .DS_Store
 
