@@ -25,6 +25,11 @@ groups/global/*
 # Temp files
 .tmp-*
 
+# Pre-migration snapshots (contain env.plain with secrets)
+.v1-backup/
+.upgrade-worktree/
+.migrate-worktree/
+
 # Playwright MCP artifacts (debug screenshots, console logs, snapshots)
 .playwright-mcp/
 *-screenshot.png
