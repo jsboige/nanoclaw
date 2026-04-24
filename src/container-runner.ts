@@ -427,6 +427,19 @@ async function buildContainerArgs(
   // Everything NanoClaw-specific is in container.json (read by runner at startup).
   args.push('-e', `TZ=${TIMEZONE}`);
 
+  // jsboige/nanoclaw fork patch — host env passthrough (PATCHES.md#1).
+  // `GH_TOKEN_*` — multi-identity-github skill switches `gh auth` per repo owner.
+  // `MCP_PROXY_BEARER`, `MCP_TOOL_TIMEOUT_MS` — roo-state-manager HTTP MCP via
+  //   mcp-remote (stdio wrapper) + timeout override for long-running tools.
+  // `ASR_*` — Telegram voice-transcription skill (host-side ASR endpoint).
+  // Exit condition: v2 grows a container.json:env passthrough field.
+  const ENV_PASSTHROUGH_PREFIXES = ['GH_TOKEN_', 'MCP_', 'ASR_'];
+  for (const key of Object.keys(process.env)) {
+    if (ENV_PASSTHROUGH_PREFIXES.some((p) => key.startsWith(p))) {
+      args.push('-e', `${key}=${process.env[key]}`);
+    }
+  }
+
   // Provider-contributed env vars (e.g. XDG_DATA_HOME, OPENCODE_*, NO_PROXY).
   if (providerContribution.env) {
     for (const [key, value] of Object.entries(providerContribution.env)) {

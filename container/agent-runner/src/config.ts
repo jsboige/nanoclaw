@@ -23,6 +23,27 @@ const DEFAULT_MAX_MESSAGES = 10;
 let _config: RunnerConfig | null = null;
 
 /**
+ * jsboige/nanoclaw fork patch — expand `${VAR}` references against process.env
+ * before handing the config to the SDK. Lets container.json reference secrets
+ * that arrive via `docker -e` rather than being baked into a committed file.
+ * PATCHES.md#6. Exit condition: upstream grows native env-substitution.
+ */
+function expandEnv<T>(value: T): T {
+  if (typeof value === 'string') {
+    return value.replace(/\$\{([A-Z0-9_]+)\}/gi, (_m, name) => process.env[name] ?? '') as unknown as T;
+  }
+  if (Array.isArray(value)) {
+    return value.map((v) => expandEnv(v)) as unknown as T;
+  }
+  if (value && typeof value === 'object') {
+    const out: Record<string, unknown> = {};
+    for (const [k, v] of Object.entries(value as Record<string, unknown>)) out[k] = expandEnv(v);
+    return out as unknown as T;
+  }
+  return value;
+}
+
+/**
  * Load config from container.json. Called once at startup.
  * Falls back to sensible defaults for any missing field.
  */
@@ -36,13 +57,17 @@ export function loadConfig(): RunnerConfig {
     console.error(`[config] Failed to read ${CONFIG_PATH}, using defaults`);
   }
 
+  const mcpServers = expandEnv(
+    (raw.mcpServers as RunnerConfig['mcpServers']) || {},
+  );
+
   _config = {
     provider: (raw.provider as string) || 'claude',
     assistantName: (raw.assistantName as string) || '',
     groupName: (raw.groupName as string) || '',
     agentGroupId: (raw.agentGroupId as string) || '',
     maxMessagesPerPrompt: (raw.maxMessagesPerPrompt as number) || DEFAULT_MAX_MESSAGES,
-    mcpServers: (raw.mcpServers as RunnerConfig['mcpServers']) || {},
+    mcpServers,
   };
 
   return _config;
