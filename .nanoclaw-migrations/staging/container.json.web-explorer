@@ -1,0 +1,9 @@
+{
+  "mcpServers": {},
+  "packages": { "apt": [], "npm": [] },
+  "additionalMounts": [],
+  "skills": "all",
+  "provider": "claude",
+  "groupName": "WebExplorer",
+  "assistantName": "WebExplorer"
+}

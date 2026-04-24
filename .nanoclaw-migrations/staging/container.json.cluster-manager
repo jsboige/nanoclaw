@@ -1,0 +1,30 @@
+{
+  "mcpServers": {
+    "roo-state-manager": {
+      "command": "npx",
+      "args": [
+        "-y",
+        "mcp-remote",
+        "https://mcp-tools.myia.io/mcp",
+        "--header",
+        "Authorization:Bearer ${MCP_PROXY_BEARER}"
+      ],
+      "env": {
+        "MCP_PROXY_BEARER": "${MCP_PROXY_BEARER}"
+      },
+      "instructions": "Use mcp__roo-state-manager__* tools for cluster coordination: dashboards (roosync_dashboard), conversation history (conversation_browser), code search (codebase_search), cross-machine messaging (roosync_send/roosync_read). Always pass workspace='nanoclaw' for workspace-scoped dashboards. Call conversation_browser(action: 'list') BEFORE other actions — IDs are required. Dashboard auto-condenses at 50KB; condense manually with roosync_dashboard(action: 'condense') if LLM backend is down."
+    }
+  },
+  "packages": { "apt": [], "npm": [] },
+  "additionalMounts": [
+    {
+      "hostPath": "G:\\Mon Drive\\Synchronisation\\RooSync\\.shared-state",
+      "containerPath": "roosync",
+      "readonly": true
+    }
+  ],
+  "skills": "all",
+  "provider": "claude",
+  "groupName": "ClusterManager",
+  "assistantName": "ClusterManager"
+}

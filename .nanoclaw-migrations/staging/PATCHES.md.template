@@ -1,0 +1,96 @@
+# PATCHES — jsboige/nanoclaw fork
+
+Minimal `src/` patches applied on top of upstream v2. Every entry MUST include its commit hash, reason, and exit condition. Target: ≤ 10 active patches at any time. Monthly review removes those whose exit condition is satisfied.
+
+## Anti-divergence discipline
+
+Before adding a new patch, verify none of these alternatives suffice:
+
+1. Config value / env var / `.env` entry
+2. Skill in `.claude/skills/<name>/` or `container/skills/<name>/`
+3. Fragment in `groups/<folder>/CLAUDE.local.md` (per-group) or append to `container/CLAUDE.md` (global)
+4. MCP server entry in `groups/<folder>/container.json:mcpServers`
+5. Branch-installed channel/provider (via `/add-<name>` skill)
+
+If none works, document the patch here with justification.
+
+---
+
+## Active patches
+
+### 1. Container env passthrough for GH_TOKEN_*
+
+- **Commit:** `<fill after apply>`
+- **File:** `src/container-runner.ts` (function `buildContainerArgs`)
+- **Summary:** Add an allowlist of env var prefixes (`GH_TOKEN_*`, `ASR_*`) passed from host env to container via `-e KEY=VALUE` spawn args.
+- **Why:** v2 does not provide a per-group env passthrough mechanism. Our `multi-identity-github` skill and ASR integration need these env vars inside the container. The container.json `McpServerConfig.env` only applies to MCP servers' subprocesses, not the agent runtime.
+- **Exit condition:** Upstream adds a `container.json:env` field (per-group env passthrough) OR a `src/container-runner.ts` hook for supplementary env.
+- **Lines:** ~5-10
+
+### 2. MCP tool timeout from env var
+
+- **Commit:** `<fill after apply>`
+- **File:** `container/agent-runner/src/providers/claude.ts`
+- **Summary:** Read `MCP_TOOL_TIMEOUT_MS` env var (default 60000) and apply it to all `mcpServers` passed to the Claude SDK.
+- **Why:** Some MCP tools (roo-state-manager dashboard condense with local LLM) legitimately take > 60s. v2 `McpServerConfig` has no `timeout` field. Without this patch, long-running tools fail with default 60s timeout. Our production value: 1800000 (30 min).
+- **Exit condition:** Upstream accepts PR adding `timeout?: number` field to `McpServerConfig` in `src/container-config.ts` propagated through to the agent-runner.
+- **Lines:** ~5
+- **Upstream PR:** `<fill after open>`
+
+### 3. Non-negotiable rules in container/CLAUDE.md
+
+- **Commit:** `<fill after apply>`
+- **File:** `container/CLAUDE.md`
+- **Summary:** Append our 8 non-negotiable rules + PR review requirements after the existing v2 content.
+- **Why:** These rules must apply to ALL agents in this install. v2 deletes `groups/global/` (the old location). Alternatives considered: (a) per-group `CLAUDE.local.md` duplication — fragile, easy to forget for new groups; (b) a separate skill — skills are toggleable per group, these rules must NOT be. `container/CLAUDE.md` is the only always-loaded, always-all-agents surface.
+- **Exit condition:** Upstream adds a `container/CLAUDE.local.md` (per-install, not tracked) or a similar mechanism for install-global rules. OR we cease to care about these rules (unlikely).
+- **Lines:** ~30 (content, not code)
+
+### 4. Docker network name per agent_group
+
+- **Commit:** `<fill after apply — ONLY if needed>`
+- **File:** `src/container-runner.ts` (function `buildContainerArgs`, network selection)
+- **Summary:** Read `container.json:dockerNetwork` (new field) and add `--network <name>` to `docker run` args.
+- **Why:** cluster-manager and web-explorer need different network isolation — cluster-manager on `internal:true` (no internet), web-explorer on standard bridge. v2 `buildContainerArgs` hardcodes host gateway network.
+- **Exit condition:** Upstream adds the `container.json:dockerNetwork` field (or equivalent) natively.
+- **Lines:** ~10
+- **Status:** Not yet applied. Apply ONLY when starting Exp 2 (web-explorer). Issue #5.
+
+### 5. Telegram voice transcription (ASR)
+
+- **Status:** DEFERRED post-migration. Not applied on day 1. Tracking issue to be opened.
+- **Plan:** Implement as container skill `container/skills/voice-transcription/` that the agent uses when it detects audio content in an inbound message. Agent calls a bash script that fetches the voice file (via Telegram Bot API), POSTs to `ASR_BASE_URL` (Whisper), and receives transcribed text. No patch to the Telegram adapter needed.
+- **Env vars:** `ASR_BASE_URL`, `ASR_API_KEY` — already in `.env`.
+
+---
+
+## Recently removed patches (for reference)
+
+### ~~6. Mount allowlist env override~~ — REMOVED 2026-04-25
+
+- **Was:** v1 commit `55043c2` patched `src/config.ts` to read `NANOCLAW_MOUNT_ALLOWLIST_PATH` env var.
+- **Reason for removal:** v2 has `src/modules/mount-security/` natively, using `MOUNT_ALLOWLIST_PATH` env var (same concept). No patch needed.
+
+### ~~7. MCP HTTP type for roo-state-manager~~ — REPLACED 2026-04-25
+
+- **Was:** v1 commit `6f90164` patched `container/agent-runner/src/index.ts buildExtraMcpServers()` to support HTTP-type MCP servers.
+- **Reason for removal:** Replaced by `mcp-remote` stdio wrapper declared in `groups/<folder>/container.json:mcpServers`. No patch to core.
+
+### ~~8. RooSync inbox watcher~~ — REMOVED 2026-04-25
+
+- **Was:** v1 commits `509f6fb` + related — `src/roosync-inbox-standalone.ts`, `src/roosync-inbox-watcher.ts` (550 lines).
+- **Reason for removal:** v2 is message-first; all RooSync ops go through the HTTP `roo-state-manager` MCP server (see active patch context). The host no longer needs a RooSync poller.
+
+### ~~9. Credential proxy~~ — REPLACED 2026-04-25
+
+- **Was:** v1 `src/credential-proxy.ts` from merged skill `native-credential-proxy`.
+- **Reason for removal:** Switched to OneCLI Vault for credentials. z.ai routing via OneCLI secret with host-pattern. If OneCLI fails for z.ai, fallback is to merge `upstream/skill/native-credential-proxy` again (which would revive this patch).
+
+---
+
+## Review schedule
+
+- Monthly review of this file. For each active patch, check exit condition.
+- If an exit condition is met: open PR removing the patch, reference this file.
+- If a new upstream release breaks a patch: fix or open discussion upstream, not revert the change silently.
+- Budget: 10 active patches. At 8+, stop adding new and prioritize upstreaming.
