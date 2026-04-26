@@ -1,150 +1,108 @@
 #!/bin/bash
 #
-# Prune stale session artifacts (JSONLs, debug logs, todos, telemetry, group logs).
-# Safe to run while NanoClaw is live — active sessions are read from the DB.
+# Archive (never delete) orphaned v2 session directories.
 #
-# Usage:  ./scripts/cleanup-sessions.sh [--dry-run]
+# A session directory under data/v2-sessions/<agent_group_id>/<session_id>/
+# is considered "orphaned" when its <session_id> no longer appears in the
+# central DB's `sessions` table. Orphaned dirs are tar.gz'd into
+# data/v2-sessions/_archive/<agent_group_id>/<session_id>-<UTC>.tar.gz
+# and only then removed from their original location.
 #
-# Retention:
-#   Session JSONLs + tool-results:  7 days  (active session always kept)
-#   Debug logs:                     3 days
-#   Todo files:                     3 days
-#   Telemetry:                      7 days
-#   Group logs:                     7 days
+# Active sessions (rows in sessions table) are never touched.
+#
+# Usage:  ./scripts/cleanup-sessions.sh [--dry-run] [--min-age-days N]
+#
+#   --dry-run         List what would be archived; touch nothing.
+#   --min-age-days N  Only archive orphaned sessions whose dir mtime is older
+#                     than N days (default: 14). Prevents archiving sessions
+#                     mid-deletion or transient orphans during DB migrations.
 
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 PROJECT_ROOT="$(dirname "$SCRIPT_DIR")"
 
-STORE_DB="$PROJECT_ROOT/store/messages.db"
-SESSIONS_DIR="$PROJECT_ROOT/data/sessions"
-GROUPS_DIR="$PROJECT_ROOT/groups"
+CENTRAL_DB="$PROJECT_ROOT/data/v2.db"
+SESSIONS_ROOT="$PROJECT_ROOT/data/v2-sessions"
+ARCHIVE_ROOT="$SESSIONS_ROOT/_archive"
 
 DRY_RUN=false
-[[ "${1:-}" == "--dry-run" ]] && DRY_RUN=true
+MIN_AGE_DAYS=14
 
-TOTAL_FREED=0
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --dry-run) DRY_RUN=true; shift ;;
+    --min-age-days) MIN_AGE_DAYS="$2"; shift 2 ;;
+    *) echo "Unknown arg: $1" >&2; exit 2 ;;
+  esac
+done
 
 log() { echo "[cleanup] $*"; }
 
-remove() {
-  local target="$1"
-  if $DRY_RUN; then
-    if [ -d "$target" ]; then
-      size=$(du -sk "$target" 2>/dev/null | cut -f1)
-    else
-      size=$(wc -c < "$target" 2>/dev/null || echo 0)
-      size=$((size / 1024))
-    fi
-    TOTAL_FREED=$((TOTAL_FREED + size))
-    log "would remove: $target (${size}K)"
-  else
-    if [ -d "$target" ]; then
-      size=$(du -sk "$target" 2>/dev/null | cut -f1)
-      rm -rf "$target"
-    else
-      size=$(wc -c < "$target" 2>/dev/null || echo 0)
-      size=$((size / 1024))
-      rm -f "$target"
-    fi
-    TOTAL_FREED=$((TOTAL_FREED + size))
-  fi
-}
-
-# --- Collect active session IDs from the database ---
-
-if [ ! -f "$STORE_DB" ]; then
-  log "ERROR: database not found at $STORE_DB"
+if [ ! -f "$CENTRAL_DB" ]; then
+  log "ERROR: central DB not found at $CENTRAL_DB"
   exit 1
 fi
+if [ ! -d "$SESSIONS_ROOT" ]; then
+  log "no sessions dir at $SESSIONS_ROOT — nothing to do"
+  exit 0
+fi
 
-ACTIVE_IDS=$(sqlite3 "$STORE_DB" "SELECT session_id FROM sessions;" 2>/dev/null || true)
+# Collect live session ids. Use a set-of-lines for robust matching.
+ACTIVE_IDS=$(sqlite3 "$CENTRAL_DB" "SELECT id FROM sessions;" 2>/dev/null || true)
 
 is_active() {
-  echo "$ACTIVE_IDS" | grep -qF "$1"
+  local id="$1"
+  printf '%s\n' "$ACTIVE_IDS" | grep -qFx "$id"
 }
 
-# --- Prune session JSONLs and tool-results dirs ---
+ARCHIVED_COUNT=0
+ARCHIVED_BYTES=0
 
-for group_dir in "$SESSIONS_DIR"/*/; do
-  [ -d "$group_dir" ] || continue
-  jsonl_dir="$group_dir/.claude/projects/-workspace-group"
-  [ -d "$jsonl_dir" ] || continue
+mkdir -p "$ARCHIVE_ROOT"
 
-  for jsonl in "$jsonl_dir"/*.jsonl; do
-    [ -f "$jsonl" ] || continue
-    id=$(basename "$jsonl" .jsonl)
+for ag_dir in "$SESSIONS_ROOT"/*/; do
+  [ -d "$ag_dir" ] || continue
+  ag_id="$(basename "$ag_dir")"
+  # Skip the archive dir itself.
+  [ "$ag_id" = "_archive" ] && continue
 
-    # Never delete the active session
-    if is_active "$id"; then
+  for sess_dir in "$ag_dir"*/; do
+    [ -d "$sess_dir" ] || continue
+    sess_id="$(basename "$sess_dir")"
+
+    # Skip active sessions.
+    if is_active "$sess_id"; then
       continue
     fi
 
-    # Only delete if older than 7 days
-    if [ -n "$(find "$jsonl" -mtime +7 2>/dev/null)" ]; then
-      remove "$jsonl"
-      # Remove matching tool-results directory
-      [ -d "$jsonl_dir/$id" ] && remove "$jsonl_dir/$id"
+    # Skip too-recent dirs (transient orphans during migrations / mid-delete).
+    if [ -z "$(find "$sess_dir" -maxdepth 0 -mtime "+$MIN_AGE_DAYS" 2>/dev/null)" ]; then
+      continue
     fi
+
+    size_kb=$(du -sk "$sess_dir" 2>/dev/null | cut -f1)
+    archive_dir="$ARCHIVE_ROOT/$ag_id"
+    mkdir -p "$archive_dir"
+    ts="$(date -u +%Y%m%dT%H%M%SZ)"
+    archive_path="$archive_dir/${sess_id}-${ts}.tar.gz"
+
+    if $DRY_RUN; then
+      log "would archive: $sess_dir (${size_kb}K) → $archive_path"
+    else
+      log "archiving: $sess_dir (${size_kb}K) → $archive_path"
+      # tar from parent so paths inside the archive are relative.
+      tar -czf "$archive_path" -C "$ag_dir" "$sess_id"
+      rm -rf "$sess_dir"
+    fi
+
+    ARCHIVED_COUNT=$((ARCHIVED_COUNT + 1))
+    ARCHIVED_BYTES=$((ARCHIVED_BYTES + size_kb))
   done
 done
 
-# --- Prune debug logs (>3 days, skip files named after active sessions) ---
-
-for group_dir in "$SESSIONS_DIR"/*/; do
-  debug_dir="$group_dir/.claude/debug"
-  [ -d "$debug_dir" ] || continue
-  while IFS= read -r -d '' f; do
-    fname=$(basename "$f" .txt)
-    is_active "$fname" && continue
-    remove "$f"
-  done < <(find "$debug_dir" -type f -mtime +3 ! -name "latest" -print0 2>/dev/null)
-done
-
-# --- Prune todo files (>3 days, skip files named after active sessions) ---
-
-for group_dir in "$SESSIONS_DIR"/*/; do
-  todos_dir="$group_dir/.claude/todos"
-  [ -d "$todos_dir" ] || continue
-  while IFS= read -r -d '' f; do
-    fname=$(basename "$f" .json)
-    # Todo filenames are like {session_id}-agent-{session_id}.json
-    for aid in $ACTIVE_IDS; do
-      if [[ "$fname" == *"$aid"* ]]; then
-        continue 2
-      fi
-    done
-    remove "$f"
-  done < <(find "$todos_dir" -type f -mtime +3 -print0 2>/dev/null)
-done
-
-# --- Prune telemetry (>7 days, skip files named after active sessions) ---
-
-for group_dir in "$SESSIONS_DIR"/*/; do
-  telem_dir="$group_dir/.claude/telemetry"
-  [ -d "$telem_dir" ] || continue
-  while IFS= read -r -d '' f; do
-    fname=$(basename "$f")
-    for aid in $ACTIVE_IDS; do
-      if [[ "$fname" == *"$aid"* ]]; then
-        continue 2
-      fi
-    done
-    remove "$f"
-  done < <(find "$telem_dir" -type f -mtime +7 -print0 2>/dev/null)
-done
-
-# --- Prune group logs (>7 days) ---
-
-while IFS= read -r -d '' f; do
-  remove "$f"
-done < <(find "$GROUPS_DIR"/*/logs -type f -mtime +7 -print0 2>/dev/null)
-
-# --- Summary ---
-
 if $DRY_RUN; then
-  log "DRY RUN complete — would free ~${TOTAL_FREED}K"
+  log "DRY RUN — would archive $ARCHIVED_COUNT session(s), ~${ARCHIVED_BYTES}K"
 else
-  log "Done — freed ~${TOTAL_FREED}K"
+  log "Done — archived $ARCHIVED_COUNT session(s), ~${ARCHIVED_BYTES}K"
 fi
