@@ -293,12 +293,15 @@ export function createChatSdkBridge(config: ChatSdkBridgeConfig): ChannelAdapter
       // Chat SDK dispatch (handling-events.mdx §"Handler dispatch order") is
       // exclusive: subscribed → onSubscribedMessage; unsubscribed+mention →
       // onNewMention; unsubscribed+pattern-match → onNewMessage. Registering
-      // with `/./` lets the router see every plain message on every
-      // unsubscribed thread the bot can see. The router short-circuits via
-      // getMessagingGroupWithAgentCount (~1 DB read) for unwired channels,
-      // so forwarding every one is cheap enough to not need a bridge-side
-      // flood gate.
-      chat.onNewMessage(/./, async (thread, message) => {
+      // with `/.*/` lets the router see every plain message — including
+      // attachment-only messages with empty text (voice notes, stickers,
+      // photos without caption) — on every unsubscribed thread the bot can
+      // see. (`/./` would skip empty text since `.` requires at least one
+      // character, breaking voice-message ASR.) The router short-circuits
+      // via getMessagingGroupWithAgentCount (~1 DB read) for unwired
+      // channels, so forwarding every one is cheap enough to not need a
+      // bridge-side flood gate.
+      chat.onNewMessage(/.*/, async (thread, message) => {
         const channelId = adapter.channelIdFromThreadId(thread.id);
         const { inbound, transcripts } = await messageToInbound(message, false, true);
         await setupConfig.onInbound(channelId, thread.id, inbound);

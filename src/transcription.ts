@@ -5,6 +5,8 @@ interface AsrConfig {
   baseUrl: string;
   apiKey: string;
   model: string;
+  language?: string;
+  prompt?: string;
 }
 
 let cachedConfig: AsrConfig | null | undefined = undefined;
@@ -12,7 +14,7 @@ let cachedConfig: AsrConfig | null | undefined = undefined;
 function loadConfig(): AsrConfig | null {
   if (cachedConfig !== undefined) return cachedConfig;
 
-  const env = readEnvFile(['ASR_BASE_URL', 'ASR_API_KEY', 'ASR_MODEL']);
+  const env = readEnvFile(['ASR_BASE_URL', 'ASR_API_KEY', 'ASR_MODEL', 'ASR_LANGUAGE', 'ASR_PROMPT']);
   const baseUrl = process.env.ASR_BASE_URL || env.ASR_BASE_URL;
   const apiKey = process.env.ASR_API_KEY || env.ASR_API_KEY;
 
@@ -25,6 +27,8 @@ function loadConfig(): AsrConfig | null {
     baseUrl: baseUrl.replace(/\/+$/, ''),
     apiKey,
     model: process.env.ASR_MODEL || env.ASR_MODEL || 'whisper-1',
+    language: process.env.ASR_LANGUAGE || env.ASR_LANGUAGE || undefined,
+    prompt: process.env.ASR_PROMPT || env.ASR_PROMPT || undefined,
   };
   return cachedConfig;
 }
@@ -56,6 +60,10 @@ export async function transcribeAudioBuffer(
     const form = new FormData();
     form.append('file', new Blob([buffer], { type: mime }), filename);
     form.append('model', config.model);
+    // language hint stops Whisper from misdetecting the language on short
+    // clips (auto-detection is unreliable below ~5s of speech).
+    if (config.language) form.append('language', config.language);
+    if (config.prompt) form.append('prompt', config.prompt);
 
     const url = `${config.baseUrl}/audio/transcriptions`;
     const resp = await fetch(url, {

@@ -13,6 +13,7 @@ import { runMigrations } from './db/migrations/index.js';
 import { ensureContainerRuntimeRunning, cleanupOrphans } from './container-runtime.js';
 import { startActiveDeliveryPoll, startSweepDeliveryPoll, setDeliveryAdapter, stopDeliveryPolls } from './delivery.js';
 import { startHostSweep, stopHostSweep } from './host-sweep.js';
+import { startIpcWatcher, stopIpcWatcher } from './ipc-watcher.js';
 import { routeInbound } from './router.js';
 import { log } from './log.js';
 
@@ -159,6 +160,10 @@ async function main(): Promise<void> {
   startHostSweep();
   log.info('Host sweep started');
 
+  // 7. Start IPC watcher (consumes data/ipc/<folder>/messages/*.json from
+  //    out-of-process producers like roosync-inbox-standalone).
+  startIpcWatcher();
+
   log.info('NanoClaw running');
 }
 
@@ -174,6 +179,7 @@ async function shutdown(signal: string): Promise<void> {
   }
   stopDeliveryPolls();
   stopHostSweep();
+  stopIpcWatcher();
   await teardownChannelAdapters();
   process.exit(0);
 }
