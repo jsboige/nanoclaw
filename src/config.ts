@@ -38,18 +38,25 @@ export const CONTAINER_MAX_OUTPUT_SIZE = parseInt(process.env.CONTAINER_MAX_OUTP
 export const ONECLI_URL = process.env.ONECLI_URL || envConfig.ONECLI_URL;
 export const ONECLI_API_KEY = process.env.ONECLI_API_KEY || envConfig.ONECLI_API_KEY;
 
-// Local-only OneCLI policy: refuse to start the host if ONECLI_URL is missing
-// or points at the public cloud. The user explicitly forbade external fallback —
-// credentials must stay on this machine. The .onecli.sh check covers both
-// app.onecli.sh and the SDK's DEFAULT_URL fallback when the var is empty.
-if (!ONECLI_URL || /onecli\.sh/i.test(ONECLI_URL)) {
-  // eslint-disable-next-line no-console
-  console.error(
-    `[config] FATAL: ONECLI_URL must point to a local OneCLI gateway. ` +
-      `Got: ${ONECLI_URL || '(unset, SDK would fall back to https://app.onecli.sh)'}. ` +
-      `External fallback is forbidden.`,
-  );
-  process.exit(1);
+/**
+ * Local-only OneCLI policy: refuse to start the host if ONECLI_URL is missing
+ * or points at the public cloud. The user explicitly forbade external fallback —
+ * credentials must stay on this machine. Called from src/index.ts at startup
+ * (not at module-import time, so tests can import config freely).
+ *
+ * The `.onecli.sh` substring matches both app.onecli.sh and the SDK's
+ * DEFAULT_URL fallback when the var is empty.
+ */
+export function assertLocalOnecli(): void {
+  if (!ONECLI_URL || /onecli\.sh/i.test(ONECLI_URL)) {
+    // eslint-disable-next-line no-console
+    console.error(
+      `[config] FATAL: ONECLI_URL must point to a local OneCLI gateway. ` +
+        `Got: ${ONECLI_URL || '(unset, SDK would fall back to https://app.onecli.sh)'}. ` +
+        `External fallback is forbidden.`,
+    );
+    process.exit(1);
+  }
 }
 export const MAX_MESSAGES_PER_PROMPT = Math.max(1, parseInt(process.env.MAX_MESSAGES_PER_PROMPT || '10', 10) || 10);
 export const IDLE_TIMEOUT = parseInt(process.env.IDLE_TIMEOUT || '1800000', 10); // 30min default — how long to keep container alive after last result

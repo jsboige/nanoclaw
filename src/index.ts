@@ -6,7 +6,7 @@
  */
 import path from 'path';
 
-import { DATA_DIR } from './config.js';
+import { DATA_DIR, assertLocalOnecli } from './config.js';
 import { migrateGroupsToClaudeLocal } from './claude-md-compose.js';
 import { initDb } from './db/connection.js';
 import { runMigrations } from './db/migrations/index.js';
@@ -58,6 +58,11 @@ import { initChannelAdapters, teardownChannelAdapters, getChannelAdapter } from 
 
 async function main(): Promise<void> {
   log.info('NanoClaw starting');
+
+  // 0. Refuse to run if ONECLI_URL points at the cloud (or is unset). This is
+  //    a runtime check rather than a module-load assertion so tests and tools
+  //    can import ./config freely without an env var.
+  assertLocalOnecli();
 
   // 1. Init central DB
   const dbPath = path.join(DATA_DIR, 'v2.db');
