@@ -14,21 +14,12 @@ const env = readEnvFile([
 const SHARED = process.env.ROOSYNC_SHARED_PATH || env.ROOSYNC_SHARED_PATH || '';
 const MACHINE = process.env.ROOSYNC_MACHINE_ID || env.ROOSYNC_MACHINE_ID || '';
 const WORKSPACE = process.env.ROOSYNC_WORKSPACE || env.ROOSYNC_WORKSPACE || '';
-const EXTRA_TARGETS_RAW =
-  process.env.ROOSYNC_INBOX_EXTRA_TARGETS ||
-  env.ROOSYNC_INBOX_EXTRA_TARGETS ||
-  '';
+const EXTRA_TARGETS_RAW = process.env.ROOSYNC_INBOX_EXTRA_TARGETS || env.ROOSYNC_INBOX_EXTRA_TARGETS || '';
 const POLL_MS = Math.max(
   1000,
-  parseInt(
-    process.env.ROOSYNC_INBOX_POLL_INTERVAL ||
-      env.ROOSYNC_INBOX_POLL_INTERVAL ||
-      '15000',
-    10,
-  ) || 15000,
+  parseInt(process.env.ROOSYNC_INBOX_POLL_INTERVAL || env.ROOSYNC_INBOX_POLL_INTERVAL || '15000', 10) || 15000,
 );
-const MAIN_GROUP_FOLDER =
-  process.env.ROOSYNC_INBOX_IPC_GROUP_FOLDER || 'telegram_main';
+const MAIN_GROUP_FOLDER = process.env.ROOSYNC_INBOX_IPC_GROUP_FOLDER || 'telegram_main';
 const DATA_DIR = path.resolve(process.cwd(), 'data');
 
 const CUTOFF_DAYS = 3;
@@ -45,17 +36,11 @@ const INBOX_DIR = path.join(SHARED, 'messages', 'inbox');
 // ROOSYNC_INBOX_EXTRA_TARGETS is a comma-separated list of additional
 // "machineId:workspace" pairs the watcher will also accept.
 const EXPECTED_TARGETS = new Set<string>(
-  [
-    `${MACHINE}:${WORKSPACE}`,
-    ...EXTRA_TARGETS_RAW.split(',').map((s) => s.trim()),
-  ].filter((t) => t.length > 0 && t.includes(':')),
+  [`${MACHINE}:${WORKSPACE}`, ...EXTRA_TARGETS_RAW.split(',').map((s) => s.trim())].filter(
+    (t) => t.length > 0 && t.includes(':'),
+  ),
 );
-const IPC_MESSAGES_DIR = path.join(
-  DATA_DIR,
-  'ipc',
-  MAIN_GROUP_FOLDER,
-  'messages',
-);
+const IPC_MESSAGES_DIR = path.join(DATA_DIR, 'ipc', MAIN_GROUP_FOLDER, 'messages');
 const STATE_FILE = path.join(DATA_DIR, 'roosync-inbox-processed.json');
 
 function log(level: 'info' | 'warn' | 'error', data: Record<string, unknown>) {
@@ -96,8 +81,7 @@ function loadProcessed(): Set<string> {
     const parsed = JSON.parse(fs.readFileSync(STATE_FILE, 'utf-8')) as {
       ids?: string[];
     };
-    if (Array.isArray(parsed.ids))
-      return new Set(parsed.ids.slice(-PROCESSED_MAX));
+    if (Array.isArray(parsed.ids)) return new Set(parsed.ids.slice(-PROCESSED_MAX));
   } catch (err) {
     log('warn', {
       msg: 'failed to load state',
