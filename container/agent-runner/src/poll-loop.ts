@@ -9,6 +9,7 @@ import {
   setContinuation,
 } from './db/session-state.js';
 import { formatMessages, extractRouting, categorizeMessage, isClearCommand, stripInternalTags, type RoutingContext } from './formatter.js';
+import { formatFailures, probeMcpRemoteCached, type RequiredRemote } from './mcp-health.js';
 import type { AgentProvider, AgentQuery, ProviderEvent } from './providers/types.js';
 
 const POLL_INTERVAL_MS = 1000;
@@ -34,6 +35,12 @@ export interface PollLoopConfig {
   systemContext?: {
     instructions?: string;
   };
+  /**
+   * MCP remotes that must be reachable before each turn. If any are down,
+   * the turn is blocked with an explicit 🛑 message (no silent partial
+   * operation). Cached 60s to avoid hammering the proxy.
+   */
+  requiredRemotes?: RequiredRemote[];
 }
 
 /**
@@ -171,6 +178,40 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
     if (keep.length === 0) {
       log(`All ${normalMessages.length} non-command message(s) gated by script, skipping query`);
       continue;
+    }
+
+    // Per-turn fail-fast: refuse to call the provider when a required MCP
+    // remote is down. Better to surface an explicit 🛑 than to let the
+    // agent reply with sk-agent still working while roo-state-manager 404s
+    // — partial degraded operation is the failure mode this guards against.
+    // Cached 60s in mcp-health so this isn't a per-batch hot path.
+    if (config.requiredRemotes && config.requiredRemotes.length > 0) {
+      const healthResults = await Promise.all(
+        config.requiredRemotes.map(async (r) => ({
+          name: r.name,
+          result: await probeMcpRemoteCached(r.parsed),
+        })),
+      );
+      const failed = healthResults.filter((h) => !h.result.ok);
+      if (failed.length > 0) {
+        const failList = formatFailures(failed);
+        log(`BLOCKED: required MCP remote(s) DOWN — ${failList}`);
+        const blockedIds = keep.map((m) => m.id);
+        if (routing.platformId && routing.channelType) {
+          writeMessageOut({
+            id: generateId(),
+            kind: 'chat',
+            platform_id: routing.platformId,
+            channel_type: routing.channelType,
+            thread_id: routing.threadId,
+            content: JSON.stringify({
+              text: `🛑 BLOCKED: required MCP server(s) unreachable: ${failList}\n\nNot processing this message — repair in progress, retry after the chain recovers.`,
+            }),
+          });
+        }
+        markCompleted(blockedIds);
+        continue;
+      }
     }
 
     // Format messages: passthrough commands get raw text (only if the

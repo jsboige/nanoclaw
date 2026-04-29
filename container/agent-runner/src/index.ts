@@ -26,7 +26,9 @@ import path from 'path';
 import { fileURLToPath } from 'url';
 
 import { loadConfig } from './config.js';
-import { buildSystemPromptAddendum } from './destinations.js';
+import { writeMessageOut } from './db/messages-out.js';
+import { buildSystemPromptAddendum, getAllDestinations } from './destinations.js';
+import { formatFailures, probeMcpRemote, selectRequiredRemotes, type RequiredRemote } from './mcp-health.js';
 // Providers barrel — each enabled provider self-registers on import.
 // Provider skills append imports to providers/index.ts.
 import './providers/index.js';
@@ -86,6 +88,48 @@ async function main(): Promise<void> {
     log(`Additional MCP server: ${name} (${serverConfig.command})`);
   }
 
+  // Boot-time fail-fast: probe each required mcp-remote. If anything required
+  // is unreachable, exit 1 — the host will spawn a fresh container, which
+  // re-checks. Once the chain recovers (the watchdog auto-repairs at
+  // D:\roo-extensions\scripts\mcp-watchdog\) the next boot succeeds. Surface
+  // an explicit message to the first configured destination so a human sees
+  // the halt instead of a silent loop.
+  const requiredRemotes = selectRequiredRemotes(
+    config.mcpServers as Record<string, { command: string; args: string[]; env?: Record<string, string>; required?: boolean }>,
+  );
+  if (requiredRemotes.length > 0) {
+    log(`Health-checking ${requiredRemotes.length} required MCP remote(s): ${requiredRemotes.map((r) => r.name).join(', ')}`);
+    const results = await Promise.all(
+      requiredRemotes.map(async (r) => ({ name: r.name, result: await probeMcpRemote(r.parsed) })),
+    );
+    const failed = results.filter((r) => !r.result.ok);
+    if (failed.length > 0) {
+      const failList = formatFailures(failed);
+      log(`FATAL: required MCP server(s) unreachable: ${failList}`);
+      try {
+        const dests = getAllDestinations();
+        const dest = dests[0];
+        if (dest) {
+          const platformId = dest.type === 'channel' ? dest.platformId! : dest.agentGroupId!;
+          const channelType = dest.type === 'channel' ? dest.channelType! : 'agent';
+          writeMessageOut({
+            id: `health-alert-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+            kind: 'chat',
+            platform_id: platformId,
+            channel_type: channelType,
+            content: JSON.stringify({
+              text: `🛑 Agent halted: required MCP server(s) unreachable.\n\n${failList}\n\nThe container will exit and the host will retry. If the chain stays down, manual repair is required (see watchdog log on the host).`,
+            }),
+          });
+        }
+      } catch (err) {
+        log(`Failed to write health alert: ${err instanceof Error ? err.message : String(err)}`);
+      }
+      process.exit(1);
+    }
+    log('All required MCP remotes healthy.');
+  }
+
   const provider = createProvider(providerName, {
     assistantName: config.assistantName || undefined,
     mcpServers,
@@ -98,6 +142,7 @@ async function main(): Promise<void> {
     providerName,
     cwd: CWD,
     systemContext: { instructions },
+    requiredRemotes,
   });
 }
 
