@@ -22,6 +22,12 @@ export interface McpServerConfig {
   // content to `.claude-fragments/mcp-<name>.md` at spawn and imports it
   // into the composed CLAUDE.md.
   instructions?: string;
+  // Fail-fast policy for mcp-remote servers. Default: an mcp-remote
+  // server is required (probed at boot + every turn; if unreachable the
+  // container halts / the turn is blocked). Set to false to opt out — the
+  // server stays wired but its absence won't stop the agent. See
+  // container/agent-runner/src/mcp-health.ts.
+  required?: boolean;
 }
 
 export interface AdditionalMountConfig {
