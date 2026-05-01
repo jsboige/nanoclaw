@@ -130,6 +130,14 @@ If none works, document the patch here with justification.
 - **Exit condition:** Migrate to a container skill `container/skills/voice-transcription/` that the agent invokes (planned in PATCHES.md original entry #9). Once the skill ships, this host-side path can be removed.
 - **Lines:** ~80 (module) + ~20 (channel integration).
 
+### 13. Filesystem-safe per-agent message id separator (`messageIdForAgent`)
+
+- **File:** `src/router.ts` (function `messageIdForAgent` at end of file)
+- **Summary:** Replace `${id}:${agentGroupId}` with `${id}_${agentGroupId}` and strip any remaining `:` from `baseId`. Result: id like `-5256188832_1581_ag-...` instead of `-5256188832:1581:ag-...`.
+- **Why:** Upstream sync `94170b0` (v2.0.13..v2.0.23) introduced this helper with `:` as separator. Telegram's `message.id` is already `${chatId}:${msgId}`, so the result has 2 colons. The id is consumed as a filesystem directory name in `session-manager.ts:extractAttachmentFiles` (line 291). On Windows NTFS, `:` is reserved (drive prefix and alternate data streams), so `mkdirSync(inbox/<id>)` fails with ENOENT, which crashes inbound routing for every voice/attachment message and eventually kills the host process. POSIX hosts (upstream's default test surface) accept `:` in filenames so upstream did not see this regression. `isSafeAttachmentName` doesn't catch it either — it tests for `/`, `\`, NUL, and `path.basename(name) === name`, which all pass on this id.
+- **Exit condition:** Upstream changes `messageIdForAgent` to use a filesystem-safe separator (e.g. `_`) or sanitizes the id before it reaches the inbox path.
+- **Lines:** ~10 (1 expression change + 8 lines of explanatory comment).
+
 ---
 
 ## Deferred / not yet applied

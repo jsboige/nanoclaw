@@ -489,8 +489,15 @@ async function deliverToAgent(
  * session DBs. messages_in.id is PRIMARY KEY, so reuse of the raw id would
  * collide across sessions (or, more subtly, within one session if re-routed
  * after a retry). Namespace by agent_group_id to keep ids unique per session.
+ *
+ * Patch (overlay #13, see PATCHES.md): use '_' instead of ':' as separator,
+ * and replace any ':' coming from `baseId`. Telegram's `message.id` is
+ * `${chatId}:${msgId}` already, and the resulting id is consumed as a
+ * filesystem directory name in `session-manager.ts:extractAttachmentFiles`.
+ * On Windows NTFS, ':' is reserved (drive prefix + alternate data streams),
+ * so `mkdirSync(inbox/<id>)` fails with ENOENT and crashes inbound routing.
  */
 function messageIdForAgent(baseId: string | undefined, agentGroupId: string): string {
   const id = baseId && baseId.length > 0 ? baseId : generateId();
-  return `${id}:${agentGroupId}`;
+  return `${id}_${agentGroupId}`.replace(/:/g, '_');
 }
