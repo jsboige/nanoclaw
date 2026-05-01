@@ -257,9 +257,13 @@ const CLAUDE_CODE_AUTO_COMPACT_WINDOW = process.env.CLAUDE_CODE_AUTO_COMPACT_WIN
 /**
  * Stale-session detection. Matches Claude Code's error text when a
  * resumed session can't be found — missing transcript .jsonl, unknown
- * session ID, etc.
+ * session ID, etc. Also matches the synthetic "MCP servers not connected"
+ * error from translateEvents — when init reports a required MCP as
+ * failed/missing, the safest recovery is to drop the continuation so the
+ * next attempt starts a fresh session (the broken init might be tied to
+ * the resumed transcript's stored tool registry).
  */
-const STALE_SESSION_RE = /no conversation found|ENOENT.*\.jsonl|session.*not found/i;
+const STALE_SESSION_RE = /no conversation found|ENOENT.*\.jsonl|session.*not found|MCP servers not connected at init/i;
 
 export class ClaudeProvider implements AgentProvider {
   readonly supportsNativeSlashCommands = true;
@@ -320,6 +324,7 @@ export class ClaudeProvider implements AgentProvider {
     });
 
     let aborted = false;
+    const requiredMcpServers = Object.keys(this.mcpServers);
 
     async function* translateEvents(): AsyncGenerator<ProviderEvent> {
       let messageCount = 0;
@@ -331,6 +336,33 @@ export class ClaudeProvider implements AgentProvider {
         yield { type: 'activity' };
 
         if (message.type === 'system' && message.subtype === 'init') {
+          // Issue #27: catch the failure mode where the SDK's MCP registry is
+          // empty/broken even though the HTTP chain probe in mcp-health.ts
+          // says everything is fine. We only throw on TERMINAL failure
+          // states ('failed', 'needs-auth'): 'pending' is the normal
+          // mid-handshake state the SDK reports while async MCP connections
+          // are still completing, and rejecting it would block every
+          // healthy startup. 'connected' and 'disabled' are fine.
+          // A required server missing from mcp_servers[] entirely is also
+          // treated as a soft warning, not fatal — the SDK may not have
+          // populated that array yet at init time.
+          const initMsg = message as { mcp_servers?: { name: string; status: string }[]; session_id: string };
+          const reportedServers = initMsg.mcp_servers ?? [];
+          const TERMINAL_FAILURE_STATUSES = new Set(['failed', 'needs-auth']);
+          const reports = requiredMcpServers.map((name) => {
+            const entry = reportedServers.find((s) => s.name === name);
+            return { name, status: entry?.status ?? 'missing' };
+          });
+          const failed = reports.filter((s) => TERMINAL_FAILURE_STATUSES.has(s.status));
+          const nonConnected = reports.filter((s) => s.status !== 'connected');
+          if (nonConnected.length > 0) {
+            const summary = nonConnected.map((d) => `${d.name}=${d.status}`).join(', ');
+            log(`MCP init status — ${summary} (session ${initMsg.session_id})`);
+          }
+          if (failed.length > 0) {
+            const summary = failed.map((d) => `${d.name}=${d.status}`).join(', ');
+            throw new Error(`MCP servers not connected at init: ${summary}`);
+          }
           yield { type: 'init', continuation: message.session_id };
         } else if (message.type === 'result') {
           const text = 'result' in message ? (message as { result?: string }).result ?? null : null;

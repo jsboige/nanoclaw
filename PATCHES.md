@@ -85,14 +85,14 @@ If none works, document the patch here with justification.
 - **Exit condition:** Upstream adds a native concurrency cap on container spawning, or the host-sweep grows queue-aware backpressure.
 - **Lines:** ~12.
 
-### 8. Container-side MCP fail-fast probe (`mcp-health.ts`)
+### 8. Container-side MCP fail-fast probe (`mcp-health.ts` + SDK init guard)
 
-- **Commits:** `efc651b` (PR #17)
-- **File:** `container/agent-runner/src/mcp-health.ts` + integration in `index.ts` and `poll-loop.ts`
-- **Summary:** At container boot AND before each turn, probe required `mcp-remote` HTTP MCP endpoints with a JSON-RPC `initialize` call. Halt the container (boot) or block the turn (per-turn) if a required MCP is unreachable. Surfaces explicit `MCP failed` message rather than continuing with degraded tool surface.
-- **Why:** Silent partial-degraded operation is the failure mode that triggered this code: a 404 on `roo-state-manager` was masked by `sk-agent` still working, and the agent kept replying as if everything was fine. Upstream removed `mcp-health.ts` in favor of `circuit-breaker.ts` (host-side startup backoff) which is complementary but does NOT cover the container-side MCP probe.
-- **Exit condition:** Upstream adds container-side MCP health probes (e.g. as part of the agent-runner provider abstraction), or our cluster moves off `mcp-remote` to a transport that fails fast natively.
-- **Lines:** ~150 (module + integration + tests).
+- **Commits:** `efc651b` (PR #17, HTTP probe), follow-up SDK init guard (issue #27).
+- **File:** `container/agent-runner/src/mcp-health.ts` + integration in `index.ts` and `poll-loop.ts`; SDK init guard in `container/agent-runner/src/providers/claude.ts` (`translateEvents`).
+- **Summary:** Two complementary checks. (a) At container boot AND before each turn, probe required `mcp-remote` HTTP MCP endpoints with a JSON-RPC `initialize` call. Halt the container (boot) or block the turn (per-turn) if the chain is unreachable. (b) When the Claude SDK emits its `system/init` message, inspect `mcp_servers[].status` and throw only on **terminal failure** statuses (`'failed'`, `'needs-auth'`). `'pending'` is the normal mid-handshake state — the SDK reports it whenever async MCP connections are still completing — so rejecting it would block every healthy startup. `'connected'` and `'disabled'` are accepted; missing entries are logged but not fatal (the SDK may not have populated the array yet). The poll-loop catches the throw on terminal failure, writes the error to outbound, and (via `STALE_SESSION_RE`) clears `continuation:claude` so the next inbound respawns with a fresh init.
+- **Why:** Silent partial-degraded operation is the failure mode that triggered this code. Two distinct silent-failures observed: (a) `roo-state-manager` 404 masked by `sk-agent` still working, agent kept replying as if everything was fine (PR #17 fix). (b) On z.ai's Anthropic-compatible endpoint, the chain probe passes (HTTP 200 from `mcp-tools.myia.io`) but the SDK reports `mcp_servers[].status='failed'` for one or more required servers — every `mcp__<server>__*` call then returns "No such tool available" while the bot keeps replying "Dashboard MCP DOWN" indefinitely (issue #27, observed 2026-04-24 → 2026-05-01 across 22 occurrences in session 412a71e3). The HTTP probe alone is insufficient — only the SDK's own `mcp_servers[]` status reflects whether tools were actually registered.
+- **Exit condition:** Upstream adds container-side MCP health probes (HTTP + SDK-init coverage) as part of the agent-runner provider abstraction, or our cluster moves off `mcp-remote` to a transport that fails fast natively.
+- **Lines:** ~150 (module + integration + tests) + ~25 (SDK init guard in `claude.ts`).
 
 ### 9. Restored container-side observability surface (`task-run-logs.ts`)
 
