@@ -43,7 +43,7 @@ import {
 } from './db/session-db.js';
 import { log } from './log.js';
 import { openInboundDb, openOutboundDb, inboundDbPath, heartbeatPath } from './session-manager.js';
-import { isContainerRunning, killContainer, wakeContainer } from './container-runner.js';
+import { getContainerSpawnedAt, isContainerRunning, killContainer, wakeContainer } from './container-runner.js';
 import type { Session } from './types.js';
 
 const SWEEP_INTERVAL_MS = 60_000;
@@ -54,6 +54,13 @@ export const ABSOLUTE_CEILING_MS = 30 * 60 * 1000;
 // Stuck tolerance window applied per 'processing' claim — "did we see any
 // signs of life since this message was claimed?"
 export const CLAIM_STUCK_MS = 60 * 1000;
+// Grace window after a container spawn during which we suppress the
+// claim-stuck rule. A fresh container needs a moment to import modules,
+// touch its heartbeat, and DELETE orphan `processing_ack` rows left by a
+// previously crashed container. Without this, a single old claim would
+// loop spawn → kill → respawn forever — the new container never gets to
+// run the cleanup line.
+export const STARTUP_GRACE_MS = 30 * 1000;
 const MAX_TRIES = 5;
 const BACKOFF_BASE_MS = 5000;
 
@@ -72,8 +79,15 @@ export function decideStuckAction(args: {
   heartbeatMtimeMs: number; // 0 when heartbeat file absent
   containerState: ContainerState | null;
   claims: Array<{ message_id: string; status_changed: string }>;
+  /**
+   * Epoch ms when the current container was spawned. Used to suppress the
+   * claim-stuck rule during the startup grace window — a fresh container
+   * needs a moment to clear orphan claims left by a previously crashed
+   * peer. null when the host doesn't track a spawn time (e.g. tests).
+   */
+  spawnedAtMs?: number | null;
 }): StuckDecision {
-  const { now, heartbeatMtimeMs, containerState, claims } = args;
+  const { now, heartbeatMtimeMs, containerState, claims, spawnedAtMs } = args;
   const declaredToolMs = declaredToolTimeoutMs(containerState);
 
   // Ceiling check only applies when we have an actual heartbeat timestamp.
@@ -90,6 +104,15 @@ export function decideStuckAction(args: {
     if (heartbeatAge > ceiling) {
       return { action: 'kill-ceiling', heartbeatAgeMs: heartbeatAge, ceilingMs: ceiling };
     }
+  }
+
+  // Startup grace: while a freshly-spawned container is still importing
+  // modules and clearing orphan processing_ack rows, suppress claim-stuck.
+  // Without this, a stale claim left by a crashed predecessor produces an
+  // infinite kill/respawn loop because the replacement is killed before its
+  // first line of JS runs.
+  if (spawnedAtMs != null && now - spawnedAtMs < STARTUP_GRACE_MS) {
+    return { action: 'ok' };
   }
 
   const tolerance = Math.max(CLAIM_STUCK_MS, declaredToolMs ?? 0);
@@ -222,6 +245,7 @@ function enforceRunningContainerSla(
     heartbeatMtimeMs: heartbeatMtimeMs(agentGroupId, session.id),
     containerState: getContainerState(outDb),
     claims: getProcessingClaims(outDb),
+    spawnedAtMs: getContainerSpawnedAt(session.id),
   });
 
   if (decision.action === 'ok') return;
