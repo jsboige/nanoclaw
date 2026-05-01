@@ -33,7 +33,7 @@
 import net from 'net';
 import path from 'path';
 
-import { DATA_DIR } from '../src/config.js';
+import { DATA_DIR, getCliSocketPath } from '../src/config.js';
 import { createAgentGroup, getAgentGroupByFolder } from '../src/db/agent-groups.js';
 import { initDb } from '../src/db/connection.js';
 import {
@@ -320,7 +320,7 @@ async function sendWelcomeViaCliSocket(
   welcome: string,
   identity: { senderId: string; sender: string },
 ): Promise<void> {
-  const sockPath = path.join(DATA_DIR, 'cli.sock');
+  const sockPath = getCliSocketPath();
 
   await new Promise<void>((resolve, reject) => {
     const socket = net.connect(sockPath);

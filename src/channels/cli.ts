@@ -1,11 +1,13 @@
 /**
- * CLI channel — talk to your agent from a local terminal via Unix socket.
+ * CLI channel — talk to your agent from a local terminal via Unix socket
+ * (POSIX) or named pipe (Windows).
  *
  * Always-on, zero-credentials channel that ships with main. The daemon
- * listens on `data/cli.sock`; the `scripts/chat.ts` client connects, writes
- * a JSON line per message, reads JSON lines back. The channel plumbs into
- * the normal router/delivery path like any other adapter — `/clear` and
- * other session-level commands work identically.
+ * listens on `data/cli.sock` on POSIX or `\\.\pipe\nanoclaw-cli` on Windows;
+ * the `scripts/chat.ts` client connects, writes a JSON line per message,
+ * reads JSON lines back. The channel plumbs into the normal router/delivery
+ * path like any other adapter — `/clear` and other session-level commands
+ * work identically.
  *
  * Wire format: one JSON object per line.
  *
@@ -35,18 +37,14 @@
  */
 import fs from 'fs';
 import net from 'net';
-import path from 'path';
 
-import { DATA_DIR } from '../config.js';
+import { getCliSocketPath } from '../config.js';
 import { log } from '../log.js';
 import type { ChannelAdapter, ChannelSetup, DeliveryAddress, InboundEvent, OutboundMessage } from './adapter.js';
 import { registerChannelAdapter } from './channel-registry.js';
 
 const PLATFORM_ID = 'local';
-
-function socketPath(): string {
-  return path.join(DATA_DIR, 'cli.sock');
-}
+const IS_WINDOWS = process.platform === 'win32';
 
 function createAdapter(): ChannelAdapter {
   let server: net.Server | null = null;
@@ -58,16 +56,19 @@ function createAdapter(): ChannelAdapter {
     supportsThreads: false,
 
     async setup(config: ChannelSetup): Promise<void> {
-      const sock = socketPath();
+      const sock = getCliSocketPath();
 
-      // Stale socket cleanup: a previous run that crashed may have left the
-      // file behind, and net.createServer refuses to bind to an existing path.
-      try {
-        fs.unlinkSync(sock);
-      } catch (err) {
-        const e = err as NodeJS.ErrnoException;
-        if (e.code !== 'ENOENT') {
-          log.warn('Failed to unlink stale CLI socket (will try to bind anyway)', { sock, err });
+      // Stale socket cleanup (POSIX only — Windows named pipes are auto-cleaned
+      // by the OS when the previous owning process exits, and unlink on a
+      // pipe path returns EPERM).
+      if (!IS_WINDOWS) {
+        try {
+          fs.unlinkSync(sock);
+        } catch (err) {
+          const e = err as NodeJS.ErrnoException;
+          if (e.code !== 'ENOENT') {
+            log.warn('Failed to unlink stale CLI socket (will try to bind anyway)', { sock, err });
+          }
         }
       }
 
@@ -75,13 +76,14 @@ function createAdapter(): ChannelAdapter {
       await new Promise<void>((resolve, reject) => {
         server!.once('error', reject);
         server!.listen(sock, () => {
-          // Tighten perms so only the owner can connect. Unix socket files
-          // obey filesystem perms — 0700 on the socket means other local
-          // users can't send into this agent.
-          try {
-            fs.chmodSync(sock, 0o600);
-          } catch (err) {
-            log.warn('Failed to chmod CLI socket (continuing)', { sock, err });
+          // Tighten perms so only the owner can connect (POSIX only — named
+          // pipe ACLs are enforced by the OS, not chmod).
+          if (!IS_WINDOWS) {
+            try {
+              fs.chmodSync(sock, 0o600);
+            } catch (err) {
+              log.warn('Failed to chmod CLI socket (continuing)', { sock, err });
+            }
           }
           log.info('CLI channel listening', { sock });
           resolve();
@@ -104,11 +106,13 @@ function createAdapter(): ChannelAdapter {
         });
         server = null;
       }
-      // Remove the socket file so a relaunch doesn't trip over it.
-      try {
-        fs.unlinkSync(socketPath());
-      } catch {
-        // swallow
+      // Remove the socket file so a relaunch doesn't trip over it (POSIX only).
+      if (!IS_WINDOWS) {
+        try {
+          fs.unlinkSync(getCliSocketPath());
+        } catch {
+          // swallow
+        }
       }
     },
 
