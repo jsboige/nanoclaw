@@ -121,6 +121,12 @@ async function sweep(): Promise<void> {
   if (!running) return;
 
   try {
+    await expireApprovalsTick();
+  } catch (err) {
+    log.error('Approval expiry tick error', { err });
+  }
+
+  try {
     const sessions = getActiveSessions();
     for (const session of sessions) {
       await sweepSession(session);
@@ -130,6 +136,30 @@ async function sweep(): Promise<void> {
   }
 
   setTimeout(sweep, SWEEP_INTERVAL_MS);
+}
+
+async function expireApprovalsTick(): Promise<void> {
+  const { expireStalePendingApprovals } = await import('./db/sessions.js');
+  const expired = expireStalePendingApprovals(new Date().toISOString());
+  if (expired.length === 0) return;
+
+  // Notify each requesting session so the agent learns its approval ran out
+  // instead of silently waiting forever. Best-effort — errors per row don't
+  // stop the others.
+  const { notifyAgent } = await import('./modules/approvals/primitive.js');
+  const { getSession } = await import('./db/sessions.js');
+  for (const a of expired) {
+    log.warn('Approval expired without response', { approvalId: a.approval_id, action: a.action });
+    if (!a.session_id) continue;
+    try {
+      const session = getSession(a.session_id);
+      if (session) {
+        notifyAgent(session, `Approval request expired without response (action=${a.action}).`);
+      }
+    } catch (err) {
+      log.error('Failed to notify agent of expired approval', { approvalId: a.approval_id, err });
+    }
+  }
 }
 
 async function sweepSession(session: Session): Promise<void> {

@@ -34,11 +34,13 @@ if (Test-Path $EnvFile) {
         }
         [Environment]::SetEnvironmentVariable($name, $value, 'Process')
     }
-    "[start-roosync-watcher] Loaded .env from $EnvFile" | Tee-Object -FilePath $LogFile -Append
+    "[start-roosync-watcher] Loaded .env from $EnvFile" | Out-File -FilePath $LogFile -Append -Encoding utf8
 } else {
-    "[start-roosync-watcher] WARNING: .env not found at $EnvFile" | Tee-Object -FilePath $LogFile -Append
+    "[start-roosync-watcher] WARNING: .env not found at $EnvFile" | Out-File -FilePath $LogFile -Append -Encoding utf8
 }
 
-# Launch standalone watcher, appending to the log
-"[start-roosync-watcher] Starting node $EntryPoint (pid $PID)" | Tee-Object -FilePath $LogFile -Append
-& node $EntryPoint *>> $LogFile
+# Launch standalone watcher. Redirecting via Out-File -Encoding utf8 because
+# PowerShell 5.1's `*>>` defaults to Default encoding (UTF-16LE on FR locale),
+# which makes the resulting log file unreadable to grep/tail/awk.
+"[start-roosync-watcher] Starting node $EntryPoint (pid $PID)" | Out-File -FilePath $LogFile -Append -Encoding utf8
+& node $EntryPoint 2>&1 | Out-File -FilePath $LogFile -Append -Encoding utf8

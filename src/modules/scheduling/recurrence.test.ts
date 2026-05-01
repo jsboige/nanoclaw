@@ -7,6 +7,7 @@
  * user-local — a recurring scheduling bug users can't diagnose.
  */
 import fs from 'fs';
+import os from 'os';
 import path from 'path';
 import { afterEach, describe, expect, it } from 'vitest';
 
@@ -15,14 +16,27 @@ import { insertTask } from './db.js';
 import { handleRecurrence } from './recurrence.js';
 import type { Session } from '../../types.js';
 
-const TEST_DIR = '/tmp/nanoclaw-recurrence-test';
+// Per-process tmp dir avoids EPERM under Windows when sibling test files hold
+// open handles to the shared `/tmp/nanoclaw-recurrence-test` location.
+const TEST_DIR = path.join(os.tmpdir(), `nanoclaw-recurrence-test-${process.pid}`);
 const DB_PATH = path.join(TEST_DIR, 'inbound.db');
 
+let openDb: ReturnType<typeof openInboundDb> | null = null;
+
 function freshDb() {
-  if (fs.existsSync(TEST_DIR)) fs.rmSync(TEST_DIR, { recursive: true });
+  if (openDb) {
+    try {
+      openDb.close();
+    } catch {
+      // already closed
+    }
+    openDb = null;
+  }
+  if (fs.existsSync(TEST_DIR)) fs.rmSync(TEST_DIR, { recursive: true, force: true });
   fs.mkdirSync(TEST_DIR, { recursive: true });
   ensureSchema(DB_PATH, 'inbound');
-  return openInboundDb(DB_PATH);
+  openDb = openInboundDb(DB_PATH);
+  return openDb;
 }
 
 function fakeSession(): Session {
@@ -39,7 +53,15 @@ function fakeSession(): Session {
 }
 
 afterEach(() => {
-  if (fs.existsSync(TEST_DIR)) fs.rmSync(TEST_DIR, { recursive: true });
+  if (openDb) {
+    try {
+      openDb.close();
+    } catch {
+      // already closed
+    }
+    openDb = null;
+  }
+  if (fs.existsSync(TEST_DIR)) fs.rmSync(TEST_DIR, { recursive: true, force: true });
 });
 
 describe('handleRecurrence', () => {
@@ -75,6 +97,38 @@ describe('handleRecurrence', () => {
     expect(follow.recurrence).toBe('0 9 * * *');
     expect(follow.series_id).toBe('task-1');
     expect(new Date(follow.process_after).getTime()).toBeGreaterThan(Date.now());
+  });
+
+  it('clears recurrence when cron expression is malformed (no infinite re-error)', async () => {
+    const db = freshDb();
+    insertTask(db, {
+      id: 'task-bad',
+      processAfter: '2020-01-01T00:00:00.000Z',
+      // Invalid: cron-parser rejects ranges where min > max ("21-5" should be
+      // split into "21-23,0-5"). Real-world reproducer from Apr 30 incident.
+      recurrence: '0 21-5 * * *',
+      platformId: null,
+      channelType: null,
+      threadId: null,
+      content: JSON.stringify({ prompt: 'night shift' }),
+    });
+    db.prepare(`UPDATE messages_in SET status='completed' WHERE id='task-bad'`).run();
+
+    await handleRecurrence(db, fakeSession());
+
+    const row = db
+      .prepare(`SELECT id, status, recurrence FROM messages_in WHERE id='task-bad'`)
+      .get() as { id: string; status: string; recurrence: string | null };
+    // Recurrence cleared so the next tick won't pick this row up again.
+    expect(row.recurrence).toBeNull();
+    // No follow-up row created — recurrence was unparseable.
+    const count = (db.prepare(`SELECT COUNT(*) AS c FROM messages_in`).get() as { c: number }).c;
+    expect(count).toBe(1);
+
+    // Idempotent: a second tick should be a no-op.
+    await handleRecurrence(db, fakeSession());
+    const countAfter = (db.prepare(`SELECT COUNT(*) AS c FROM messages_in`).get() as { c: number }).c;
+    expect(countAfter).toBe(1);
   });
 
   it('does not clone rows whose recurrence is already cleared', async () => {

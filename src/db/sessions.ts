@@ -193,6 +193,24 @@ export function getPendingApprovalsByAction(action: string): PendingApproval[] {
 }
 
 /**
+ * Mark every still-pending approval whose `expires_at` is in the past as
+ * `'expired'` and return the affected rows. Caller is responsible for
+ * notifying the requesting session — keeping the DB op pure makes it easy
+ * to test and re-use.
+ */
+export function expireStalePendingApprovals(nowIso: string): PendingApproval[] {
+  const db = getDb();
+  const stale = db
+    .prepare("SELECT * FROM pending_approvals WHERE status = 'pending' AND expires_at IS NOT NULL AND expires_at < ?")
+    .all(nowIso) as PendingApproval[];
+  if (stale.length === 0) return [];
+  db.prepare(
+    "UPDATE pending_approvals SET status = 'expired' WHERE status = 'pending' AND expires_at IS NOT NULL AND expires_at < ?",
+  ).run(nowIso);
+  return stale;
+}
+
+/**
  * Resolve ask_question render metadata (title + normalized options) for any
  * card, regardless of whether it was persisted as a pending_question (generic
  * ask_user_question) or a pending_approval (self-mod / OneCLI credential).
