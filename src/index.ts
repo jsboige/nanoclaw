@@ -7,6 +7,7 @@
 import path from 'path';
 
 import { DATA_DIR, assertLocalOnecli } from './config.js';
+import { enforceStartupBackoff, resetCircuitBreaker } from './circuit-breaker.js';
 import { migrateGroupsToClaudeLocal } from './claude-md-compose.js';
 import { initDb } from './db/connection.js';
 import { runMigrations } from './db/migrations/index.js';
@@ -59,10 +60,13 @@ import { initChannelAdapters, teardownChannelAdapters, getChannelAdapter } from 
 async function main(): Promise<void> {
   log.info('NanoClaw starting');
 
-  // 0. Refuse to run if ONECLI_URL points at the cloud (or is unset). This is
-  //    a runtime check rather than a module-load assertion so tests and tools
-  //    can import ./config freely without an env var.
+  // 0a. [PATCH-myia] Refuse to run if ONECLI_URL points at the cloud (or is
+  //     unset). Runtime check rather than module-load assertion so tests and
+  //     tools can import ./config freely without an env var. See PATCHES.md.
   assertLocalOnecli();
+
+  // 0b. Circuit breaker — backoff on rapid restarts
+  await enforceStartupBackoff();
 
   // 1. Init central DB
   const dbPath = path.join(DATA_DIR, 'v2.db');
@@ -184,9 +188,16 @@ async function shutdown(signal: string): Promise<void> {
   }
   stopDeliveryPolls();
   stopHostSweep();
-  stopIpcWatcher();
-  await teardownChannelAdapters();
-  process.exit(0);
+  stopIpcWatcher(); // [PATCH-myia #10] legacy IPC consumer
+  try {
+    await teardownChannelAdapters();
+  } finally {
+    // Always reset on graceful shutdown — even if teardown threw, we got here
+    // via SIGTERM/SIGINT, not a crash, so the next start shouldn't be counted
+    // as one.
+    resetCircuitBreaker();
+    process.exit(0);
+  }
 }
 
 process.on('SIGTERM', () => shutdown('SIGTERM'));
