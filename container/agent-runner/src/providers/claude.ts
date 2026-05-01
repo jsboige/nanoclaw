@@ -257,9 +257,13 @@ const CLAUDE_CODE_AUTO_COMPACT_WINDOW = process.env.CLAUDE_CODE_AUTO_COMPACT_WIN
 /**
  * Stale-session detection. Matches Claude Code's error text when a
  * resumed session can't be found — missing transcript .jsonl, unknown
- * session ID, etc.
+ * session ID, etc. Also matches the synthetic "MCP servers not connected"
+ * error from translateEvents — when init reports a required MCP as
+ * failed/missing, the safest recovery is to drop the continuation so the
+ * next attempt starts a fresh session (the broken init might be tied to
+ * the resumed transcript's stored tool registry).
  */
-const STALE_SESSION_RE = /no conversation found|ENOENT.*\.jsonl|session.*not found/i;
+const STALE_SESSION_RE = /no conversation found|ENOENT.*\.jsonl|session.*not found|MCP servers not connected at init/i;
 
 export class ClaudeProvider implements AgentProvider {
   readonly supportsNativeSlashCommands = true;
@@ -320,6 +324,7 @@ export class ClaudeProvider implements AgentProvider {
     });
 
     let aborted = false;
+    const requiredMcpServers = Object.keys(this.mcpServers);
 
     async function* translateEvents(): AsyncGenerator<ProviderEvent> {
       let messageCount = 0;
@@ -331,6 +336,28 @@ export class ClaudeProvider implements AgentProvider {
         yield { type: 'activity' };
 
         if (message.type === 'system' && message.subtype === 'init') {
+          // Verify required MCP servers actually connected. The boot-time HTTP
+          // probe in mcp-health.ts confirms the chain is up, but it does NOT
+          // verify the SDK successfully registered the MCP tools. On z.ai's
+          // Anthropic-compatible endpoint we periodically see init succeed
+          // with mcp_servers[].status = 'failed' (issue #27): the model then
+          // gets "No such tool available" for every mcp__<server>__* call and
+          // the bot reports infrastructure DOWN until manually restarted.
+          // Throwing here makes the poll-loop write the error and clear
+          // continuation; the next inbound respawns with a fresh init.
+          const initMsg = message as { mcp_servers?: { name: string; status: string }[]; session_id: string };
+          const reportedServers = initMsg.mcp_servers ?? [];
+          const degraded = requiredMcpServers
+            .map((name) => {
+              const entry = reportedServers.find((s) => s.name === name);
+              return { name, status: entry?.status ?? 'missing' };
+            })
+            .filter((s) => s.status !== 'connected');
+          if (degraded.length > 0) {
+            const summary = degraded.map((d) => `${d.name}=${d.status}`).join(', ');
+            log(`MCP init degraded — ${summary} (session ${initMsg.session_id})`);
+            throw new Error(`MCP servers not connected at init: ${summary}`);
+          }
           yield { type: 'init', continuation: message.session_id };
         } else if (message.type === 'result') {
           const text = 'result' in message ? (message as { result?: string }).result ?? null : null;
