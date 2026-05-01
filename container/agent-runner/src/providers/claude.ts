@@ -336,26 +336,31 @@ export class ClaudeProvider implements AgentProvider {
         yield { type: 'activity' };
 
         if (message.type === 'system' && message.subtype === 'init') {
-          // Verify required MCP servers actually connected. The boot-time HTTP
-          // probe in mcp-health.ts confirms the chain is up, but it does NOT
-          // verify the SDK successfully registered the MCP tools. On z.ai's
-          // Anthropic-compatible endpoint we periodically see init succeed
-          // with mcp_servers[].status = 'failed' (issue #27): the model then
-          // gets "No such tool available" for every mcp__<server>__* call and
-          // the bot reports infrastructure DOWN until manually restarted.
-          // Throwing here makes the poll-loop write the error and clear
-          // continuation; the next inbound respawns with a fresh init.
+          // Issue #27: catch the failure mode where the SDK's MCP registry is
+          // empty/broken even though the HTTP chain probe in mcp-health.ts
+          // says everything is fine. We only throw on TERMINAL failure
+          // states ('failed', 'needs-auth'): 'pending' is the normal
+          // mid-handshake state the SDK reports while async MCP connections
+          // are still completing, and rejecting it would block every
+          // healthy startup. 'connected' and 'disabled' are fine.
+          // A required server missing from mcp_servers[] entirely is also
+          // treated as a soft warning, not fatal — the SDK may not have
+          // populated that array yet at init time.
           const initMsg = message as { mcp_servers?: { name: string; status: string }[]; session_id: string };
           const reportedServers = initMsg.mcp_servers ?? [];
-          const degraded = requiredMcpServers
-            .map((name) => {
-              const entry = reportedServers.find((s) => s.name === name);
-              return { name, status: entry?.status ?? 'missing' };
-            })
-            .filter((s) => s.status !== 'connected');
-          if (degraded.length > 0) {
-            const summary = degraded.map((d) => `${d.name}=${d.status}`).join(', ');
-            log(`MCP init degraded — ${summary} (session ${initMsg.session_id})`);
+          const TERMINAL_FAILURE_STATUSES = new Set(['failed', 'needs-auth']);
+          const reports = requiredMcpServers.map((name) => {
+            const entry = reportedServers.find((s) => s.name === name);
+            return { name, status: entry?.status ?? 'missing' };
+          });
+          const failed = reports.filter((s) => TERMINAL_FAILURE_STATUSES.has(s.status));
+          const nonConnected = reports.filter((s) => s.status !== 'connected');
+          if (nonConnected.length > 0) {
+            const summary = nonConnected.map((d) => `${d.name}=${d.status}`).join(', ');
+            log(`MCP init status — ${summary} (session ${initMsg.session_id})`);
+          }
+          if (failed.length > 0) {
+            const summary = failed.map((d) => `${d.name}=${d.status}`).join(', ');
             throw new Error(`MCP servers not connected at init: ${summary}`);
           }
           yield { type: 'init', continuation: message.session_id };
