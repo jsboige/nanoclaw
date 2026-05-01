@@ -5,7 +5,7 @@
  */
 import { describe, expect, it } from 'vitest';
 
-import { ABSOLUTE_CEILING_MS, CLAIM_STUCK_MS, decideStuckAction } from './host-sweep.js';
+import { ABSOLUTE_CEILING_MS, CLAIM_STUCK_MS, STARTUP_GRACE_MS, decideStuckAction } from './host-sweep.js';
 
 const BASE = Date.parse('2026-04-20T12:00:00.000Z');
 
@@ -132,6 +132,35 @@ describe('decideStuckAction', () => {
       claims: [claim('msg-1', 5 * 60 * 1000)],
     });
     expect(res.action).toBe('ok');
+  });
+
+  it('suppresses claim-stuck during the startup grace window for a freshly-spawned container', () => {
+    // Reproduces the "infinite kill/respawn loop" bug: a previous container
+    // crashed leaving a 'processing' row in outbound.db. The replacement is
+    // spawned, but the host sweep evaluates claim-stuck before the new
+    // container can run its boot-time DELETE. Without the grace, the new
+    // container is killed within ms of spawn and the loop repeats forever.
+    const veryOldClaimMs = CLAIM_STUCK_MS + 60 * 60 * 1000; // claim from 1h+ ago
+    const res = decideStuckAction({
+      now: BASE,
+      heartbeatMtimeMs: 0, // fresh container hasn't ticked yet
+      containerState: null,
+      claims: [claim('msg-old', veryOldClaimMs)],
+      spawnedAtMs: BASE - 5_000, // spawned 5s ago, well within grace
+    });
+    expect(res.action).toBe('ok');
+  });
+
+  it('still kills claim-stuck once the startup grace window has elapsed', () => {
+    const veryOldClaimMs = CLAIM_STUCK_MS + 60 * 60 * 1000;
+    const res = decideStuckAction({
+      now: BASE,
+      heartbeatMtimeMs: 0,
+      containerState: null,
+      claims: [claim('msg-old', veryOldClaimMs)],
+      spawnedAtMs: BASE - STARTUP_GRACE_MS - 5_000, // grace expired
+    });
+    expect(res.action).toBe('kill-claim');
   });
 
   it('ignores claims with unparseable timestamps', () => {

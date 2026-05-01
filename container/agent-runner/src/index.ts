@@ -26,6 +26,7 @@ import path from 'path';
 import { fileURLToPath } from 'url';
 
 import { loadConfig } from './config.js';
+import { clearStaleProcessingAcks, touchHeartbeat } from './db/connection.js';
 import { writeMessageOut } from './db/messages-out.js';
 import { buildSystemPromptAddendum, getAllDestinations } from './destinations.js';
 import { formatFailures, probeMcpRemote, selectRequiredRemotes, type RequiredRemote } from './mcp-health.js';
@@ -42,6 +43,20 @@ function log(msg: string): void {
 const CWD = '/workspace/agent';
 
 async function main(): Promise<void> {
+  // Signal liveness + clear orphan claims BEFORE anything that can block (MCP
+  // health probes, config IO). The host sweep kills containers whose claim
+  // age exceeds tolerance with no fresher heartbeat — if we delay these two
+  // calls, a pre-existing stale `processing_ack` row from a previously
+  // crashed container can race the boot path and the host kills us before
+  // we ever clean it. Symptom: tight kill/respawn loop, claimAge grows
+  // monotonically across boots. Both calls are cheap and idempotent.
+  touchHeartbeat();
+  try {
+    clearStaleProcessingAcks();
+  } catch (err) {
+    log(`Failed to clear stale processing acks at boot: ${err instanceof Error ? err.message : String(err)}`);
+  }
+
   const config = loadConfig();
   const providerName = config.provider.toLowerCase() as ProviderName;
 
