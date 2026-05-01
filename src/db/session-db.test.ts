@@ -135,9 +135,10 @@ describe('expireAncientScheduledMessages', () => {
 
     expect(expired.map((e) => e.id).sort()).toEqual(['stale-1', 'stale-2']);
 
-    const statuses = db
-      .prepare('SELECT id, status FROM messages_in ORDER BY id')
-      .all() as Array<{ id: string; status: string }>;
+    const statuses = db.prepare('SELECT id, status FROM messages_in ORDER BY id').all() as Array<{
+      id: string;
+      status: string;
+    }>;
     const byId = Object.fromEntries(statuses.map((r) => [r.id, r.status]));
     expect(byId['stale-1']).toBe('expired');
     expect(byId['stale-2']).toBe('expired');
