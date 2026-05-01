@@ -44,7 +44,19 @@ export async function handleRecurrence(inDb: Database.Database, session: Session
         sessionId: session.id,
       });
     } catch (err) {
-      log.error('Failed to compute next recurrence', {
+      // Cron string can't fix itself — clearing recurrence stops every-tick spam
+      // and lets the agent see the failure once instead of repeatedly. Discovered
+      // after a "0 21-5 * * *" task (invalid range, min>max) re-threw every minute
+      // for ~16h, blocking the night shift entirely.
+      try {
+        clearRecurrence(inDb, msg.id);
+      } catch (clearErr) {
+        log.error('Failed to clear malformed recurrence after parse error', {
+          messageId: msg.id,
+          err: clearErr,
+        });
+      }
+      log.error('Cleared malformed recurrence after parse failure', {
         messageId: msg.id,
         recurrence: msg.recurrence,
         err,

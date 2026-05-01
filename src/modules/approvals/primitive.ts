@@ -38,6 +38,9 @@ const APPROVAL_OPTIONS: RawOption[] = [
   { label: 'Reject', selectedLabel: '❌ Rejected', value: 'reject' },
 ];
 
+/** Default lifetime for an approval request. Sweep marks anything older expired. */
+export const APPROVAL_DEFAULT_TTL_MS = 24 * 60 * 60 * 1000;
+
 // ── Approval handler registry ──
 // Modules that want to be called back when an admin approves a pending row
 // register here at import time, keyed by the `action` string they used in
@@ -182,13 +185,15 @@ export async function requestApproval(opts: RequestApprovalOptions): Promise<voi
 
   const approvalId = `appr-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
   const normalizedOptions = normalizeOptions(APPROVAL_OPTIONS);
+  const now = Date.now();
   createPendingApproval({
     approval_id: approvalId,
     session_id: session.id,
     request_id: approvalId,
     action,
     payload: JSON.stringify(payload),
-    created_at: new Date().toISOString(),
+    created_at: new Date(now).toISOString(),
+    expires_at: new Date(now + APPROVAL_DEFAULT_TTL_MS).toISOString(),
     title,
     options_json: JSON.stringify(normalizedOptions),
   });
