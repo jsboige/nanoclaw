@@ -11,16 +11,11 @@
  * `cli/local` via `/init-first-agent` or `/manage-channels`.
  */
 import net from 'net';
-import path from 'path';
 
-import { DATA_DIR } from '../src/config.js';
+import { getCliSocketPath } from '../src/config.js';
 
 const SILENCE_MS = 2000; // exit after this much quiet time following the first reply
 const TOTAL_TIMEOUT_MS = 120_000; // hard stop
-
-function socketPath(): string {
-  return path.join(DATA_DIR, 'cli.sock');
-}
 
 function main(): void {
   const words = process.argv.slice(2);
@@ -30,12 +25,12 @@ function main(): void {
   }
   const text = words.join(' ');
 
-  const socket = net.connect(socketPath());
+  const socket = net.connect(getCliSocketPath());
 
   socket.on('error', (err) => {
     const e = err as NodeJS.ErrnoException;
     if (e.code === 'ENOENT' || e.code === 'ECONNREFUSED') {
-      console.error(`NanoClaw daemon not reachable at ${socketPath()}.`);
+      console.error(`NanoClaw daemon not reachable at ${getCliSocketPath()}.`);
       console.error('Start the service (launchctl/systemd) before running nc.');
     } else {
       console.error('CLI socket error:', err);

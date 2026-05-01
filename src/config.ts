@@ -25,6 +25,21 @@ export const STORE_DIR = path.resolve(PROJECT_ROOT, 'store');
 export const GROUPS_DIR = path.resolve(PROJECT_ROOT, 'groups');
 export const DATA_DIR = path.resolve(PROJECT_ROOT, 'data');
 
+/**
+ * CLI channel transport endpoint. On POSIX this is a Unix socket file under
+ * data/; on Windows we use a named pipe instead because Node's AF_UNIX
+ * support on NTFS hits EACCES under the service account (the daemon binds
+ * but cannot chmod, then the next start re-binds and fails). Named pipes
+ * are auto-cleaned by the OS when the owning process exits, so no stale
+ * unlink is needed on Windows.
+ */
+export function getCliSocketPath(): string {
+  if (process.platform === 'win32') {
+    return '\\\\.\\pipe\\nanoclaw-cli';
+  }
+  return path.join(DATA_DIR, 'cli.sock');
+}
+
 // Per-checkout image tag so two installs on the same host don't share
 // `nanoclaw-agent:latest` and clobber each other on rebuild.
 export const CONTAINER_IMAGE_BASE = process.env.CONTAINER_IMAGE_BASE || getContainerImageBase(PROJECT_ROOT);
