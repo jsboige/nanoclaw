@@ -59,7 +59,7 @@ const activeContainers = new Map<string, { process: ChildProcess; containerName:
  * a duplicate container against the same session directory, producing
  * racy double-replies.
  */
-const wakePromises = new Map<string, Promise<void>>();
+const wakePromises = new Map<string, Promise<boolean>>();
 
 export function getActiveContainerCount(): number {
   return activeContainers.size;
@@ -89,22 +89,28 @@ export function getContainerSpawnedAt(sessionId: string): number | null {
  * (the in-flight wake promise is reused).
  *
  * The container runs the v2 agent-runner which polls the session DB.
+ *
+ * Contract: never throws. Returns `true` on successful spawn, `false` on
+ * transient spawn failure (e.g. OneCLI gateway unreachable). Callers don't
+ * need to wrap — the inbound row stays pending and host-sweep retries on
+ * its next tick. Callers that care (e.g. the router's typing indicator)
+ * can branch on the boolean.
  */
-export function wakeContainer(session: Session): Promise<void> {
+export function wakeContainer(session: Session): Promise<boolean> {
   if (activeContainers.has(session.id)) {
     log.debug('Container already running', { sessionId: session.id });
-    return Promise.resolve();
+    return Promise.resolve(true);
   }
   const existing = wakePromises.get(session.id);
   if (existing) {
     log.debug('Container wake already in-flight — joining existing promise', { sessionId: session.id });
     return existing;
   }
-  // Concurrency cap: refuse to spawn beyond MAX_CONCURRENT_CONTAINERS. The
-  // host sweep (60s) re-checks countDueMessages and re-wakes once capacity
-  // frees up, so messages are never lost — just deferred. v1 did this via a
-  // GroupQueue with explicit waiting list; v2 leans on the sweep loop and
-  // keeps the runner branchless.
+  // [PATCH-myia #10] Concurrency cap: refuse to spawn beyond
+  // MAX_CONCURRENT_CONTAINERS. The host sweep (60s) re-checks
+  // countDueMessages and re-wakes once capacity frees up, so messages are
+  // never lost — just deferred. Returns false (transient failure) so callers
+  // treat it like any other spawn miss. See PATCHES.md.
   if (activeContainers.size + wakePromises.size >= MAX_CONCURRENT_CONTAINERS) {
     log.warn('Container wake deferred — at concurrency limit', {
       sessionId: session.id,
@@ -112,11 +118,17 @@ export function wakeContainer(session: Session): Promise<void> {
       inFlight: wakePromises.size,
       limit: MAX_CONCURRENT_CONTAINERS,
     });
-    return Promise.resolve();
+    return Promise.resolve(false);
   }
-  const promise = spawnContainer(session).finally(() => {
-    wakePromises.delete(session.id);
-  });
+  const promise = spawnContainer(session)
+    .then(() => true)
+    .catch((err) => {
+      log.warn('wakeContainer failed — host-sweep will retry', { sessionId: session.id, err });
+      return false;
+    })
+    .finally(() => {
+      wakePromises.delete(session.id);
+    });
   wakePromises.set(session.id, promise);
   return promise;
 }
@@ -493,23 +505,16 @@ async function buildContainerArgs(
     }
   }
 
-  // OneCLI gateway — injects HTTPS_PROXY + certs so container API calls
-  // are routed through the agent vault for credential injection.
-  // FAIL CLOSED: if the gateway is unreachable or returns an error, refuse to
-  // spawn rather than silently falling back to .env passthrough. The user
-  // explicitly forbade external fallback (Apr 2026) — a container without
-  // proxy + CA cert would either leak raw .env keys or hit ConnectionRefused
-  // for every API call. Better to log the spawn failure and let the human
-  // see it than to flood Telegram with API errors.
+  // are routed through the agent vault for credential injection. Treated as
+  // a transient hard failure: if we can't wire the gateway, we don't spawn.
+  // The caller (router or host-sweep) catches the throw, leaves the inbound
+  // message pending, and the next sweep tick retries.
   if (agentIdentifier) {
     await onecli.ensureAgent({ name: agentGroup.name, identifier: agentIdentifier });
   }
   const onecliApplied = await onecli.applyContainerConfig(args, { addHostMapping: false, agent: agentIdentifier });
   if (!onecliApplied) {
-    throw new Error(
-      `OneCLI gateway unreachable at ${ONECLI_URL} — refusing to spawn container without credentials. ` +
-        `Check that the local gateway is running (docker compose -p onecli ps) and that the host can reach ${ONECLI_URL}/api/health.`,
-    );
+    throw new Error('OneCLI gateway not applied — refusing to spawn container without credentials');
   }
   log.info('OneCLI gateway applied', { containerName });
 
