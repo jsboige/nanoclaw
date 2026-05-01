@@ -26,6 +26,7 @@ const CUTOFF_DAYS = 3;
 const PROCESSED_MAX = 500;
 
 const INBOX_DIR = path.join(SHARED, 'messages', 'inbox');
+const CORRUPT_ARCHIVE_DIR = path.join(SHARED, 'messages', 'inbox', '.archive', 'corrupt');
 // The host machine's RooSync identity (e.g. "nanoclaw-cluster:nanoclaw") is the
 // primary target. But the bot inside the agent container signs its dashboard
 // posts with a *different* identity (e.g. "nanoclaw:agent") — see the
@@ -169,11 +170,10 @@ function pollOnce(): void {
     try {
       msg = JSON.parse(raw);
     } catch (err) {
-      log('warn', {
-        msg: 'parse failed',
-        file: f,
-        err: err instanceof Error ? err.message : String(err),
-      });
+      // Corrupt JSON: move out of the inbox so the watcher doesn't re-read
+      // it forever (parse-fail is deterministic, retrying is wasted IO and
+      // log noise). Archive preserves the file for offline inspection.
+      archiveCorrupt(full, f, err);
       processedIds.add(id);
       continue;
     }
@@ -221,6 +221,37 @@ function pollOnce(): void {
     processedIds = new Set(sorted.slice(-PROCESSED_MAX));
   }
   saveProcessed(processedIds);
+}
+
+function archiveCorrupt(fullPath: string, filename: string, err: unknown): void {
+  try {
+    fs.mkdirSync(CORRUPT_ARCHIVE_DIR, { recursive: true });
+  } catch (mkdirErr) {
+    log('error', {
+      msg: 'corrupt-archive mkdir failed; leaving file in inbox',
+      file: filename,
+      err: mkdirErr instanceof Error ? mkdirErr.message : String(mkdirErr),
+    });
+    return;
+  }
+  const stamp = new Date().toISOString().replace(/[:.]/g, '-');
+  const target = path.join(CORRUPT_ARCHIVE_DIR, `${stamp}-${filename}`);
+  try {
+    fs.renameSync(fullPath, target);
+    log('warn', {
+      msg: 'archived corrupt inbox file',
+      file: filename,
+      target,
+      parseErr: err instanceof Error ? err.message : String(err),
+    });
+  } catch (renameErr) {
+    log('error', {
+      msg: 'corrupt-archive rename failed; leaving file in inbox',
+      file: filename,
+      target,
+      err: renameErr instanceof Error ? renameErr.message : String(renameErr),
+    });
+  }
 }
 
 function loop(): void {
