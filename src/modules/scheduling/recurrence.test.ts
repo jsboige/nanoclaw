@@ -116,9 +116,11 @@ describe('handleRecurrence', () => {
 
     await handleRecurrence(db, fakeSession());
 
-    const row = db
-      .prepare(`SELECT id, status, recurrence FROM messages_in WHERE id='task-bad'`)
-      .get() as { id: string; status: string; recurrence: string | null };
+    const row = db.prepare(`SELECT id, status, recurrence FROM messages_in WHERE id='task-bad'`).get() as {
+      id: string;
+      status: string;
+      recurrence: string | null;
+    };
     // Recurrence cleared so the next tick won't pick this row up again.
     expect(row.recurrence).toBeNull();
     // No follow-up row created — recurrence was unparseable.
