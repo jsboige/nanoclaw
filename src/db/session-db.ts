@@ -129,6 +129,44 @@ export function markMessageFailed(db: Database.Database, messageId: string): voi
   db.prepare("UPDATE messages_in SET status = 'failed' WHERE id = ?").run(messageId);
 }
 
+/**
+ * Mark one-shot scheduled tasks (kind='task', recurrence IS NULL) whose
+ * process_after is older than `staleThresholdIso` as 'expired'. Returns the
+ * affected rows so the caller can log them. Recurring tasks (recurrence NOT
+ * NULL) and chat messages are not touched — the recurrence engine advances
+ * recurring messages on its own, and chat messages have no scheduled
+ * window.
+ *
+ * Defends against the case where a host outage causes scheduled one-shot
+ * tasks to pile up; firing the whole backlog at once on restart would
+ * trigger a wake-storm or flood the user with stale notifications.
+ */
+export function expireAncientScheduledMessages(
+  db: Database.Database,
+  staleThresholdIso: string,
+): Array<{ id: string; process_after: string }> {
+  const stale = db
+    .prepare(
+      `SELECT id, process_after FROM messages_in
+       WHERE status = 'pending'
+         AND kind = 'task'
+         AND recurrence IS NULL
+         AND process_after IS NOT NULL
+         AND datetime(process_after) < datetime(?)`,
+    )
+    .all(staleThresholdIso) as Array<{ id: string; process_after: string }>;
+  if (stale.length === 0) return [];
+  db.prepare(
+    `UPDATE messages_in SET status = 'expired'
+     WHERE status = 'pending'
+       AND kind = 'task'
+       AND recurrence IS NULL
+       AND process_after IS NOT NULL
+       AND datetime(process_after) < datetime(?)`,
+  ).run(staleThresholdIso);
+  return stale;
+}
+
 export function retryWithBackoff(db: Database.Database, messageId: string, backoffSec: number): void {
   db.prepare(
     `UPDATE messages_in SET tries = tries + 1, process_after = datetime('now', '+${backoffSec} seconds') WHERE id = ?`,

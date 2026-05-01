@@ -33,6 +33,7 @@ import { getActiveSessions } from './db/sessions.js';
 import { getAgentGroup } from './db/agent-groups.js';
 import {
   countDueMessages,
+  expireAncientScheduledMessages,
   getContainerState,
   getMessageForRetry,
   getProcessingClaims,
@@ -61,6 +62,11 @@ export const CLAIM_STUCK_MS = 60 * 1000;
 // loop spawn → kill → respawn forever — the new container never gets to
 // run the cleanup line.
 export const STARTUP_GRACE_MS = 30 * 1000;
+// One-shot scheduled tasks (kind='task', recurrence IS NULL) become
+// candidates for expiry once their process_after is this far behind. Long
+// outages otherwise cause the entire backlog to fire at once on wake — not
+// useful for tasks whose intent was time-bound.
+export const STALE_SCHEDULED_MS = 6 * 60 * 60 * 1000;
 const MAX_TRIES = 5;
 const BACKOFF_BASE_MS = 5000;
 
@@ -207,6 +213,21 @@ async function sweepSession(session: Session): Promise<void> {
   }
 
   try {
+    // 0. Expire ancient one-shot scheduled tasks. Done before counting due
+    // messages so a backlog that built up during an outage doesn't trigger
+    // a wake-storm. Recurring tasks are untouched — their recurrence engine
+    // advances them naturally.
+    const staleCutoff = new Date(Date.now() - STALE_SCHEDULED_MS).toISOString();
+    const expired = expireAncientScheduledMessages(inDb, staleCutoff);
+    if (expired.length > 0) {
+      log.warn('Expired ancient scheduled tasks', {
+        sessionId: session.id,
+        count: expired.length,
+        cutoffIso: staleCutoff,
+        sampleIds: expired.slice(0, 3).map((e) => e.id),
+      });
+    }
+
     // 1. Sync processing_ack → messages_in status
     if (outDb) {
       syncProcessingAcks(inDb, outDb);
