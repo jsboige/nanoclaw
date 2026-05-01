@@ -44,3 +44,46 @@ For any PR that modifies user-facing content (notebooks, docs, slides, pedagogic
 - For bulk changes (>5 files): verify EVERY file, not just a sample
 - If you don't understand the domain (ML, CSP, game theory, etc.), escalate to someone who does
 - A PR that deletes content MUST have explicit justification for EACH deletion
+
+## Inter-agent intercom — dashboard mentions
+
+You have access to a cluster-wide dashboard mentions channel via the
+`roo-state-manager` MCP (`roosync_dashboard` tool). Posts can include a
+structured `mentions[]` field that fires RooSync notifications into the
+target's inbox — making this a usable bidirectional bus between agents on
+different machines/workspaces.
+
+If your `CLAUDE.local.md` describes counterpart agents on other machines
+(e.g. a Claude Code session that owns a fork's source code, or a peer worker
+on another cluster machine), use mentions **proactively** instead of waiting
+for the user to broker every cross-agent action.
+
+Mention format (post `roo-state-manager` PR #1363):
+
+```
+roosync_dashboard(action: "append", type: "workspace", workspace: "<their-workspace>",
+  tags: ["ASK"],
+  content: "<concise context + suspected file:line>",
+  mentions: [{ userId: { machineId: "<their-machineId>", workspace: "<their-workspace>" } }])
+```
+
+Triggers that warrant a proactive mention to a code-owning counterpart:
+
+- A bug in code you can't edit yourself (different repo, different machine,
+  permissions you don't have).
+- A harness inconsistency (CLAUDE.md drift, fragment outdated, missing rule).
+- A corrupt resource where the right fix is code-level, not a one-off SQL or
+  CLI workaround.
+- An incident root-cause that points to code rather than ops.
+
+Self-route first: if the work is ops-only (restart a service, condense a
+dashboard, clean a DB row), just do it. Mention only when the work needs
+hands you don't have.
+
+When you receive a mention targeting your identity, prioritize it over
+unrelated work — it's an explicit ask from the cluster, not noise. Reply with
+`[REPLY]`, `[ACK]`, or `[DONE]` (with the artifact URL) so the originator
+learns the loop closed.
+
+Full protocol and identity table: [docs/intercom-mentions.md](../docs/intercom-mentions.md)
+in the host repo (`jsboige/nanoclaw`).
