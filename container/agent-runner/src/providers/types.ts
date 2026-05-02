@@ -75,6 +75,15 @@ export type ProviderEvent =
   | { type: 'error'; message: string; retryable: boolean; classification?: string }
   | { type: 'progress'; message: string }
   /**
+   * Mid-session MCP registry loss. Emitted when the SDK injects a
+   * tool_use_error for a required mcp__<server>__* tool — happens on z.ai's
+   * Anthropic-pretend endpoint after auto-compaction (issue #27 branch 2).
+   * The chain HTTP probe still passes; only the SDK's effective tool
+   * registry is broken. Recovery requires a fresh session (clear
+   * continuation, respawn). Treated as terminal for the current turn.
+   */
+  | { type: 'mcp_tool_missing'; toolName: string; serverName: string }
+  /**
    * Liveness signal. Providers MUST yield this on every underlying SDK
    * event (tool call, thinking, partial message, anything) so the
    * poll-loop's idle timer stays honest during long tool runs.
