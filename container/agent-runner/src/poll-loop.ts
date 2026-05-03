@@ -8,7 +8,7 @@ import {
   migrateLegacyContinuation,
   setContinuation,
 } from './db/session-state.js';
-import { formatMessages, extractRouting, categorizeMessage, isClearCommand, stripInternalTags, type RoutingContext } from './formatter.js';
+import { formatMessages, extractRouting, categorizeMessage, isClearCommand, isRunnerCommand, stripInternalTags, type RoutingContext } from './formatter.js';
 import { formatFailures, probeMcpRemoteCached, type RequiredRemote } from './mcp-health.js';
 import type { AgentProvider, AgentQuery, ProviderEvent } from './providers/types.js';
 
@@ -376,30 +376,46 @@ async function processQuery(
   let done = false;
 
   // Concurrent polling: push follow-ups into the active query as they arrive.
-  // We do NOT force-end the stream on silence — keeping the query open is
-  // strictly cheaper than close+reopen (no cold prompt cache, no reconnect).
+  // We do NOT force-end the stream on silence — keeping the query open avoids
+  // re-spawning the SDK subprocess (~few seconds) and re-loading the .jsonl
+  // transcript on every turn. The Anthropic prompt cache is server-side with
+  // a 5-min TTL keyed on prefix hash, so stream lifecycle does NOT affect
+  // cache lifetime — close+reopen within 5 min still gets cache hits.
   // Stream liveness is decided host-side via the heartbeat file + processing
   // claim age (see src/host-sweep.ts); if something is truly stuck, the host
   // will kill the container and messages get reset to pending.
   let pollInFlight = false;
+  let endedForCommand = false;
   const pollHandle = setInterval(() => {
-    if (done || pollInFlight) return;
+    if (done || pollInFlight || endedForCommand) return;
     pollInFlight = true;
 
     void (async () => {
       try {
-        // Skip system messages (MCP tool responses) and /clear (needs fresh query).
+        const pending = getPendingMessages();
+
+        // Slash commands need a fresh query: /clear resets the SDK's
+        // resume id (fixed at sdkQuery() time); admin/passthrough commands
+        // (/compact, /cost, …) only dispatch when they're the first input
+        // of a query — pushed mid-stream they arrive as plain text and
+        // the SDK never runs them. End the stream and leave the rows
+        // pending; the outer loop handles them on next iteration via the
+        // canonical command path + formatMessagesWithCommands.
+        if (pending.some((m) => isRunnerCommand(m))) {
+          log('Pending slash command — ending stream so outer loop can process');
+          endedForCommand = true;
+          query.end();
+          return;
+        }
+
+        // Skip system messages (MCP tool responses).
         // Thread routing is the router's concern — if a message landed in this
         // session, the agent should see it. Per-thread sessions already isolate
         // threads into separate containers; shared sessions intentionally merge
         // everything. Filtering on thread_id here caused deadlocks when the
         // initial batch and follow-ups had mismatched thread_ids (e.g. a
         // host-generated welcome trigger with null thread vs a Discord DM reply).
-        const newMessages = getPendingMessages().filter((m) => {
-          if (m.kind === 'system') return false;
-          if ((m.kind === 'chat' || m.kind === 'chat-sdk') && isClearCommand(m)) return false;
-          return true;
-        });
+        const newMessages = pending.filter((m) => m.kind !== 'system');
         if (newMessages.length === 0) return;
 
         const newIds = newMessages.map((m) => m.id);

@@ -66,6 +66,18 @@ export function isClearCommand(msg: MessageInRow): boolean {
   return text.toLowerCase().startsWith('/clear');
 }
 
+/**
+ * True for any chat that needs the outer loop's command path: /clear plus
+ * admin/passthrough slash commands the SDK can only dispatch when they are
+ * a query's first input. Used by the follow-up poller to bail out and let
+ * the outer loop reopen the query.
+ */
+export function isRunnerCommand(msg: MessageInRow): boolean {
+  if (msg.kind !== 'chat' && msg.kind !== 'chat-sdk') return false;
+  const cat = categorizeMessage(msg).category;
+  return cat === 'admin' || cat === 'passthrough';
+}
+
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 function extractSenderId(msg: MessageInRow, content: any): string | null {
   const raw: string | null = content?.senderId || content?.author?.userId || null;
@@ -227,11 +239,12 @@ function formatAttachments(attachments: any[] | undefined): string {
     const type = a.type || 'file';
     const localPath = a.localPath ? `/workspace/${a.localPath}` : '';
     const url = a.url || '';
-    // Audio attachments carry an ASR-produced `transcript` set by the host
-    // bridge (src/channels/chat-sdk-bridge.ts). Surface it inline and tell the
-    // agent the transcription is already done — otherwise it sees a bare
-    // `[audio: …]` marker, runs `file` on the path, and concludes it lacks an
-    // ASR tool, even though the transcript is right there in the inbound.
+    // [PATCH-myia #9] Audio attachments carry an ASR-produced `transcript` set
+    // by the host bridge (src/channels/chat-sdk-bridge.ts). Surface it inline
+    // and tell the agent the transcription is already done — otherwise it sees
+    // a bare `[audio: …]` marker, runs `file` on the path, and concludes it
+    // lacks an ASR tool, even though the transcript is right there in the
+    // inbound.
     if (type === 'audio' && typeof a.transcript === 'string' && a.transcript.length > 0) {
       const tail = localPath ? ` — file at ${escapeXml(localPath)}` : '';
       return `[audio transcript (already done host-side, no further transcription needed): "${escapeXml(a.transcript)}"${tail}]`;

@@ -33,6 +33,7 @@ import { getActiveSessions } from './db/sessions.js';
 import { getAgentGroup } from './db/agent-groups.js';
 import {
   countDueMessages,
+  deleteOrphanProcessingClaims,
   expireAncientScheduledMessages,
   getContainerState,
   getMessageForRetry,
@@ -43,7 +44,7 @@ import {
   type ContainerState,
 } from './db/session-db.js';
 import { log } from './log.js';
-import { openInboundDb, openOutboundDb, inboundDbPath, heartbeatPath } from './session-manager.js';
+import { openInboundDb, openOutboundDb, openOutboundDbRw, inboundDbPath, heartbeatPath } from './session-manager.js';
 import { getContainerSpawnedAt, isContainerRunning, killContainer, wakeContainer } from './container-runner.js';
 import type { Session } from './types.js';
 
@@ -324,11 +325,26 @@ function enforceRunningContainerSla(
   resetStuckProcessingRows(inDb, outDb, session, 'claim-stuck');
 }
 
+export function _resetStuckProcessingRowsForTesting(
+  inDb: Database.Database,
+  outDb: Database.Database,
+  session: Session,
+  reason: string,
+): void {
+  // [PATCH-myia] Tests pass an in-memory outDb; openOutboundDbRw(...) would
+  // fail (no on-disk session DB) and the orphan-claim cleanup would silently
+  // no-op. Pass outDb itself as the writable override so reads and the
+  // production cleanup share one connection — fixes upstream tests on this
+  // exact code path.
+  resetStuckProcessingRows(inDb, outDb, session, reason, outDb);
+}
+
 function resetStuckProcessingRows(
   inDb: Database.Database,
   outDb: Database.Database,
   session: Session,
   reason: string,
+  outDbRwOverride?: Database.Database,
 ): void {
   const claims = getProcessingClaims(outDb);
   const now = Date.now();
@@ -359,5 +375,28 @@ function resetStuckProcessingRows(
         reason,
       });
     }
+  }
+
+  // Drop the orphan 'processing' rows. Without this, the next sweep tick
+  // would re-read them, see the old status_changed timestamp, conclude the
+  // freshly respawned container is stuck, and SIGKILL it before its
+  // agent-runner has a chance to run clearStaleProcessingAcks() on startup.
+  // We're safe to write outbound.db here because we just killed the container
+  // that owned it (or it crashed and left no writer behind).
+  // outDb was opened readonly for reads above; reopen with write access for this delete.
+  let outDbRw: Database.Database | null = outDbRwOverride ?? null;
+  const shouldClose = outDbRw === null;
+  try {
+    if (!outDbRw) {
+      outDbRw = openOutboundDbRw(session.agent_group_id, session.id);
+    }
+    const cleared = deleteOrphanProcessingClaims(outDbRw);
+    if (cleared > 0) {
+      log.info('Cleared orphan processing claims', { sessionId: session.id, cleared, reason });
+    }
+  } catch (err) {
+    log.warn('Failed to clear orphan processing claims', { sessionId: session.id, err });
+  } finally {
+    if (shouldClose) outDbRw?.close();
   }
 }

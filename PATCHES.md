@@ -2,7 +2,7 @@
 
 Minimal `src/` and `container/` patches applied on top of upstream v2. Every entry includes its commit hash, reason, and exit condition. Target: ≤ 10 active patches at any time. Monthly review removes those whose exit condition is satisfied.
 
-Baseline: upstream `main` at `8c962d3` (v2.0.23) — sync 2026-05-01. Previous baseline was `a4346f5` (v2.0.10 + fixes, 2026-04-24).
+Baseline: upstream `main` at `8bdc5c4` (v2.0.28) — sync 2026-05-03. Previous baseline was `8c962d3` (v2.0.23, 2026-05-01).
 
 ## Anti-divergence discipline
 
@@ -129,6 +129,14 @@ If none works, document the patch here with justification.
 - **Why:** Voice messages are a primary user input channel (operator preference: "voice OK il préfère parler"). Without transcription, the agent receives only the audio attachment without text and the response latency doubles (the agent has to call back).
 - **Exit condition:** Migrate to a container skill `container/skills/voice-transcription/` that the agent invokes (planned in PATCHES.md original entry #9). Once the skill ships, this host-side path can be removed.
 - **Lines:** ~80 (module) + ~20 (channel integration).
+
+### 14. Test-singleton reuse in `openInboundDb()`
+
+- **File:** `container/agent-runner/src/db/connection.ts` (function `openInboundDb` + new `closeOpenedInbound` helper) and `container/agent-runner/src/db/messages-in.ts` (call sites use the helper instead of `db.close()`).
+- **Summary:** When `_inbound` is set (test mode via `initTestSessionDb()`), `openInboundDb()` returns that singleton instead of opening a fresh `Database` against `DEFAULT_INBOUND_PATH` (`/workspace/inbound.db`). New helper `closeOpenedInbound()` is a no-op for the singleton, so `messages-in.ts` finally-blocks don't tear down test fixtures between calls.
+- **Why:** Upstream `ccfdf2d` ("fix(agent-runner): open inbound.db fresh per messages_in read") adopted a "fresh connection per read" pattern to defeat SQLite cache staleness across the host-container mount boundary. The new function hardcodes the production path and ignores the in-memory singleton that tests rely on; result is 25/77 container Bun tests fail with `SQLiteError: unable to open database file`. The patch keeps upstream's fresh-connection semantics in production while restoring test compatibility — it's an additive guard, not a behavior change for the container runtime.
+- **Exit condition:** Upstream either accepts a PR adding the same test-singleton fast-path, or refactors `initTestSessionDb()` to write the in-memory DB to a real temp file path that `openInboundDb()` can open.
+- **Lines:** ~12 (guard + helper + 4 call-site renames).
 
 ### 13. Filesystem-safe per-agent message id separator (`messageIdForAgent`)
 

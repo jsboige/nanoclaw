@@ -28,11 +28,51 @@ let _inbound: Database | null = null;
 let _outbound: Database | null = null;
 let _heartbeatPath: string = DEFAULT_HEARTBEAT_PATH;
 
-/** Inbound DB — container opens read-only (host is the sole writer). */
+/**
+ * Avoid all cached db reads; open inbound.db read-only with mmap and page cache disabled. 
+ * 
+ * Use this (not getInboundDb) for readers that need to see host-written rows
+ * promptly — e.g. messages_in polling. Caller must .close() the returned
+ * connection (try/finally).
+ *
+ * Needed for mounts where host writes don't reliably invalidate
+ * SQLite's caches: virtiofs (Colima, Lima, Podman Machine, Apple
+ * Container), NFS. 
+ * 
+ * Cost is microseconds per query, so safe for universal use.
+ */
+export function openInboundDb(): Database {
+  // [PATCH-myia #14] Honor the in-memory singleton set by initTestSessionDb().
+  // Tests rely on `:memory:` DBs that don't exist on disk, so opening a fresh
+  // file path here breaks them with `unable to open database file`. Callers
+  // pair this with closeOpenedInbound() so they don't tear down the singleton.
+  if (_inbound) return _inbound;
+  const db = new Database(DEFAULT_INBOUND_PATH, { readonly: true });
+  db.exec('PRAGMA busy_timeout = 5000');
+  db.exec('PRAGMA mmap_size = 0');
+  return db;
+}
+
+/**
+ * Close a connection returned by `openInboundDb()`. No-op if the connection
+ * is the test singleton — closing it would break the next call from the same
+ * test, since `initTestSessionDb()` sets up the schema once per test.
+ */
+export function closeOpenedInbound(db: Database): void {
+  if (db !== _inbound) db.close();
+}
+
+/**
+ * Inbound DB — long-lived singleton, OK for tables the host writes once
+ * at spawn and never again (destinations, session_routing). For
+ * messages_in polling — where the host writes continuously and a stale
+ * view causes the pollHandle hang — use `openInboundDb()` instead.
+ */
 export function getInboundDb(): Database {
   if (!_inbound) {
     _inbound = new Database(DEFAULT_INBOUND_PATH, { readonly: true });
     _inbound.exec('PRAGMA busy_timeout = 5000');
+    _inbound.exec('PRAGMA mmap_size = 0');
   }
   return _inbound;
 }
