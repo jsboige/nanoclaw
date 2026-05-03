@@ -16,6 +16,7 @@ import { getMessagingGroupByPlatform } from './db/messaging-groups.js';
 import {
   getDueOutboundMessages,
   getDeliveredIds,
+  isTransientSqliteReadonlyError,
   markDelivered,
   markDeliveryFailed,
   migrateDeliveredTable,
@@ -175,8 +176,17 @@ async function drainSession(session: Session): Promise<void> {
   }
 
   try {
-    // Read all due messages from outbound.db (read-only)
-    const allDue = getDueOutboundMessages(outDb);
+    // Read all due messages from outbound.db (read-only).
+    // [PATCH-myia] If the container is mid-commit, the DELETE-journal write
+    // path leaves a `-journal` file that SQLite can't recover from a readonly
+    // open. Skip the tick — the next active poll (~1s) sees a clean DB.
+    let allDue: ReturnType<typeof getDueOutboundMessages>;
+    try {
+      allDue = getDueOutboundMessages(outDb);
+    } catch (err) {
+      if (isTransientSqliteReadonlyError(err)) return;
+      throw err;
+    }
     if (allDue.length === 0) return;
 
     // Filter out already-delivered messages using inbound.db's delivered table
