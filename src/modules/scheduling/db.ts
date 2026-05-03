@@ -60,6 +60,21 @@ export interface TaskUpdate {
   processAfter?: string;
 }
 
+// Defensive: a row's `content` column has TEXT affinity, but SQLite uses
+// manifest typing (per-row), and historical bugs (or a foreign writer) can
+// leave a row stored as BLOB. better-sqlite3 surfaces that as Buffer; bun:sqlite
+// in the container surfaces it as Uint8Array and JSON.parse() throws. If we
+// re-bind such a value untouched (insertRecurrence copies it forward on every
+// cron firing, updateTask rewrites the same row), the taint becomes hereditary
+// — every recurring fire produces another BLOB row and the container's
+// list_tasks breaks for the whole series. Coerce on the way back into the DB.
+function asText(c: unknown): string {
+  if (typeof c === 'string') return c;
+  if (Buffer.isBuffer(c)) return c.toString('utf8');
+  if (c instanceof Uint8Array) return Buffer.from(c).toString('utf8');
+  return String(c);
+}
+
 // Merges content JSON in-place so callers can update prompt/script without
 // clobbering other fields. Matches by id OR series_id so the live next
 // occurrence of a recurring task is updated, not just the completed row the
@@ -79,9 +94,10 @@ export function updateTask(db: Database.Database, taskId: string, update: TaskUp
 
   const tx = db.transaction(() => {
     for (const row of rows) {
-      let content = row.content;
+      const rowText = asText(row.content);
+      let content: string = rowText;
       if (mergeContent) {
-        const parsed = JSON.parse(row.content) as Record<string, unknown>;
+        const parsed = JSON.parse(rowText) as Record<string, unknown>;
         if (update.prompt !== undefined) parsed.prompt = update.prompt;
         if (update.script !== undefined) parsed.script = update.script;
         content = JSON.stringify(parsed);
@@ -143,7 +159,7 @@ export function insertRecurrence(
     msg.platform_id,
     msg.channel_type,
     msg.thread_id,
-    msg.content,
+    asText(msg.content),
     msg.series_id,
   );
 }

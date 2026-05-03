@@ -149,9 +149,20 @@ export const listTasks: McpToolDefinition = {
 
     if ((rows as unknown[]).length === 0) return ok('No tasks found.');
 
-    const lines = (rows as Array<{ id: string; status: string; process_after: string | null; recurrence: string | null; content: string }>).map((r) => {
-      const content = JSON.parse(r.content);
-      const prompt = (content.prompt as string || '').slice(0, 80);
+    // bun:sqlite returns BLOB-typed columns as Uint8Array even when the column
+    // has TEXT affinity (manifest typing — type is per-row). A historical taint
+    // can leave a row stored as BLOB; JSON.parse(Uint8Array) throws in Bun.
+    // Coerce defensively, and never let one bad row sink the whole listing —
+    // otherwise the agent loses access to pause/cancel any task.
+    const lines = (rows as Array<{ id: string; status: string; process_after: string | null; recurrence: string | null; content: string | Uint8Array }>).map((r) => {
+      let prompt = '';
+      try {
+        const text = typeof r.content === 'string' ? r.content : new TextDecoder().decode(r.content);
+        const content = JSON.parse(text) as { prompt?: unknown };
+        prompt = (typeof content.prompt === 'string' ? content.prompt : '').slice(0, 80);
+      } catch {
+        prompt = '[corrupt content — see list_task_runs]';
+      }
       return `- ${r.id} [${r.status}] at=${r.process_after || 'now'} ${r.recurrence ? `recur=${r.recurrence} ` : ''}→ ${prompt}`;
     });
 
