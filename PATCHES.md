@@ -146,6 +146,14 @@ If none works, document the patch here with justification.
 - **Exit condition:** Upstream changes `messageIdForAgent` to use a filesystem-safe separator (e.g. `_`) or sanitizes the id before it reaches the inbox path.
 - **Lines:** ~10 (1 expression change + 8 lines of explanatory comment).
 
+### 16. Strip leaked MCP tool-call XML envelopes from agent output
+
+- **File:** `container/agent-runner/src/formatter.ts` (new helper `stripLeakedMcpToolcalls`) + `container/agent-runner/src/poll-loop.ts` (call site in `dispatchResultText`).
+- **Summary:** After `stripInternalTags`, run `stripLeakedMcpToolcalls` on the assistant text. Drops any `<mcp__server__tool …>…</mcp__server__tool>` paired blocks (back-reference matched) and `<mcp__server__tool … />` self-closing blocks; logs `WARNING: stripped N leaked MCP toolcall block(s)` so the incident is visible in container logs.
+- **Why:** z.ai's Anthropic-pretend endpoint occasionally emits the model's tool-call XML envelope as plain text instead of executing it. Without stripping, the dispatcher's single-destination fallback posts the raw `<mcp__nanoclaw__send_message>…</…>` (or `<mcp__nanoclaw__add_reaction />`) as a chat message — the user sees garbage, and worse: an intended private DM is exposed in the public group because the fallback ignores the `to=` parameter inside the leaked XML and always replies to the channel of origin. Recovery is unsafe (parameter conventions differ across MCPs and across model leak variants), so just drop the leak and rely on the next user message to retry.
+- **Exit condition:** Upstream applies the same defensive strip OR z.ai fixes the SDK envelope leak OR we switch the agent provider for this group off z.ai.
+- **Lines:** ~35 (helper) + ~10 (call site + WARNING log).
+
 ---
 
 ## Deferred / not yet applied

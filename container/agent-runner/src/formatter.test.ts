@@ -13,7 +13,7 @@ import { describe, it, expect, beforeEach, afterEach } from 'bun:test';
 
 import { initTestSessionDb, closeSessionDb, getInboundDb } from './db/connection.js';
 import { getPendingMessages } from './db/messages-in.js';
-import { formatMessages, stripInternalTags } from './formatter.js';
+import { formatMessages, stripInternalTags, stripLeakedMcpToolcalls } from './formatter.js';
 import { TIMEZONE } from './timezone.js';
 
 beforeEach(() => {
@@ -163,5 +163,73 @@ describe('stripInternalTags', () => {
     expect(stripInternalTags('<internal>thinking</internal>The answer is 42')).toBe(
       'The answer is 42',
     );
+  });
+});
+
+describe('stripLeakedMcpToolcalls', () => {
+  it('strips a paired send_message envelope (multi-line)', () => {
+    const input = `Here is my answer.
+<mcp__nanoclaw__send_message>
+<parameter name="to">emerjesse</parameter>
+<parameter name="text">private note</parameter>
+</mcp__nanoclaw__send_message>
+Done.`;
+    const { cleaned, leakCount } = stripLeakedMcpToolcalls(input);
+    expect(leakCount).toBe(1);
+    expect(cleaned).not.toContain('<mcp__');
+    expect(cleaned).toContain('Here is my answer.');
+    expect(cleaned).toContain('Done.');
+  });
+
+  it('strips a self-closing add_reaction envelope', () => {
+    const input =
+      'Pre. <mcp__nanoclaw__add_reaction emoji="eyes" messageId="1398" /> Post.';
+    const { cleaned, leakCount } = stripLeakedMcpToolcalls(input);
+    expect(leakCount).toBe(1);
+    expect(cleaned).toBe('Pre.  Post.'.trim());
+  });
+
+  it('strips a paired add_reaction with empty body and attributes on opening tag', () => {
+    const input =
+      '<mcp__nanoclaw__add_reaction emoji="eyes" messageId="1398"></mcp__nanoclaw__add_reaction>';
+    const { cleaned, leakCount } = stripLeakedMcpToolcalls(input);
+    expect(leakCount).toBe(1);
+    expect(cleaned).toBe('');
+  });
+
+  it('strips multiple leaked blocks and counts them', () => {
+    const input = `<mcp__a__b>x</mcp__a__b> middle <mcp__c__d arg="1" />`;
+    const { cleaned, leakCount } = stripLeakedMcpToolcalls(input);
+    expect(leakCount).toBe(2);
+    expect(cleaned).toBe('middle');
+  });
+
+  it('does not strip ordinary <message to="..."> blocks', () => {
+    const input = '<message to="emerjesse">hi</message>';
+    const { cleaned, leakCount } = stripLeakedMcpToolcalls(input);
+    expect(leakCount).toBe(0);
+    expect(cleaned).toBe(input);
+  });
+
+  it('does not strip non-mcp HTML-like tags', () => {
+    const input = '<b>bold</b> <i>italic</i>';
+    const { cleaned, leakCount } = stripLeakedMcpToolcalls(input);
+    expect(leakCount).toBe(0);
+    expect(cleaned).toBe(input);
+  });
+
+  it('returns empty + leakCount when input is only leaked XML', () => {
+    const input = `<mcp__nanoclaw__send_message><parameter name="to">x</parameter></mcp__nanoclaw__send_message>`;
+    const { cleaned, leakCount } = stripLeakedMcpToolcalls(input);
+    expect(leakCount).toBe(1);
+    expect(cleaned).toBe('');
+  });
+
+  it('does not match mismatched server/tool tag pairs (back-reference enforced)', () => {
+    // Open vs close differ → not a real paired block; left intact.
+    const input = '<mcp__a__b>x</mcp__c__d>';
+    const { cleaned, leakCount } = stripLeakedMcpToolcalls(input);
+    expect(leakCount).toBe(0);
+    expect(cleaned).toBe(input);
   });
 });

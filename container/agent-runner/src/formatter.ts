@@ -278,3 +278,38 @@ function escapeXml(str: string): string {
 export function stripInternalTags(text: string): string {
   return text.replace(/<internal>[\s\S]*?<\/internal>/g, '').trim();
 }
+
+/**
+ * Strip leaked MCP tool-call XML from agent output.
+ *
+ * On z.ai's Anthropic-pretend endpoint, the model sometimes emits its
+ * tool-call XML envelope as plain text instead of executing it. Examples:
+ *   <mcp__nanoclaw__send_message>
+ *     <parameter name="to">emerjesse</parameter>
+ *     <parameter name="text">…</parameter>
+ *   </mcp__nanoclaw__send_message>
+ *   <mcp__nanoclaw__add_reaction emoji="eyes" messageId="1398"></mcp__nanoclaw__add_reaction>
+ *   <mcp__server__tool arg="x" />
+ *
+ * Without stripping, the dispatcher's single-destination fallback posts
+ * the raw XML as a chat message — the user sees garbage, and the
+ * agent's intended action (e.g. private DM) is exposed publicly.
+ *
+ * Recovery is unsafe (multiple format variants, parameter conventions
+ * differ across MCPs); just drop the leak and log a warning so the
+ * incident is visible.
+ */
+export function stripLeakedMcpToolcalls(text: string): { cleaned: string; leakCount: number } {
+  let leakCount = 0;
+  // Paired block (back-reference enforces matching open/close tag).
+  let cleaned = text.replace(/<(mcp__\w+__\w+)\b[^>]*>[\s\S]*?<\/\1>/g, () => {
+    leakCount++;
+    return '';
+  });
+  // Self-closing block.
+  cleaned = cleaned.replace(/<mcp__\w+__\w+\b[^>]*\/\s*>/g, () => {
+    leakCount++;
+    return '';
+  });
+  return { cleaned: cleaned.trim(), leakCount };
+}
