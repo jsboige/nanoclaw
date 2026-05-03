@@ -261,9 +261,67 @@ const CLAUDE_CODE_AUTO_COMPACT_WINDOW = process.env.CLAUDE_CODE_AUTO_COMPACT_WIN
  * error from translateEvents — when init reports a required MCP as
  * failed/missing, the safest recovery is to drop the continuation so the
  * next attempt starts a fresh session (the broken init might be tied to
- * the resumed transcript's stored tool registry).
+ * the resumed transcript's stored tool registry). Also matches the
+ * "MCP registry lost mid-session" synthetic error (issue #27 branch 2)
+ * for the same reason — the broken registry is bound to this resumed
+ * transcript, only a fresh session restores tool visibility.
  */
-const STALE_SESSION_RE = /no conversation found|ENOENT.*\.jsonl|session.*not found|MCP servers not connected at init/i;
+const STALE_SESSION_RE = /no conversation found|ENOENT.*\.jsonl|session.*not found|MCP servers not connected at init|MCP registry lost mid-session/i;
+
+/**
+ * Match the synthetic tool_result text the SDK injects when the model
+ * calls a tool that isn't in its registry. Captures: full tool name +
+ * server name. We deliberately match the "mcp__<server>__<tool>" shape
+ * so non-MCP fake tool names (e.g. the model hallucinating a builtin)
+ * don't trigger session resets.
+ */
+const NO_SUCH_MCP_TOOL_RE = /No such tool available:\s*(mcp__([A-Za-z0-9_.-]+)__[A-Za-z0-9_.-]+)/;
+
+/**
+ * Extract a missing required MCP tool from a synthetic SDK user message
+ * carrying a tool_result with is_error=true. Returns null when the
+ * message isn't a tool-error, the error isn't an "unknown tool" error,
+ * or the missing tool doesn't belong to a required server (so we don't
+ * reset the session because the model hallucinated `Bashh` or similar).
+ *
+ * Exported for testability — the SDK message format is opaque, this
+ * keeps the regex/structural assumptions in one auditable place.
+ */
+export function detectMissingMcpTool(
+  userMessage: { message?: { content?: unknown } },
+  requiredServers: ReadonlySet<string>,
+): { toolName: string; serverName: string } | null {
+  const content = userMessage?.message?.content;
+  if (!Array.isArray(content)) return null;
+
+  for (const block of content) {
+    if (!block || typeof block !== 'object') continue;
+    const b = block as { type?: string; is_error?: boolean; content?: unknown };
+    if (b.type !== 'tool_result' || b.is_error !== true) continue;
+
+    // tool_result.content is either a string or an array of {type:"text",text}
+    let text = '';
+    if (typeof b.content === 'string') {
+      text = b.content;
+    } else if (Array.isArray(b.content)) {
+      for (const sub of b.content) {
+        if (sub && typeof sub === 'object' && (sub as { type?: string }).type === 'text') {
+          const t = (sub as { text?: unknown }).text;
+          if (typeof t === 'string') text += t;
+        }
+      }
+    } else {
+      continue;
+    }
+
+    const m = NO_SUCH_MCP_TOOL_RE.exec(text);
+    if (!m) continue;
+    const serverName = m[2];
+    if (!requiredServers.has(serverName)) continue;
+    return { toolName: m[1], serverName };
+  }
+  return null;
+}
 
 export class ClaudeProvider implements AgentProvider {
   readonly supportsNativeSlashCommands = true;
@@ -325,6 +383,8 @@ export class ClaudeProvider implements AgentProvider {
 
     let aborted = false;
     const requiredMcpServers = Object.keys(this.mcpServers);
+    const requiredServerSet = new Set(requiredMcpServers);
+    let mcpRegistryLostEmitted = false;
 
     async function* translateEvents(): AsyncGenerator<ProviderEvent> {
       let messageCount = 0;
@@ -334,6 +394,29 @@ export class ClaudeProvider implements AgentProvider {
 
         // Yield activity for every SDK event so the poll loop knows the agent is working
         yield { type: 'activity' };
+
+        // Issue #27 branch 2: SDK auto-injects a tool_result with
+        // is_error=true and "No such tool available: mcp__<server>__*"
+        // when the model calls a tool that isn't in its current registry.
+        // Observed pattern: 22 occurrences in a single resumed session
+        // (412a71e3) between 2026-04-24 and 2026-05-01, all post-compaction
+        // on z.ai's Anthropic-pretend endpoint. Chain HTTP probe stayed
+        // healthy throughout — the SDK's own registry was the broken layer.
+        // We emit once per query (the loss is session-wide; the first hit
+        // tells us all we need) and stop the stream so the poll-loop can
+        // clear the continuation and let the host respawn fresh.
+        if (!mcpRegistryLostEmitted && message.type === 'user') {
+          const missing = detectMissingMcpTool(
+            message as { message?: { content?: unknown } },
+            requiredServerSet,
+          );
+          if (missing) {
+            mcpRegistryLostEmitted = true;
+            log(`MCP registry lost mid-session: ${missing.toolName} not in SDK registry — aborting turn for fresh respawn`);
+            yield { type: 'mcp_tool_missing', toolName: missing.toolName, serverName: missing.serverName };
+            return;
+          }
+        }
 
         if (message.type === 'system' && message.subtype === 'init') {
           // Issue #27: catch the failure mode where the SDK's MCP registry is

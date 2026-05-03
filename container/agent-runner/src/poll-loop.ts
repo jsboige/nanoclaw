@@ -239,6 +239,35 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
         continuation = result.continuation;
         setContinuation(config.providerName, continuation);
       }
+      if (result.mcpRegistryLost) {
+        // Drop the broken continuation so the next inbound triggers a fresh
+        // SDK init. We deliberately do NOT retry inside this batch — the
+        // SDK can't re-register MCP servers on an already-resumed session,
+        // and we'd just be paying for tokens to get the same failure. The
+        // host respawns the container on the next inbound, init picks up
+        // a clean registry, and the user's next message lands in a
+        // working session. Tradeoff: we lose the conversation thread (the
+        // user is told). Better than the previous behavior where the bot
+        // would reply "Dashboard MCP down" 5+ times before someone
+        // noticed and killed the container manually.
+        const { toolName, serverName } = result.mcpRegistryLost;
+        log(`Clearing continuation due to MCP registry loss (server=${serverName}, tool=${toolName})`);
+        continuation = undefined;
+        clearContinuation(config.providerName);
+        if (routing.platformId && routing.channelType) {
+          writeMessageOut({
+            id: generateId(),
+            kind: 'chat',
+            platform_id: routing.platformId,
+            channel_type: routing.channelType,
+            thread_id: routing.threadId,
+            content: JSON.stringify({
+              text: `🔄 MCP tool registry was lost mid-session (${serverName}). Starting a fresh session — please resend your last message.`,
+            }),
+          });
+        }
+        batchError = `mcp_registry_lost:${serverName}`;
+      }
     } catch (err) {
       const errMsg = err instanceof Error ? err.message : String(err);
       log(`Query error: ${errMsg}`);
@@ -327,6 +356,13 @@ function formatMessagesWithCommands(messages: MessageInRow[], nativeSlashCommand
 
 interface QueryResult {
   continuation?: string;
+  /**
+   * Set when the SDK lost its MCP registry mid-session (issue #27 branch 2).
+   * Signals the outer loop to clear continuation so the next inbound starts
+   * a fresh session. Also tells it to skip the generic "Error: ..." reply
+   * since this code path writes its own user-visible message.
+   */
+  mcpRegistryLost?: { toolName: string; serverName: string };
 }
 
 async function processQuery(
@@ -336,6 +372,7 @@ async function processQuery(
   providerName: string,
 ): Promise<QueryResult> {
   let queryContinuation: string | undefined;
+  let mcpRegistryLost: { toolName: string; serverName: string } | undefined;
   let done = false;
 
   // Concurrent polling: push follow-ups into the active query as they arrive.
@@ -434,6 +471,17 @@ async function processQuery(
         if (event.text) {
           dispatchResultText(event.text, routing);
         }
+      } else if (event.type === 'mcp_tool_missing') {
+        // Issue #27 branch 2: the resumed session's tool registry is broken.
+        // Stop draining further SDK events (any continuation reply would be
+        // the model parroting "Dashboard MCP DOWN" indefinitely), close out
+        // this turn, and let the outer loop clear the continuation. The
+        // next inbound will respawn with a fresh init that re-establishes
+        // the registry.
+        mcpRegistryLost = { toolName: event.toolName, serverName: event.serverName };
+        markCompleted(initialBatchIds);
+        query.abort();
+        break;
       }
     }
   } finally {
@@ -441,7 +489,7 @@ async function processQuery(
     clearInterval(pollHandle);
   }
 
-  return { continuation: queryContinuation };
+  return { continuation: queryContinuation, mcpRegistryLost };
 }
 
 function handleEvent(event: ProviderEvent, _routing: RoutingContext): void {
@@ -457,6 +505,9 @@ function handleEvent(event: ProviderEvent, _routing: RoutingContext): void {
       break;
     case 'progress':
       log(`Progress: ${event.message}`);
+      break;
+    case 'mcp_tool_missing':
+      log(`MCP tool missing: ${event.toolName} (server=${event.serverName})`);
       break;
   }
 }
