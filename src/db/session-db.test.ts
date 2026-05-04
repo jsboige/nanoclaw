@@ -10,7 +10,11 @@ import fs from 'fs';
 import path from 'path';
 import { describe, it, expect, afterEach } from 'vitest';
 
-import { expireAncientScheduledMessages, migrateMessagesInTable } from './session-db.js';
+import {
+  expireAncientScheduledMessages,
+  isTransientSqliteReadonlyError,
+  migrateMessagesInTable,
+} from './session-db.js';
 
 const TEST_DIR = '/tmp/nanoclaw-session-db-test';
 const DB_PATH = path.join(TEST_DIR, 'inbound.db');
@@ -168,5 +172,51 @@ describe('expireAncientScheduledMessages', () => {
     const second = expireAncientScheduledMessages(db, cutoff);
     expect(second).toEqual([]);
     db.close();
+  });
+});
+
+describe('isTransientSqliteReadonlyError', () => {
+  it('detects SqliteError code starting with SQLITE_READONLY', () => {
+    const err = Object.assign(new Error('attempt to write a readonly database'), {
+      code: 'SQLITE_READONLY',
+    });
+    expect(isTransientSqliteReadonlyError(err)).toBe(true);
+  });
+
+  it('detects SQLITE_READONLY_RECOVERY (hot-journal recovery on RO open)', () => {
+    const err = Object.assign(new Error('attempt to write a readonly database'), {
+      code: 'SQLITE_READONLY_RECOVERY',
+    });
+    expect(isTransientSqliteReadonlyError(err)).toBe(true);
+  });
+
+  it('falls back to message regex when no code is set', () => {
+    const err = new Error('attempt to write a readonly database');
+    expect(isTransientSqliteReadonlyError(err)).toBe(true);
+  });
+
+  it('reproduces the error path in better-sqlite3 against a RO connection', () => {
+    if (fs.existsSync(TEST_DIR)) fs.rmSync(TEST_DIR, { recursive: true });
+    fs.mkdirSync(TEST_DIR, { recursive: true });
+    const dbPath = path.join(TEST_DIR, 'ro-write.db');
+    new Database(dbPath).close();
+
+    const ro = new Database(dbPath, { readonly: true });
+    let caught: unknown;
+    try {
+      ro.prepare('CREATE TABLE x (v INTEGER)').run();
+    } catch (err) {
+      caught = err;
+    }
+    ro.close();
+    expect(caught).toBeDefined();
+    expect(isTransientSqliteReadonlyError(caught)).toBe(true);
+  });
+
+  it('rejects unrelated errors', () => {
+    expect(isTransientSqliteReadonlyError(new Error('disk full'))).toBe(false);
+    expect(isTransientSqliteReadonlyError(null)).toBe(false);
+    expect(isTransientSqliteReadonlyError(undefined)).toBe(false);
+    expect(isTransientSqliteReadonlyError('readonly database')).toBe(false);
   });
 });

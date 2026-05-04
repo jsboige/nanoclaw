@@ -32,6 +32,27 @@ export function openOutboundDb(dbPath: string): Database.Database {
   return db;
 }
 
+/**
+ * [PATCH-myia] Transient read race against a writer that uses DELETE journal.
+ *
+ * outbound.db is owned by the container and runs `journal_mode=DELETE` (load-
+ * bearing for cross-mount visibility on VirtioFS). When the container is mid-
+ * commit, a `*-journal` file exists; SQLite then needs write access to recover
+ * the journal before serving any read. Our host-side opens are READ-ONLY, so
+ * `prepare()` throws `SqliteError: attempt to write a readonly database`.
+ *
+ * The condition is transient — the next 1s delivery tick (or 60s sweep tick)
+ * sees a clean DB. Callers should treat it as "skip this tick".
+ */
+export function isTransientSqliteReadonlyError(err: unknown): boolean {
+  if (!err || typeof err !== 'object') return false;
+  const code = (err as { code?: unknown }).code;
+  if (typeof code === 'string' && code.startsWith('SQLITE_READONLY')) return true;
+  const message = (err as { message?: unknown }).message;
+  if (typeof message === 'string' && /readonly database/i.test(message)) return true;
+  return false;
+}
+
 /** Open the outbound DB for a session with write access. Only safe to call when no container is running. */
 export function openOutboundDbRw(dbPath: string): Database.Database {
   const db = new Database(dbPath);

@@ -138,6 +138,14 @@ If none works, document the patch here with justification.
 - **Exit condition:** Upstream either accepts a PR adding the same test-singleton fast-path, or refactors `initTestSessionDb()` to write the in-memory DB to a real temp file path that `openInboundDb()` can open.
 - **Lines:** ~12 (guard + helper + 4 call-site renames).
 
+### 15. Swallow transient `SQLITE_READONLY` in delivery poll on hot-journal recovery
+
+- **File:** `src/db/session-db.ts` (new `isTransientSqliteReadonlyError` helper) + `src/delivery.ts` (wrap `getDueOutboundMessages` in `drainSession`)
+- **Summary:** When the host's 1s active delivery poll opens `outbound.db` read-only and `prepare(SELECT ... FROM messages_out)` runs while the container is mid-commit, `better-sqlite3` throws `SqliteError: attempt to write a readonly database`. The container uses `journal_mode=DELETE` (load-bearing for VirtioFS cross-mount visibility) so a `*-journal` file is the normal during-commit state — but readonly opens cannot recover the hot journal. Catch this specific transient case (code starts with `SQLITE_READONLY` or message matches `/readonly database/i`) and skip the tick; the next poll (~1s) sees a clean DB.
+- **Why:** Observed ~67 occurrences in 24h of `Active delivery poll error` log spam on myia-ai-01 (1s poll × ~5 transient hits/hour). Each error logs a full stack to `nanoclaw.err.log` despite being a benign race that resolves on the next tick. Without the swallow, the bug appears as constant noise that masks real delivery failures and clouds the on-call signal-to-noise.
+- **Exit condition:** Upstream applies this fix or the agent-runner switches to a journal mode (e.g. WAL with explicit checkpoint) that doesn't leave hot journals readable cross-mount. Filing upstream is straightforward — the helper is portable and the fix is purely defensive.
+- **Lines:** ~25 (helper + call-site wrap + 5 unit tests).
+
 ### 13. Filesystem-safe per-agent message id separator (`messageIdForAgent`)
 
 - **File:** `src/router.ts` (function `messageIdForAgent` at end of file)
