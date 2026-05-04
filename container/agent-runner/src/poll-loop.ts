@@ -8,7 +8,16 @@ import {
   migrateLegacyContinuation,
   setContinuation,
 } from './db/session-state.js';
-import { formatMessages, extractRouting, categorizeMessage, isClearCommand, isRunnerCommand, stripInternalTags, type RoutingContext } from './formatter.js';
+import {
+  formatMessages,
+  extractRouting,
+  categorizeMessage,
+  isClearCommand,
+  isRunnerCommand,
+  stripInternalTags,
+  stripLeakedMcpToolcalls,
+  type RoutingContext,
+} from './formatter.js';
 import { formatFailures, probeMcpRemoteCached, type RequiredRemote } from './mcp-health.js';
 import type { AgentProvider, AgentQuery, ProviderEvent } from './providers/types.js';
 
@@ -569,7 +578,14 @@ function dispatchResultText(text: string, routing: RoutingContext): void {
     scratchpadParts.push(text.slice(lastIndex));
   }
 
-  const scratchpad = stripInternalTags(scratchpadParts.join(''));
+  const internalStripped = stripInternalTags(scratchpadParts.join(''));
+  // Defensive: z.ai SDK occasionally leaks `<mcp__server__tool>...</...>`
+  // tool-call envelopes as plain text. Without this strip, the fallback
+  // below posts the raw XML to the user-facing channel.
+  const { cleaned: scratchpad, leakCount } = stripLeakedMcpToolcalls(internalStripped);
+  if (leakCount > 0) {
+    log(`WARNING: stripped ${leakCount} leaked MCP toolcall block(s) from agent output (z.ai SDK known issue)`);
+  }
 
   // Single-destination shortcut: the agent wrote plain text — send to
   // the session's originating channel (from session_routing) if available,
