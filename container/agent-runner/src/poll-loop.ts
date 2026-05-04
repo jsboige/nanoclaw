@@ -8,6 +8,7 @@ import {
   migrateLegacyContinuation,
   setContinuation,
 } from './db/session-state.js';
+// [PATCH-myia #8 + #16] mcp-health probe + stripLeakedMcpToolcalls preserved.
 import {
   formatMessages,
   extractRouting,

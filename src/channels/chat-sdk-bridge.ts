@@ -294,13 +294,10 @@ export function createChatSdkBridge(config: ChatSdkBridgeConfig): ChannelAdapter
       // exclusive: subscribed → onSubscribedMessage; unsubscribed+mention →
       // onNewMention; unsubscribed+pattern-match → onNewMessage. Registering
       // with `/[\s\S]*/` lets the router see every plain message (including
-      // media-only messages with empty text — voice notes, stickers, photos
-      // without caption) on every unsubscribed thread the bot can see.
-      // (`/./` would skip empty text since `.` requires ≥1 character, breaking
-      // voice-message ASR.) The router short-circuits via
-      // getMessagingGroupWithAgentCount (~1 DB read) for unwired channels, so
-      // forwarding every one is cheap enough to not need a bridge-side flood
-      // gate.
+      // media-only messages with empty text) on every unsubscribed thread the
+      // getMessagingGroupWithAgentCount (~1 DB read) for unwired channels,
+      // so forwarding every one is cheap enough to not need a bridge-side
+      // flood gate.
       chat.onNewMessage(/[\s\S]*/, async (thread, message) => {
         const channelId = adapter.channelIdFromThreadId(thread.id);
         const { inbound, transcripts } = await messageToInbound(message, false, true);

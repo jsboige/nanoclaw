@@ -331,7 +331,7 @@ export function _resetStuckProcessingRowsForTesting(
   session: Session,
   reason: string,
 ): void {
-  // [PATCH-myia] Tests pass an in-memory outDb; openOutboundDbRw(...) would
+  // [PATCH-myia #14] Tests pass an in-memory outDb; openOutboundDbRw(...) would
   // fail (no on-disk session DB) and the orphan-claim cleanup would silently
   // no-op. Pass outDb itself as the writable override so reads and the
   // production cleanup share one connection — fixes upstream tests on this

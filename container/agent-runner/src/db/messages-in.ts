@@ -8,6 +8,7 @@
  * processing_ack. The host reads processing_ack to sync message lifecycle.
  */
 import { getConfig } from '../config.js';
+// [PATCH-myia #14] closeOpenedInbound preserves test singleton (no-op when in-memory).
 import { openInboundDb, closeOpenedInbound, getOutboundDb } from './connection.js';
 
 export interface MessageInRow {

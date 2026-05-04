@@ -33,7 +33,7 @@ export function openOutboundDb(dbPath: string): Database.Database {
 }
 
 /**
- * [PATCH-myia] Transient read race against a writer that uses DELETE journal.
+ * [PATCH-myia #15] Transient read race against a writer that uses DELETE journal.
  *
  * outbound.db is owned by the container and runs `journal_mode=DELETE` (load-
  * bearing for cross-mount visibility on VirtioFS). When the container is mid-
