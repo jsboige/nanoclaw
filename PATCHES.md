@@ -2,7 +2,7 @@
 
 Minimal `src/` and `container/` patches applied on top of upstream v2. Every entry includes its commit hash, reason, and exit condition. Target: ≤ 10 active patches at any time. Monthly review removes those whose exit condition is satisfied.
 
-Baseline: upstream `main` at `8bdc5c4` (v2.0.28) — sync 2026-05-03. Previous baseline was `8c962d3` (v2.0.23, 2026-05-01).
+Baseline: upstream `main` at `1404f7f` (v2.0.30) — sync 2026-05-04. Previous baseline was `8bdc5c4` (v2.0.28, 2026-05-03).
 
 ## Anti-divergence discipline
 
