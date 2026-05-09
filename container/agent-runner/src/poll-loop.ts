@@ -691,10 +691,13 @@ function handleEvent(event: ProviderEvent, _routing: RoutingContext): void {
 /**
  * Parse the agent's final text for <message to="name">...</message> blocks
  * and dispatch each one to its resolved destination. Text outside of blocks
- * (including <internal>...</internal>) is scratchpad — logged but not sent.
+ * is sent verbatim to the routing source as a fallback (PATCH-myia #19).
  *
- * The agent must always wrap output in <message to="name">...</message>
- * blocks, even with a single destination. Bare text is scratchpad only.
+ * The agent SHOULD wrap output in <message to="name">...</message> blocks
+ * to address specific destinations. When it forgets (often after MCP
+ * registry loss + continuation reset, or after auto-compaction), the
+ * fallback ensures the user still gets the reply on the channel they
+ * messaged from — better than silently dropping it into scratchpad.
  */
 function dispatchResultText(text: string, routing: RoutingContext): void {
   const MESSAGE_RE = /<message\s+to="([^"]+)"\s*>([\s\S]*?)<\/message>/g;
@@ -732,6 +735,39 @@ function dispatchResultText(text: string, routing: RoutingContext): void {
   const { cleaned: scratchpad, leakCount } = stripLeakedMcpToolcalls(internalStripped);
   if (leakCount > 0) {
     log(`WARNING: stripped ${leakCount} leaked MCP toolcall block(s) from agent output (z.ai SDK known issue)`);
+  }
+
+  // [PATCH-myia #19] Routing-source fallback. If the agent produced text but
+  // failed to wrap any of it in `<message to="...">` blocks, send the cleaned
+  // scratchpad to the source of the inbound that triggered this turn. The
+  // alternative (current upstream behavior) is to silently drop the reply,
+  // which from the user's POV looks identical to "the bot ignored me." This
+  // recurs especially after MCP registry loss → continuation cleared → fresh
+  // SDK init that sometimes drops the destination-wrapping discipline.
+  //
+  // We only fall back when:
+  //   - sent === 0 (no <message> blocks succeeded)
+  //   - scratchpad has substantive content (not just whitespace)
+  //   - routing has a usable channel (platformId + channelType)
+  if (
+    sent === 0 &&
+    scratchpad.trim().length > 0 &&
+    routing.platformId &&
+    routing.channelType
+  ) {
+    log(
+      `FALLBACK: agent output had no <message to="..."> blocks — sending ${scratchpad.length} chars to routing source (${routing.channelType}:${routing.platformId})`,
+    );
+    writeMessageOut({
+      id: generateId(),
+      in_reply_to: routing.inReplyTo,
+      kind: 'chat',
+      platform_id: routing.platformId,
+      channel_type: routing.channelType,
+      thread_id: routing.threadId ?? null,
+      content: JSON.stringify({ text: scratchpad.trim() }),
+    });
+    return;
   }
 
   if (scratchpad) {

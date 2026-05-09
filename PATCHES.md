@@ -179,6 +179,14 @@ If none works, document the patch here with justification.
 - **Exit condition:** Upstream adopts deferred-ack-on-result semantics + periodic refresh (PR target), OR the underlying SDK exposes a per-push acknowledgment hook so the poll-loop can do strict 1-to-1 mapping, OR push-mode is replaced with end+restart-per-batch.
 - **Lines:** ~60 (deferred-ack tracking + watchdog interval + `resetProcessingAcks` helper + finally-block reset + periodic refresh check on `result` event).
 
+### 19. Routing-source fallback when agent omits `<message to="...">` wrapping
+
+- **File:** `container/agent-runner/src/poll-loop.ts` (`dispatchResultText` — added fallback branch before the silent-drop log path).
+- **Summary:** If the agent produces non-empty text but fails to wrap any of it in `<message to="...">` blocks, send the cleaned scratchpad to the source of the inbound that triggered the turn (`routing.platformId` + `routing.channelType` + `routing.threadId` + `routing.inReplyTo`). Pre-fix path: log `WARNING: agent output had no <message to="..."> blocks — nothing was sent` and return — i.e. silently drop the agent's reply.
+- **Why:** Observed 2026-05-10: container active 1h, MCP registry was lost mid-session and the SDK rebuilt a fresh query without the destination-wrapping discipline. User sent 4 inbound messages; only 2 outbound rows existed (one auto-error about MCP loss, one partial reply). Container log showed `Result: Mémoire mise à jour. J'attends ta réponse...` followed immediately by `[scratchpad] …` and `WARNING: agent output had no <message to="..."> blocks` — the agent DID generate a reply, but it was thrown away because the wrapping was missing. From the user's POV this looks identical to "the bot ignored me", which is the symptom that motivates this patch (user feedback: "nanoclaw est devenu quasiement inutile en conversation"). Better a reply that goes back to the source channel (the one place we know it's safe) than total silence. Triggered most often by MCP registry loss → continuation cleared → fresh SDK init that drops the wrapping convention.
+- **Exit condition:** Upstream adds the same source-channel fallback in `dispatchResultText` OR the agent provider stops dropping the `<message to="...">` discipline after MCP-init churn (e.g. system-prompt re-send on every fresh query, or stricter SDK guidance).
+- **Lines:** ~20 (one fallback branch in `dispatchResultText` + comment block + one-line docstring update on the surrounding function).
+
 ---
 
 ## Deferred / not yet applied
