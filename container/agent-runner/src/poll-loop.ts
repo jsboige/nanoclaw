@@ -1,5 +1,11 @@
 import { findByName, getAllDestinations, type DestinationEntry } from './destinations.js';
-import { getPendingMessages, markProcessing, markCompleted, type MessageInRow } from './db/messages-in.js';
+import {
+  getPendingMessages,
+  markProcessing,
+  markCompleted,
+  resetProcessingAcks, // [PATCH-myia #18]
+  type MessageInRow,
+} from './db/messages-in.js';
 import { writeMessageOut } from './db/messages-out.js';
 import { getInboundDb, touchHeartbeat, clearStaleProcessingAcks } from './db/connection.js';
 import { recordTaskRun } from './db/task-run-logs.js'; // [PATCH-myia #9]
@@ -21,6 +27,19 @@ import type { AgentProvider, AgentQuery, ProviderEvent } from './providers/types
 
 const POLL_INTERVAL_MS = 1000;
 const ACTIVE_POLL_INTERVAL_MS = 500;
+
+// [PATCH-myia #18] Push-mode stall watchdog. If we push a follow-up batch into
+// an active SDK query and don't see a `result` event within this window, we
+// treat the query as stalled, reset the pushed messages back to pending (so
+// the next poll iteration re-picks them) and abort the query. Without this,
+// pushes that the SDK silently fails to address are lost (the messages were
+// being marked `completed` immediately after `query.push()`).
+//
+// 90s chosen as: long enough to cover normal SDK turn latency including tool
+// calls (~10-30s typical, 60s for slow MCP), short enough to recover before
+// the user notices "the bot didn't reply".
+const STALL_TIMEOUT_MS = 90_000;
+const STALL_CHECK_INTERVAL_MS = 5_000;
 
 function log(msg: string): void {
   console.error(`[poll-loop] ${msg}`);
@@ -399,6 +418,16 @@ async function processQuery(
   // will kill the container and messages get reset to pending.
   let pollInFlight = false;
   let endedForCommand = false;
+
+  // [PATCH-myia #18] Push-mode stall recovery state.
+  // - pendingFollowUpAcks: follow-up message IDs whose markCompleted is deferred
+  //   until a `result` event arrives. Empty when the query is idle / fully drained.
+  // - lastPushAt: timestamp of the most recent query.push(); reset on each
+  //   `result` event. Used by the stall watchdog to decide when to give up.
+  // - stalledAborted: latched once the watchdog fired, prevents racy double-aborts.
+  const pendingFollowUpAcks: string[] = [];
+  let lastPushAt: number | null = null;
+  let stalledAborted = false;
   const pollHandle = setInterval(() => {
     if (done || pollInFlight || endedForCommand) return;
     pollInFlight = true;
@@ -461,7 +490,14 @@ async function processQuery(
         const prompt = formatMessages(keep);
         log(`Pushing ${keep.length} follow-up message(s) into active query`);
         query.push(prompt);
-        markCompleted(keptIds);
+        // [PATCH-myia #18] Defer markCompleted until a `result` event arrives.
+        // The previous behavior marked these completed immediately after push,
+        // which silently lost messages whenever the SDK failed to emit a
+        // matching result event (push-mode stall). Now they stay in
+        // `processing` state and are either drained on the next result event,
+        // or reset+retried by the stall watchdog below.
+        pendingFollowUpAcks.push(...keptIds);
+        lastPushAt = Date.now();
       } catch (err) {
         // Without this catch the rejection escapes the void IIFE and Node
         // terminates the container on unhandled-rejection. The initial-batch
@@ -474,6 +510,39 @@ async function processQuery(
       }
     })();
   }, ACTIVE_POLL_INTERVAL_MS);
+
+  // [PATCH-myia #18] Stall watchdog — every STALL_CHECK_INTERVAL_MS, check
+  // whether a pushed follow-up has been awaiting a result for longer than
+  // STALL_TIMEOUT_MS. If so, reset the pushed messages back to pending (clear
+  // their processing_ack rows) and abort the active SDK query. The outer
+  // poll loop will then re-pick those messages on its next iteration with a
+  // fresh query.
+  const stallHandle = setInterval(() => {
+    if (done || stalledAborted) return;
+    if (lastPushAt === null) return;
+    const elapsed = Date.now() - lastPushAt;
+    if (elapsed < STALL_TIMEOUT_MS) return;
+
+    log(
+      `STALL DETECTED: ${pendingFollowUpAcks.length} follow-up(s) awaiting result for ${Math.round(
+        elapsed / 1000,
+      )}s. Resetting acks and aborting query.`,
+    );
+    stalledAborted = true;
+    if (pendingFollowUpAcks.length > 0) {
+      try {
+        resetProcessingAcks(pendingFollowUpAcks);
+      } catch (err) {
+        log(`Failed to reset processing acks during stall: ${err instanceof Error ? err.message : String(err)}`);
+      }
+      pendingFollowUpAcks.length = 0;
+    }
+    try {
+      query.abort();
+    } catch (err) {
+      log(`Failed to abort stalled query: ${err instanceof Error ? err.message : String(err)}`);
+    }
+  }, STALL_CHECK_INTERVAL_MS);
 
   try {
     for await (const event of query.events) {
@@ -497,6 +566,16 @@ async function processQuery(
         // (send_message) mid-turn, or the message may not need a response
         // at all — either way the turn is finished.
         markCompleted(initialBatchIds);
+        // [PATCH-myia #18] Drain deferred follow-up acks. Any follow-up
+        // pushed since the last result is considered acknowledged by THIS
+        // result event (the SDK may merge multiple pushes into one result
+        // text — that's expected). Reset stall tracking for the next push
+        // cycle.
+        if (pendingFollowUpAcks.length > 0) {
+          markCompleted(pendingFollowUpAcks);
+          pendingFollowUpAcks.length = 0;
+        }
+        lastPushAt = null;
         if (event.text) {
           dispatchResultText(event.text, routing);
         }
@@ -532,6 +611,23 @@ async function processQuery(
   } finally {
     done = true;
     clearInterval(pollHandle);
+    clearInterval(stallHandle); // [PATCH-myia #18]
+    // [PATCH-myia #18] If the stream ended (cleanly or via abort) while we
+    // still had follow-up acks pending, the watchdog already reset them; but
+    // if the stream ended for some OTHER reason (e.g. SDK internal error,
+    // mcp_tool_missing path) we must reset them here too — otherwise those
+    // messages stay stuck in `processing` forever and never get re-picked.
+    if (pendingFollowUpAcks.length > 0 && !stalledAborted) {
+      log(
+        `Stream ended with ${pendingFollowUpAcks.length} follow-up(s) still pending — resetting acks for retry`,
+      );
+      try {
+        resetProcessingAcks(pendingFollowUpAcks);
+      } catch (err) {
+        log(`Failed to reset processing acks at stream end: ${err instanceof Error ? err.message : String(err)}`);
+      }
+      pendingFollowUpAcks.length = 0;
+    }
   }
 
   return { continuation: queryContinuation, mcpRegistryLost };
