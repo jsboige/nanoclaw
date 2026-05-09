@@ -40,6 +40,18 @@ export function getCliSocketPath(): string {
   return path.join(DATA_DIR, 'cli.sock');
 }
 
+/**
+ * `ncl` CLI socket — host-shell-only (the agent-runner inside the container
+ * uses a DB transport, not this socket). Same Windows EACCES under NSSM as
+ * `getCliSocketPath()` so we mirror the named-pipe fallback. [PATCH-myia #17]
+ */
+export function getNclSocketPath(): string {
+  if (process.platform === 'win32') {
+    return '\\\\.\\pipe\\nanoclaw-ncl';
+  }
+  return path.join(DATA_DIR, 'ncl.sock');
+}
+
 // Per-checkout image tag so two installs on the same host don't share
 // `nanoclaw-agent:latest` and clobber each other on rebuild.
 export const CONTAINER_IMAGE_BASE = process.env.CONTAINER_IMAGE_BASE || getContainerImageBase(PROJECT_ROOT);

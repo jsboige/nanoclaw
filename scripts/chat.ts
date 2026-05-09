@@ -1,5 +1,5 @@
 /**
- * nc — chat with your NanoClaw agent from the terminal.
+ * ncl — chat with your NanoClaw agent from the terminal.
  *
  * Usage:
  *   pnpm run chat <message...>
@@ -12,6 +12,9 @@
  */
 import net from 'net';
 
+// [PATCH-myia #29] getCliSocketPath() returns a Windows named pipe on win32
+// (`\\.\pipe\nanoclaw-cli`) — direct path.join(DATA_DIR, 'cli.sock') breaks
+// boot under NSSM with EACCES.
 import { getCliSocketPath } from '../src/config.js';
 
 const SILENCE_MS = 2000; // exit after this much quiet time following the first reply
@@ -31,7 +34,7 @@ function main(): void {
     const e = err as NodeJS.ErrnoException;
     if (e.code === 'ENOENT' || e.code === 'ECONNREFUSED') {
       console.error(`NanoClaw daemon not reachable at ${getCliSocketPath()}.`);
-      console.error('Start the service (launchctl/systemd) before running nc.');
+      console.error('Start the service (launchctl/systemd) before running ncl.');
     } else {
       console.error('CLI socket error:', err);
     }

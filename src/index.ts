@@ -54,6 +54,12 @@ import './channels/index.js';
 // append registry-based modules. Imported for side effects (registrations).
 import './modules/index.js';
 
+// CLI command barrel — populates the `ncl` registry before the CLI server
+// accepts connections.
+import './cli/commands/index.js';
+import './cli/delivery-action.js';
+import { startCliServer, stopCliServer } from './cli/socket-server.js';
+
 import type { ChannelAdapter, ChannelSetup } from './channels/adapter.js';
 import { initChannelAdapters, teardownChannelAdapters, getChannelAdapter } from './channels/channel-registry.js';
 
@@ -169,9 +175,12 @@ async function main(): Promise<void> {
   startHostSweep();
   log.info('Host sweep started');
 
-  // 7. Start IPC watcher (consumes data/ipc/<folder>/messages/*.json from
-  //    out-of-process producers like roosync-inbox-standalone).
+  // 7. Start IPC watcher [PATCH-myia #11] (consumes data/ipc/<folder>/messages/*.json
+  //    from out-of-process producers like roosync-inbox-standalone).
   startIpcWatcher();
+
+  // 8. Start the `ncl` CLI socket server (data/ncl.sock).
+  await startCliServer();
 
   log.info('NanoClaw running');
 }
@@ -188,7 +197,8 @@ async function shutdown(signal: string): Promise<void> {
   }
   stopDeliveryPolls();
   stopHostSweep();
-  stopIpcWatcher(); // [PATCH-myia #10] legacy IPC consumer
+  stopIpcWatcher(); // [PATCH-myia #11] legacy IPC consumer
+  await stopCliServer();
   try {
     await teardownChannelAdapters();
   } finally {
