@@ -2,7 +2,7 @@
 
 Minimal `src/` and `container/` patches applied on top of upstream v2. Every entry includes its commit hash, reason, and exit condition. Target: ≤ 10 active patches at any time. Monthly review removes those whose exit condition is satisfied.
 
-Baseline: upstream `main` at `1404f7f` (v2.0.30) — sync 2026-05-04. Previous baseline was `8bdc5c4` (v2.0.28, 2026-05-03).
+Baseline: upstream `main` at `ef43cbb` (v2.0.46) — sync 2026-05-09. Previous baseline was `1404f7f` (v2.0.30, 2026-05-04).
 
 ## Anti-divergence discipline
 
@@ -161,6 +161,14 @@ If none works, document the patch here with justification.
 - **Why:** z.ai's Anthropic-pretend endpoint occasionally emits the model's tool-call XML envelope as plain text instead of executing it. Without stripping, the dispatcher's single-destination fallback posts the raw `<mcp__nanoclaw__send_message>…</…>` (or `<mcp__nanoclaw__add_reaction />`) as a chat message — the user sees garbage, and worse: an intended private DM is exposed in the public group because the fallback ignores the `to=` parameter inside the leaked XML and always replies to the channel of origin. Recovery is unsafe (parameter conventions differ across MCPs and across model leak variants), so just drop the leak and rely on the next user message to retry.
 - **Exit condition:** Upstream applies the same defensive strip OR z.ai fixes the SDK envelope leak OR we switch the agent provider for this group off z.ai.
 - **Lines:** ~35 (helper) + ~10 (call site + WARNING log).
+
+### 17. Windows named pipe for new `ncl` CLI socket (`data/ncl.sock`)
+
+- **File:** `src/config.ts` (new `getNclSocketPath()`), `src/cli/socket-client.ts` (use it for `DEFAULT_SOCKET_PATH`), `src/cli/socket-server.ts` (skip `unlinkSync`+`chmodSync` on win32).
+- **Summary:** Mirror PATCH #29 (now obsolete-merged at the v2.0.30 sync) for the new upstream `ncl` CLI socket added in v2.0.36+. On Windows, `getNclSocketPath()` returns `\\.\pipe\nanoclaw-ncl` instead of `data/ncl.sock`. Server skips stale-file unlink and `chmod` on the named pipe (OS auto-cleans pipes; chmod is meaningless on `\\.\pipe\`).
+- **Why:** Upstream `0855369 refactor(cli): rename nc to ncl` and follow-ups added a NEW host-side CLI socket server using the same Unix-socket-on-disk pattern that PATCH #29 already fixed for `data/cli.sock`. Under NSSM service account on Windows, `net.listen('data/ncl.sock')` returns `EACCES: permission denied` — the daemon binds but cannot chmod, then crashes the host on startup. Without this patch, the service circuit-breaker-loops on every restart after the v2.0.30→v2.0.46 sync. The container's `ncl` does not use this socket (it talks to the host via DB transport — see `container/agent-runner/src/cli/ncl.ts`), so a host-only named pipe is sufficient.
+- **Exit condition:** Upstream `src/cli/socket-server.ts` adds platform detection or a config hook for the listen path, OR we deprecate the host-side socket server in favor of the container's DB transport for shell invocations too.
+- **Lines:** ~14 (new helper + 3 call-site swaps + win32 guard on cleanup/chmod).
 
 ---
 

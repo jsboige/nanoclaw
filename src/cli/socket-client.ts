@@ -6,13 +6,14 @@
  * writes one response and closes.
  */
 import net from 'net';
-import path from 'path';
 
-import { DATA_DIR } from '../config.js';
+import { getNclSocketPath } from '../config.js';
 import type { RequestFrame, ResponseFrame } from './frame.js';
 import type { Transport } from './transport.js';
 
-export const DEFAULT_SOCKET_PATH = path.join(DATA_DIR, 'ncl.sock');
+// [PATCH-myia #17] Use named pipe on Windows; Unix socket bind hits EACCES
+// under NSSM service account.
+export const DEFAULT_SOCKET_PATH = getNclSocketPath();
 
 export class SocketTransport implements Transport {
   constructor(private readonly socketPath: string = DEFAULT_SOCKET_PATH) {}

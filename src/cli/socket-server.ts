@@ -17,15 +17,22 @@ import { DEFAULT_SOCKET_PATH } from './socket-client.js';
 
 let server: net.Server | null = null;
 
+// [PATCH-myia #17] Skip stale-socket unlink + chmod on Windows where the
+// transport is a named pipe — the OS auto-cleans pipes when the owning
+// process exits, and chmod is meaningless on \\.\pipe\.
+const IS_WINDOWS = process.platform === 'win32';
+
 export async function startCliServer(socketPath: string = DEFAULT_SOCKET_PATH): Promise<void> {
   // Stale-socket cleanup — a previous run that crashed may have left the
   // file behind, and net.createServer refuses to bind to an existing path.
-  try {
-    fs.unlinkSync(socketPath);
-  } catch (err) {
-    const e = err as NodeJS.ErrnoException;
-    if (e.code !== 'ENOENT') {
-      log.warn('Failed to unlink stale ncl socket (will try to bind anyway)', { socketPath, err });
+  if (!IS_WINDOWS) {
+    try {
+      fs.unlinkSync(socketPath);
+    } catch (err) {
+      const e = err as NodeJS.ErrnoException;
+      if (e.code !== 'ENOENT') {
+        log.warn('Failed to unlink stale ncl socket (will try to bind anyway)', { socketPath, err });
+      }
     }
   }
 
@@ -34,10 +41,12 @@ export async function startCliServer(socketPath: string = DEFAULT_SOCKET_PATH): 
   await new Promise<void>((resolve, reject) => {
     s.once('error', reject);
     s.listen(socketPath, () => {
-      try {
-        fs.chmodSync(socketPath, 0o600);
-      } catch (err) {
-        log.warn('Failed to chmod ncl socket (continuing)', { socketPath, err });
+      if (!IS_WINDOWS) {
+        try {
+          fs.chmodSync(socketPath, 0o600);
+        } catch (err) {
+          log.warn('Failed to chmod ncl socket (continuing)', { socketPath, err });
+        }
       }
       log.info('ncl CLI server listening', { socketPath });
       resolve();
