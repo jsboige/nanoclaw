@@ -116,6 +116,22 @@ export function markFailed(id: string): void {
     .run(id);
 }
 
+// [PATCH-myia #18] Push-mode stall recovery — see poll-loop.ts processQuery.
+// When a follow-up batch is pushed into an active SDK query but the SDK never
+// emits a corresponding `result` event (push-mode stall, observed in z.ai SDK
+// and recurring upstream issue #2177), the messages must NOT stay marked
+// `completed` (current behavior loses them silently). Instead the watchdog
+// resets their processing_ack rows and aborts the query, letting the outer
+// poll loop re-pick them with a fresh SDK query on the next iteration.
+export function resetProcessingAcks(ids: string[]): void {
+  if (ids.length === 0) return;
+  const db = getOutboundDb();
+  const stmt = db.prepare('DELETE FROM processing_ack WHERE message_id = ?');
+  db.transaction(() => {
+    for (const id of ids) stmt.run(id);
+  })();
+}
+
 /** Get a message by ID (read from inbound.db). */
 export function getMessageIn(id: string): MessageInRow | undefined {
   const inbound = openInboundDb();
