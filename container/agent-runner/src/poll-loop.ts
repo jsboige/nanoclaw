@@ -41,6 +41,17 @@ const ACTIVE_POLL_INTERVAL_MS = 500;
 const STALL_TIMEOUT_MS = 90_000;
 const STALL_CHECK_INTERVAL_MS = 5_000;
 
+// [PATCH-myia #18b] Periodic SDK query refresh. After this much wall-clock
+// time on a single push-mode query, end gracefully after the next `result`
+// event so the outer loop spawns a fresh query (continuation token preserved
+// — the SDK resumes the same conversation, just with a clean stream + module
+// state). Belt-and-braces against long-lived SDK sessions accumulating state
+// that increases the rate of push-mode stalls (the precipitating bug for
+// PATCH #18 was a 12-hour-old single SDK query). 2h chosen as: long enough
+// that a single user conversation rarely hits it; short enough that a busy
+// always-on agent (cron tasks) recycles a few times per day.
+const QUERY_REFRESH_AFTER_MS = 2 * 60 * 60 * 1000;
+
 function log(msg: string): void {
   console.error(`[poll-loop] ${msg}`);
 }
@@ -428,6 +439,12 @@ async function processQuery(
   const pendingFollowUpAcks: string[] = [];
   let lastPushAt: number | null = null;
   let stalledAborted = false;
+
+  // [PATCH-myia #18b] Periodic SDK query refresh — wall-clock time when this
+  // query started serving requests. After QUERY_REFRESH_AFTER_MS, we end the
+  // stream gracefully on the next `result` event so the outer loop spawns a
+  // fresh query (continuation token preserves the conversation).
+  const queryStartedAt = Date.now();
   const pollHandle = setInterval(() => {
     if (done || pollInFlight || endedForCommand) return;
     pollInFlight = true;
@@ -578,6 +595,19 @@ async function processQuery(
         lastPushAt = null;
         if (event.text) {
           dispatchResultText(event.text, routing);
+        }
+        // [PATCH-myia #18b] Periodic refresh — if this query has been alive
+        // longer than QUERY_REFRESH_AFTER_MS, end gracefully now so the
+        // outer loop starts a fresh query for the next batch. Continuation
+        // token has been persisted on every `init` event, so the SDK
+        // resumes the same conversation in the new stream. Done after
+        // dispatching the current result text — the user gets this turn's
+        // reply, then we wind down.
+        if (Date.now() - queryStartedAt > QUERY_REFRESH_AFTER_MS) {
+          log(
+            `Query lifetime ${Math.round((Date.now() - queryStartedAt) / 60000)}min exceeds refresh threshold — ending stream gracefully`,
+          );
+          query.end();
         }
       } else if (event.type === 'mcp_tool_missing') {
         // [PATCH-myia #8] Issue #27 branch 2: the resumed session's tool
