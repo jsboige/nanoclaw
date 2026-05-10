@@ -179,6 +179,17 @@ If none works, document the patch here with justification.
 - **Exit condition:** Upstream adopts deferred-ack-on-result semantics + periodic refresh (PR target), OR the underlying SDK exposes a per-push acknowledgment hook so the poll-loop can do strict 1-to-1 mapping, OR push-mode is replaced with end+restart-per-batch.
 - **Lines:** ~60 (deferred-ack tracking + watchdog interval + `resetProcessingAcks` helper + finally-block reset + periodic refresh check on `result` event).
 
+### 20. Retry transient ASR failures in `transcription.ts`
+
+- **File:** `src/transcription.ts` (`transcribeAudioBuffer` retry loop).
+- **Summary:** Wrap the ASR fetch + status-check in a 3-attempt loop with backoff `[200ms, 600ms]`. Retry on `TypeError: fetch failed` (network / SSL handshake / DNS) and on HTTP `5xx`. Do NOT retry on 4xx (auth, malformed). Log warnings on each retry, error only when all attempts are exhausted. The `FormData` is rebuilt on each attempt because `Blob` streams are single-use.
+- **Why:** Observed 2026-05-10 in `nanoclaw.err.log`: 5× `Transcription error TypeError fetch failed` + 2× `Transcription request failed status=500` spread across the day, while the same endpoint produced 142 successful transcriptions. Drops are silent from the user's POV — no `🎤` echo, agent never sees `[Voice: ...]` inline → bot looks like it ignored the voice. Two distinct intermittent modes:
+  - SSL chain instability on `whisper-api.myia.io` (cert chain incomplete from ARR po-2023; Node fetch fails sporadically depending on which CA chain it tries to verify against).
+  - Whisper backend on po-2023 returning sporadic 500 (server-side hiccup, recovers on next call).
+  Both are recoverable with a quick retry. Persistent outages still surface as `Transcription error attempt=3` after exhausting attempts.
+- **Exit condition:** ARR `whisper-api.myia.io` serves the full intermediate cert chain (PowerShell strict accepts it without `-SkipCertificateCheck`), AND po-2023 Whisper stops emitting transient 500s, OR upstream NanoClaw adds native retry/backoff to its ASR path.
+- **Lines:** ~50 (3-attempt loop with attempt-aware logging + helper to rebuild FormData per attempt).
+
 ### 19. Routing-source fallback when agent omits `<message to="...">` wrapping
 
 - **File:** `container/agent-runner/src/poll-loop.ts` (`dispatchResultText` — added fallback branch before the silent-drop log path).
