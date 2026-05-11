@@ -52,6 +52,19 @@ const STALL_CHECK_INTERVAL_MS = 5_000;
 // always-on agent (cron tasks) recycles a few times per day.
 const QUERY_REFRESH_AFTER_MS = 2 * 60 * 60 * 1000;
 
+// [PATCH-myia #24] Heartbeat keep-alive cadence during an active SDK query.
+// The host-sweep claim-stuck rule kills a container when a `processing_ack`
+// row has been claimed for >60s AND the heartbeat file hasn't been touched
+// since the claim (see src/host-sweep.ts CLAIM_STUCK_MS). Upstream only
+// touches heartbeat on SDK events — so any legitimate SDK silence longer
+// than 60s (context auto-compaction before the first event of a new turn,
+// slow MCP probe, model first-token latency under load) trips the kill
+// even though the container's event loop is alive and waiting. The tickle
+// interval below proves liveness from the container side at a cadence
+// well under the host's threshold. A truly-frozen process can't run the
+// callback, so this doesn't mask hard hangs.
+const HEARTBEAT_TICKLE_INTERVAL_MS = 15_000;
+
 function log(msg: string): void {
   console.error(`[poll-loop] ${msg}`);
 }
@@ -137,6 +150,10 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
 
     const ids = messages.map((m) => m.id);
     markProcessing(ids);
+    // [PATCH-myia #24] Stamp heartbeat at claim time so the host's
+    // claim-stuck rule starts ticking from a known-fresh state. The
+    // setInterval inside processQuery picks up from here.
+    touchHeartbeat();
 
     const routing = extractRouting(messages);
 
@@ -440,6 +457,24 @@ async function processQuery(
   let lastPushAt: number | null = null;
   let stalledAborted = false;
 
+  // [PATCH-myia #25] Push serialization — hold new follow-ups until the
+  // current turn finishes. Earlier behavior pushed every arrival straight
+  // into the live stream, so the SDK merged multiple user messages into a
+  // single turn and emitted ONE result for N inputs — the extra messages
+  // got silently swallowed (no per-message reply, no fallback dispatch).
+  // Now we push at most one batch at a time: while `awaitingResult` is
+  // true (initial prompt or a previous follow-up batch still being
+  // answered), new arrivals accumulate in `queuedFollowUps` and get
+  // pushed as a single consolidated batch on the next `result`. They are
+  // still marked processing on arrival (so the host knows they're claimed
+  // and won't pick them up via the sweep), and they're reset back to
+  // pending if the stream ends before they get pushed.
+  //
+  // `awaitingResult` starts true because the initial prompt was already
+  // injected by config.provider.query() before this function was called.
+  let awaitingResult = true;
+  const queuedFollowUps: MessageInRow[] = [];
+
   // [PATCH-myia #18b] Periodic SDK query refresh — wall-clock time when this
   // query started serving requests. After QUERY_REFRESH_AFTER_MS, we end the
   // stream gracefully on the next `result` event so the outer loop spawns a
@@ -503,6 +538,19 @@ async function processQuery(
         // claimed messages get released by the host's processing-claim sweep.
         if (done) return;
 
+        // [PATCH-myia #25] Serialize pushes: if a turn is already in flight
+        // (initial prompt or a prior follow-up batch awaiting its result),
+        // queue this batch locally. It will be drained on the next `result`
+        // event so each batch gets its own SDK turn (and therefore its own
+        // user-visible reply) rather than being merged into the running turn.
+        if (awaitingResult) {
+          queuedFollowUps.push(...keep);
+          log(
+            `Queued ${keep.length} follow-up(s) — turn in flight (${queuedFollowUps.length} total queued)`,
+          );
+          return;
+        }
+
         const keptIds = keep.map((m) => m.id);
         const prompt = formatMessages(keep);
         log(`Pushing ${keep.length} follow-up message(s) into active query`);
@@ -515,6 +563,7 @@ async function processQuery(
         // or reset+retried by the stall watchdog below.
         pendingFollowUpAcks.push(...keptIds);
         lastPushAt = Date.now();
+        awaitingResult = true;
       } catch (err) {
         // Without this catch the rejection escapes the void IIFE and Node
         // terminates the container on unhandled-rejection. The initial-batch
@@ -527,6 +576,21 @@ async function processQuery(
       }
     })();
   }, ACTIVE_POLL_INTERVAL_MS);
+
+  // [PATCH-myia #24] Heartbeat tickle — keep the host's claim-stuck rule
+  // from killing us during legitimate SDK silence (auto-compaction, slow
+  // first token, MCP probe). Touches the file every 15s while this query
+  // is alive. Cleared in the finally below so the tickle stops the moment
+  // the stream ends — after that the host's normal liveness rules apply.
+  const heartbeatHandle = setInterval(() => {
+    try {
+      touchHeartbeat();
+    } catch {
+      // touchHeartbeat already swallows fs errors; defensive double-catch
+      // so an unexpected throw never escapes the interval and kills the
+      // process via unhandled-rejection.
+    }
+  }, HEARTBEAT_TICKLE_INTERVAL_MS);
 
   // [PATCH-myia #18] Stall watchdog — every STALL_CHECK_INTERVAL_MS, check
   // whether a pushed follow-up has been awaiting a result for longer than
@@ -553,6 +617,20 @@ async function processQuery(
         log(`Failed to reset processing acks during stall: ${err instanceof Error ? err.message : String(err)}`);
       }
       pendingFollowUpAcks.length = 0;
+    }
+    // [PATCH-myia #25] Queued (not-yet-pushed) follow-ups were claimed by
+    // markProcessing when they arrived. Release them too so the next outer-
+    // loop iteration re-picks them in a fresh query.
+    if (queuedFollowUps.length > 0) {
+      const queuedIds = queuedFollowUps.map((m) => m.id);
+      try {
+        resetProcessingAcks(queuedIds);
+      } catch (err) {
+        log(
+          `Failed to reset queued follow-up acks during stall: ${err instanceof Error ? err.message : String(err)}`,
+        );
+      }
+      queuedFollowUps.length = 0;
     }
     try {
       query.abort();
@@ -585,16 +663,40 @@ async function processQuery(
         markCompleted(initialBatchIds);
         // [PATCH-myia #18] Drain deferred follow-up acks. Any follow-up
         // pushed since the last result is considered acknowledged by THIS
-        // result event (the SDK may merge multiple pushes into one result
-        // text — that's expected). Reset stall tracking for the next push
-        // cycle.
+        // result event. With PATCH #25 push serialization, a result now
+        // matches the most recent single push (initial batch or one
+        // follow-up batch); the SDK no longer collapses N pushes into one
+        // result.
         if (pendingFollowUpAcks.length > 0) {
           markCompleted(pendingFollowUpAcks);
           pendingFollowUpAcks.length = 0;
         }
         lastPushAt = null;
+        awaitingResult = false;
         if (event.text) {
           dispatchResultText(event.text, routing);
+        }
+        // [PATCH-myia #25] Drain queued follow-ups into a fresh turn. Any
+        // messages that arrived while the previous turn was in flight have
+        // been holding in `queuedFollowUps`; push them as a single batch
+        // now so they get their own result (and therefore their own user
+        // reply). Guard against pushing into a stream we're about to end
+        // (slash command or refresh) — those follow-ups will be reset to
+        // pending in the finally block and re-picked by the outer loop.
+        if (
+          queuedFollowUps.length > 0 &&
+          !endedForCommand &&
+          !stalledAborted &&
+          Date.now() - queryStartedAt <= QUERY_REFRESH_AFTER_MS
+        ) {
+          const batch = queuedFollowUps.splice(0);
+          const batchIds = batch.map((m) => m.id);
+          const prompt = formatMessages(batch);
+          log(`Draining ${batch.length} queued follow-up(s) into fresh turn`);
+          query.push(prompt);
+          pendingFollowUpAcks.push(...batchIds);
+          lastPushAt = Date.now();
+          awaitingResult = true;
         }
         // [PATCH-myia #18b] Periodic refresh — if this query has been alive
         // longer than QUERY_REFRESH_AFTER_MS, end gracefully now so the
@@ -642,6 +744,7 @@ async function processQuery(
     done = true;
     clearInterval(pollHandle);
     clearInterval(stallHandle); // [PATCH-myia #18]
+    clearInterval(heartbeatHandle); // [PATCH-myia #24]
     // [PATCH-myia #18] If the stream ended (cleanly or via abort) while we
     // still had follow-up acks pending, the watchdog already reset them; but
     // if the stream ended for some OTHER reason (e.g. SDK internal error,
@@ -657,6 +760,26 @@ async function processQuery(
         log(`Failed to reset processing acks at stream end: ${err instanceof Error ? err.message : String(err)}`);
       }
       pendingFollowUpAcks.length = 0;
+    }
+    // [PATCH-myia #25] Same treatment for queued-but-not-yet-pushed follow-
+    // ups: they were claimed by markProcessing on arrival, so without an
+    // explicit reset they'd stay in `processing` until the host sweep
+    // clears them — which only happens after CLAIM_STUCK_MS+heartbeat-age
+    // checks. Resetting immediately means the outer loop's next iteration
+    // (or a fresh container spawn) picks them up at once.
+    if (queuedFollowUps.length > 0 && !stalledAborted) {
+      const queuedIds = queuedFollowUps.map((m) => m.id);
+      log(
+        `Stream ended with ${queuedFollowUps.length} queued follow-up(s) — resetting acks for retry`,
+      );
+      try {
+        resetProcessingAcks(queuedIds);
+      } catch (err) {
+        log(
+          `Failed to reset queued follow-up acks at stream end: ${err instanceof Error ? err.message : String(err)}`,
+        );
+      }
+      queuedFollowUps.length = 0;
     }
   }
 
