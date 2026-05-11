@@ -52,6 +52,19 @@ const STALL_CHECK_INTERVAL_MS = 5_000;
 // always-on agent (cron tasks) recycles a few times per day.
 const QUERY_REFRESH_AFTER_MS = 2 * 60 * 60 * 1000;
 
+// [PATCH-myia #24] Heartbeat keep-alive cadence during an active SDK query.
+// The host-sweep claim-stuck rule kills a container when a `processing_ack`
+// row has been claimed for >60s AND the heartbeat file hasn't been touched
+// since the claim (see src/host-sweep.ts CLAIM_STUCK_MS). Upstream only
+// touches heartbeat on SDK events — so any legitimate SDK silence longer
+// than 60s (context auto-compaction before the first event of a new turn,
+// slow MCP probe, model first-token latency under load) trips the kill
+// even though the container's event loop is alive and waiting. The tickle
+// interval below proves liveness from the container side at a cadence
+// well under the host's threshold. A truly-frozen process can't run the
+// callback, so this doesn't mask hard hangs.
+const HEARTBEAT_TICKLE_INTERVAL_MS = 15_000;
+
 function log(msg: string): void {
   console.error(`[poll-loop] ${msg}`);
 }
@@ -137,6 +150,10 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
 
     const ids = messages.map((m) => m.id);
     markProcessing(ids);
+    // [PATCH-myia #24] Stamp heartbeat at claim time so the host's
+    // claim-stuck rule starts ticking from a known-fresh state. The
+    // setInterval inside processQuery picks up from here.
+    touchHeartbeat();
 
     const routing = extractRouting(messages);
 
@@ -528,6 +545,21 @@ async function processQuery(
     })();
   }, ACTIVE_POLL_INTERVAL_MS);
 
+  // [PATCH-myia #24] Heartbeat tickle — keep the host's claim-stuck rule
+  // from killing us during legitimate SDK silence (auto-compaction, slow
+  // first token, MCP probe). Touches the file every 15s while this query
+  // is alive. Cleared in the finally below so the tickle stops the moment
+  // the stream ends — after that the host's normal liveness rules apply.
+  const heartbeatHandle = setInterval(() => {
+    try {
+      touchHeartbeat();
+    } catch {
+      // touchHeartbeat already swallows fs errors; defensive double-catch
+      // so an unexpected throw never escapes the interval and kills the
+      // process via unhandled-rejection.
+    }
+  }, HEARTBEAT_TICKLE_INTERVAL_MS);
+
   // [PATCH-myia #18] Stall watchdog — every STALL_CHECK_INTERVAL_MS, check
   // whether a pushed follow-up has been awaiting a result for longer than
   // STALL_TIMEOUT_MS. If so, reset the pushed messages back to pending (clear
@@ -642,6 +674,7 @@ async function processQuery(
     done = true;
     clearInterval(pollHandle);
     clearInterval(stallHandle); // [PATCH-myia #18]
+    clearInterval(heartbeatHandle); // [PATCH-myia #24]
     // [PATCH-myia #18] If the stream ended (cleanly or via abort) while we
     // still had follow-up acks pending, the watchdog already reset them; but
     // if the stream ended for some OTHER reason (e.g. SDK internal error,
