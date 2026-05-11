@@ -83,8 +83,10 @@ async function main(): Promise<void> {
   // 1b. One-time filesystem cutover — idempotent, no-op after first run.
   migrateGroupsToClaudeLocal();
 
-  // 2. Container runtime
-  ensureContainerRuntimeRunning();
+  // 2. Container runtime — async retry loop absorbs transient Docker pipe
+  //    failures on Windows so a brief Docker Desktop hiccup doesn't crash
+  //    the host into circuit-breaker backoff. See PATCH #22.
+  await ensureContainerRuntimeRunning();
   cleanupOrphans();
 
   // 3. Channel adapters
