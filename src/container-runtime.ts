@@ -42,9 +42,7 @@ export function stopContainer(name: string): void {
  *
  * Exported for tests.
  */
-export const DEFAULT_RUNTIME_RETRY_DELAYS_MS: number[] = [
-  0, 5_000, 10_000, 15_000, 30_000, 60_000, 60_000,
-];
+export const DEFAULT_RUNTIME_RETRY_DELAYS_MS: number[] = [0, 5_000, 10_000, 15_000, 30_000, 60_000, 60_000];
 
 /**
  * Ensure the container runtime is running, retrying on transient pipe failures.
