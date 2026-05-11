@@ -190,6 +190,16 @@ If none works, document the patch here with justification.
 - **Exit condition:** ARR `whisper-api.myia.io` serves the full intermediate cert chain (PowerShell strict accepts it without `-SkipCertificateCheck`), AND po-2023 Whisper stops emitting transient 500s, OR upstream NanoClaw adds native retry/backoff to its ASR path.
 - **Lines:** ~50 (3-attempt loop with attempt-aware logging + helper to rebuild FormData per attempt).
 
+### 21. Telegram delivery resilience — markdown raw-fallback + reaction-target-gone swallow
+
+- **File:** `src/channels/chat-sdk-bridge.ts` (new `postWithMarkdownFallback`, `isParseEntitiesError`, `isReactionTargetGoneError` helpers; reaction catch in `bridge.deliver`; markdown path switched to the helper).
+- **Summary:** Two outbound-delivery hardening points layered on top of `telegram-markdown-sanitize.ts`:
+  - **Markdown raw-fallback** — when `adapter.postMessage(tid, { markdown })` throws `ValidationError: can't parse entities`, the helper retries once with `{ raw }` so Telegram bypasses `parse_mode=Markdown`. Attachments (`files`) ride on the retry payload. Without this, content-driven sanitizer escapes (long replies with edge-case delimiter combinations) trigger Telegram's parser → 3 retries → `markDeliveryFailed`, message silently dropped.
+  - **Reaction-target-gone swallow** — when `adapter.addReaction` throws `ValidationError: message to react not found` (the target was deleted or fell out of the bot's window before the reaction call landed), log info and return undefined so the row marks delivered. The reaction is a UX cue (`👀`, `🎤`); retrying 3× and logging full stacks only clogs `nanoclaw.err.log`.
+- **Why:** Observed 2026-05-10 in `nanoclaw.err.log`: 1× `can't parse entities` on a 12KB reply (msg-1778446071801-0saqmr, byte offset 1243) — permanent drop after 3 retries, user never received the reply. Also 14× `message to react not found` across 24h, each producing a full stack trace and a delivery-failure row that's purely cosmetic noise. The pattern matches the user's "many messages seem not to reach Telegram" report: long agent replies hit sanitizer escapes more often as token budget grows, and reaction noise hides the real entity-parse drops in the log scroll. The legacy `telegram-markdown-sanitize.ts` is a best-effort heuristic (it doesn't tokenize markdown like the Telegram parser does), so a raw-text fallback is the right last line of defense — the message arrives without formatting, but it arrives.
+- **Exit condition:** Upstream `@chat-adapter/telegram` exposes a real mode-aware converter or surfaces an `onParseError` hook that downgrades parse_mode automatically. Until then this helper stays.
+- **Lines:** ~50 (3 helpers + 1 catch branch + 2 call-site swaps) + ~100 (tests).
+
 ### 19. Routing-source fallback when agent omits `<message to="...">` wrapping
 
 - **File:** `container/agent-runner/src/poll-loop.ts` (`dispatchResultText` — added fallback branch before the silent-drop log path).
