@@ -33,28 +33,77 @@ export function stopContainer(name: string): void {
   execSync(`${CONTAINER_RUNTIME_BIN} stop -t 1 ${name}`, { stdio: 'pipe' });
 }
 
-/** Ensure the container runtime is running, starting it if needed. */
-export function ensureContainerRuntimeRunning(): void {
-  try {
-    execSync(`${CONTAINER_RUNTIME_BIN} info`, {
-      stdio: 'pipe',
-      timeout: 10000,
-    });
-    log.debug('Container runtime already running');
-  } catch (err) {
-    log.error('Failed to reach container runtime', { err });
-    console.error('\n╔════════════════════════════════════════════════════════════════╗');
-    console.error('║  FATAL: Container runtime failed to start                      ║');
-    console.error('║                                                                ║');
-    console.error('║  Agents cannot run without a container runtime. To fix:        ║');
-    console.error('║  1. Ensure Docker is installed and running                     ║');
-    console.error('║  2. Run: docker info                                           ║');
-    console.error('║  3. Restart NanoClaw                                           ║');
-    console.error('╚════════════════════════════════════════════════════════════════╝\n');
-    throw new Error('Container runtime is required but failed to start', {
-      cause: err,
-    });
+/**
+ * Retry schedule for {@link ensureContainerRuntimeRunning}. Index 0 = first
+ * attempt (no delay). The function tries each entry as a sleep-then-probe step
+ * until either the probe succeeds or the schedule is exhausted. Total budget
+ * ~180s — enough to absorb a Docker Desktop restart hiccup on Windows
+ * (typically 30-90s) before bubbling FATAL up to the circuit breaker.
+ *
+ * Exported for tests.
+ */
+export const DEFAULT_RUNTIME_RETRY_DELAYS_MS: number[] = [
+  0, 5_000, 10_000, 15_000, 30_000, 60_000, 60_000,
+];
+
+/**
+ * Ensure the container runtime is running, retrying on transient pipe failures.
+ *
+ * On Windows the `\\.\pipe\docker_engine` named pipe can briefly disappear
+ * during Docker Desktop restarts, WSL kernel churn, or resource pressure. The
+ * original one-shot probe turned every such hiccup into a FATAL exit, which
+ * tripped the startup circuit breaker into 5-15min backoff and made the host
+ * fail to re-attach for far longer than the underlying Docker outage. We now
+ * retry inside the function so a transient hiccup doesn't kill the host.
+ */
+export async function ensureContainerRuntimeRunning(
+  retryDelaysMs: number[] = DEFAULT_RUNTIME_RETRY_DELAYS_MS,
+): Promise<void> {
+  let lastErr: unknown;
+  for (let i = 0; i < retryDelaysMs.length; i++) {
+    if (retryDelaysMs[i] > 0) {
+      await new Promise<void>((resolve) => setTimeout(resolve, retryDelaysMs[i]));
+    }
+    try {
+      execSync(`${CONTAINER_RUNTIME_BIN} info`, {
+        stdio: 'pipe',
+        timeout: 10000,
+      });
+      if (i > 0) {
+        log.info('Container runtime reachable after retries', { attempts: i + 1 });
+      } else {
+        log.debug('Container runtime already running');
+      }
+      return;
+    } catch (err) {
+      lastErr = err;
+      const nextDelay = retryDelaysMs[i + 1];
+      if (nextDelay !== undefined) {
+        const errMsg = (err as { message?: string }).message?.split('\n')[0] ?? 'unknown';
+        log.warn('Container runtime not ready, will retry', {
+          attempt: i + 1,
+          maxAttempts: retryDelaysMs.length,
+          nextRetryInMs: nextDelay,
+          err: errMsg,
+        });
+      }
+    }
   }
+  log.error('Failed to reach container runtime after retries', {
+    err: lastErr,
+    attempts: retryDelaysMs.length,
+  });
+  console.error('\n╔════════════════════════════════════════════════════════════════╗');
+  console.error('║  FATAL: Container runtime failed to start                      ║');
+  console.error('║                                                                ║');
+  console.error('║  Agents cannot run without a container runtime. To fix:        ║');
+  console.error('║  1. Ensure Docker is installed and running                     ║');
+  console.error('║  2. Run: docker info                                           ║');
+  console.error('║  3. Restart NanoClaw                                           ║');
+  console.error('╚════════════════════════════════════════════════════════════════╝\n');
+  throw new Error('Container runtime is required but failed to start', {
+    cause: lastErr,
+  });
 }
 
 /**

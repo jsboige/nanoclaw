@@ -59,10 +59,10 @@ describe('stopContainer', () => {
 // --- ensureContainerRuntimeRunning ---
 
 describe('ensureContainerRuntimeRunning', () => {
-  it('does nothing when runtime is already running', () => {
+  it('does nothing when runtime is already running', async () => {
     mockExecSync.mockReturnValueOnce('');
 
-    ensureContainerRuntimeRunning();
+    await ensureContainerRuntimeRunning([0]);
 
     expect(mockExecSync).toHaveBeenCalledTimes(1);
     expect(mockExecSync).toHaveBeenCalledWith(`${CONTAINER_RUNTIME_BIN} info`, {
@@ -72,13 +72,53 @@ describe('ensureContainerRuntimeRunning', () => {
     expect(log.debug).toHaveBeenCalledWith('Container runtime already running');
   });
 
-  it('throws when docker info fails', () => {
-    mockExecSync.mockImplementationOnce(() => {
+  it('throws when docker info fails on every retry', async () => {
+    mockExecSync.mockImplementation(() => {
       throw new Error('Cannot connect to the Docker daemon');
     });
 
-    expect(() => ensureContainerRuntimeRunning()).toThrow('Container runtime is required but failed to start');
-    expect(log.error).toHaveBeenCalled();
+    // Three zero-delay attempts so the test runs instantly.
+    await expect(ensureContainerRuntimeRunning([0, 0, 0])).rejects.toThrow(
+      'Container runtime is required but failed to start',
+    );
+    expect(mockExecSync).toHaveBeenCalledTimes(3);
+    expect(log.error).toHaveBeenCalledWith(
+      'Failed to reach container runtime after retries',
+      expect.objectContaining({ attempts: 3 }),
+    );
+  });
+
+  it('recovers when a later retry succeeds (the docker-pipe-hiccup case)', async () => {
+    // First two probes fail (pipe gone), third succeeds (Docker came back).
+    mockExecSync
+      .mockImplementationOnce(() => {
+        throw new Error('open //./pipe/docker_engine: The system cannot find the file specified.');
+      })
+      .mockImplementationOnce(() => {
+        throw new Error('open //./pipe/docker_engine: The system cannot find the file specified.');
+      })
+      .mockReturnValueOnce('');
+
+    await ensureContainerRuntimeRunning([0, 0, 0]);
+
+    expect(mockExecSync).toHaveBeenCalledTimes(3);
+    expect(log.info).toHaveBeenCalledWith('Container runtime reachable after retries', { attempts: 3 });
+    expect(log.error).not.toHaveBeenCalled();
+  });
+
+  it('logs a will-retry warning on each non-final failure', async () => {
+    mockExecSync
+      .mockImplementationOnce(() => {
+        throw new Error('pipe gone');
+      })
+      .mockReturnValueOnce('');
+
+    await ensureContainerRuntimeRunning([0, 0]);
+
+    expect(log.warn).toHaveBeenCalledWith(
+      'Container runtime not ready, will retry',
+      expect.objectContaining({ attempt: 1, maxAttempts: 2, nextRetryInMs: 0 }),
+    );
   });
 });
 

@@ -200,6 +200,14 @@ If none works, document the patch here with justification.
 - **Exit condition:** Upstream `@chat-adapter/telegram` exposes a real mode-aware converter or surfaces an `onParseError` hook that downgrades parse_mode automatically. Until then this helper stays.
 - **Lines:** ~50 (3 helpers + 1 catch branch + 2 call-site swaps) + ~100 (tests).
 
+### 22. Container-runtime startup resilience — retry on transient Docker pipe failures
+
+- **File:** `src/container-runtime.ts` (`ensureContainerRuntimeRunning` now async with internal retry schedule; `src/index.ts` awaits it).
+- **Summary:** Wrap the `docker info` probe in a retry loop with progressive sleeps (`0, 5s, 10s, 15s, 30s, 60s, 60s`, ≈180s total) before declaring FATAL. The previous one-shot probe turned any transient pipe failure (`open //./pipe/docker_engine: The system cannot find the file specified`) into an immediate `throw`, which exited the host, tripped the circuit breaker, and stacked attempts up to a 5-15min backoff. Now a brief Docker Desktop hiccup is absorbed in-process without ever incrementing the circuit-breaker counter.
+- **Why:** Observed 2026-05-10/11 in `nanoclaw.err.log`: 87 occurrences of `Container runtime is required but failed to start` across multiple crash storms (05:25, 12:22, 22:51 UTC). Each storm was 4-6 FATAL exits inside ~2 min, ending in `Circuit breaker: delaying startup due to repeated crashes attempt=5/6 delaySec=120/300`. Symptom from the user's POV: "perte des MCPs, le bot ne tient pas plus que quelques minutes" — because once the host exited, every channel adapter, MCP client and delivery poll died with it, then the circuit breaker prevented restart for 5-15 min. The underlying Docker outage was always sub-minute (next probe in the storm shows the same pipe error, but Docker Desktop typically recovers in 30-90s if you actually wait for it). One-shot was simply too aggressive for a Windows pipe.
+- **Exit condition:** Either (a) upstream adopts retry-with-backoff for the container runtime probe (we should file an issue/PR), or (b) the host gains a "degraded mode" where channel adapters keep running for inbound buffering while the runtime is unreachable. Until then, this patch is the right shape: don't conflate a transient pipe failure with "Docker not installed".
+- **Lines:** ~50 (function rewrite + caller `await` + 4 vitest cases including the hiccup-recovery path).
+
 ### 19. Routing-source fallback when agent omits `<message to="...">` wrapping
 
 - **File:** `container/agent-runner/src/poll-loop.ts` (`dispatchResultText` — added fallback branch before the silent-drop log path).
