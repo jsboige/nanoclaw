@@ -2,7 +2,7 @@
  * Container runtime abstraction for NanoClaw.
  * All runtime-specific logic lives here so swapping runtimes means changing one file.
  */
-import { execSync } from 'child_process';
+import { execFileSync, execSync } from 'child_process';
 import os from 'os';
 
 import { CONTAINER_INSTALL_LABEL } from './config.js';
@@ -112,26 +112,42 @@ export async function ensureContainerRuntimeRunning(
  * stamped onto every container at spawn time — see container-runner.ts.
  */
 export function cleanupOrphans(): void {
+  let output: string;
   try {
-    const output = execSync(
-      `${CONTAINER_RUNTIME_BIN} ps --filter label=${CONTAINER_INSTALL_LABEL} --format '{{.Names}}'`,
+    // Use execFileSync (no shell) so single-quotes around the `--format` value
+    // aren't reinterpreted differently by bash (strips them) vs cmd.exe (keeps
+    // them). With shell=true on Windows, docker would return literally quoted
+    // names like `'nanoclaw-...-1234'`, which `stopContainer` then rejects at
+    // the name regex and the orphan goes silently un-stopped — piling up
+    // multiple containers on the same session DB.
+    output = execFileSync(
+      CONTAINER_RUNTIME_BIN,
+      ['ps', '--filter', `label=${CONTAINER_INSTALL_LABEL}`, '--format', '{{.Names}}'],
       {
         stdio: ['pipe', 'pipe', 'pipe'],
         encoding: 'utf-8',
       },
     );
-    const orphans = output.trim().split('\n').filter(Boolean);
-    for (const name of orphans) {
-      try {
-        stopContainer(name);
-      } catch {
-        /* already stopped */
-      }
-    }
-    if (orphans.length > 0) {
-      log.info('Stopped orphaned containers', { count: orphans.length, names: orphans });
-    }
   } catch (err) {
-    log.warn('Failed to clean up orphaned containers', { err });
+    log.warn('Failed to list orphaned containers', { err });
+    return;
+  }
+
+  const orphans = output.trim().split('\n').filter(Boolean);
+  const stopped: string[] = [];
+  for (const name of orphans) {
+    try {
+      stopContainer(name);
+      stopped.push(name);
+    } catch (err) {
+      // Surface the failure — previously a silent swallow hid the
+      // quoted-name regex rejection that was the root cause of the orphan
+      // pile-up. "Already stopped" is the expected case from a real race;
+      // anything else is a code/env bug we need to see.
+      log.warn('Could not stop orphan container', { name, err: (err as Error).message });
+    }
+  }
+  if (stopped.length > 0) {
+    log.info('Stopped orphaned containers', { count: stopped.length, names: stopped });
   }
 }

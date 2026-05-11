@@ -11,10 +11,12 @@ vi.mock('./log.js', () => ({
   },
 }));
 
-// Mock child_process — store the mock fn so tests can configure it
+// Mock child_process — store mock fns so tests can configure them
 const mockExecSync = vi.fn();
+const mockExecFileSync = vi.fn();
 vi.mock('child_process', () => ({
   execSync: (...args: unknown[]) => mockExecSync(...args),
+  execFileSync: (...args: unknown[]) => mockExecFileSync(...args),
 }));
 
 import {
@@ -125,31 +127,34 @@ describe('ensureContainerRuntimeRunning', () => {
 // --- cleanupOrphans ---
 
 describe('cleanupOrphans', () => {
-  it('filters ps by the install label so peers are not reaped', () => {
-    mockExecSync.mockReturnValueOnce('');
+  it('uses execFileSync (no shell) so quoting is platform-stable', () => {
+    mockExecFileSync.mockReturnValueOnce('');
 
     cleanupOrphans();
 
-    expect(mockExecSync).toHaveBeenCalledWith(
-      `${CONTAINER_RUNTIME_BIN} ps --filter label=${CONTAINER_INSTALL_LABEL} --format '{{.Names}}'`,
+    // No shell expansion → single-quote-wrapped {{.Names}} can't slip through
+    // and we never invoke execSync for the listing step.
+    expect(mockExecFileSync).toHaveBeenCalledWith(
+      CONTAINER_RUNTIME_BIN,
+      ['ps', '--filter', `label=${CONTAINER_INSTALL_LABEL}`, '--format', '{{.Names}}'],
       expect.any(Object),
     );
   });
 
   it('stops orphaned nanoclaw containers', () => {
-    // docker ps returns container names, one per line
-    mockExecSync.mockReturnValueOnce('nanoclaw-group1-111\nnanoclaw-group2-222\n');
-    // stop calls succeed
+    // execFileSync (the ps listing) returns the names.
+    mockExecFileSync.mockReturnValueOnce('nanoclaw-group1-111\nnanoclaw-group2-222\n');
+    // execSync (the individual stop calls) succeeds.
     mockExecSync.mockReturnValue('');
 
     cleanupOrphans();
 
-    // ps + 2 stop calls
-    expect(mockExecSync).toHaveBeenCalledTimes(3);
-    expect(mockExecSync).toHaveBeenNthCalledWith(2, `${CONTAINER_RUNTIME_BIN} stop -t 1 nanoclaw-group1-111`, {
+    expect(mockExecFileSync).toHaveBeenCalledTimes(1);
+    expect(mockExecSync).toHaveBeenCalledTimes(2);
+    expect(mockExecSync).toHaveBeenNthCalledWith(1, `${CONTAINER_RUNTIME_BIN} stop -t 1 nanoclaw-group1-111`, {
       stdio: 'pipe',
     });
-    expect(mockExecSync).toHaveBeenNthCalledWith(3, `${CONTAINER_RUNTIME_BIN} stop -t 1 nanoclaw-group2-222`, {
+    expect(mockExecSync).toHaveBeenNthCalledWith(2, `${CONTAINER_RUNTIME_BIN} stop -t 1 nanoclaw-group2-222`, {
       stdio: 'pipe',
     });
     expect(log.info).toHaveBeenCalledWith('Stopped orphaned containers', {
@@ -159,42 +164,67 @@ describe('cleanupOrphans', () => {
   });
 
   it('does nothing when no orphans exist', () => {
-    mockExecSync.mockReturnValueOnce('');
+    mockExecFileSync.mockReturnValueOnce('');
 
     cleanupOrphans();
 
-    expect(mockExecSync).toHaveBeenCalledTimes(1);
+    expect(mockExecFileSync).toHaveBeenCalledTimes(1);
+    expect(mockExecSync).not.toHaveBeenCalled();
     expect(log.info).not.toHaveBeenCalled();
   });
 
   it('warns and continues when ps fails', () => {
-    mockExecSync.mockImplementationOnce(() => {
+    mockExecFileSync.mockImplementationOnce(() => {
       throw new Error('docker not available');
     });
 
     cleanupOrphans(); // should not throw
 
     expect(log.warn).toHaveBeenCalledWith(
-      'Failed to clean up orphaned containers',
+      'Failed to list orphaned containers',
       expect.objectContaining({ err: expect.any(Error) }),
     );
   });
 
-  it('continues stopping remaining containers when one stop fails', () => {
-    mockExecSync.mockReturnValueOnce('nanoclaw-a-1\nnanoclaw-b-2\n');
-    // First stop fails
+  it('continues stopping remaining containers when one stop fails, and surfaces the error', () => {
+    mockExecFileSync.mockReturnValueOnce('nanoclaw-a-1\nnanoclaw-b-2\n');
+    // First stop fails, second succeeds.
     mockExecSync.mockImplementationOnce(() => {
       throw new Error('already stopped');
     });
-    // Second stop succeeds
     mockExecSync.mockReturnValueOnce('');
 
     cleanupOrphans(); // should not throw
 
-    expect(mockExecSync).toHaveBeenCalledTimes(3);
+    expect(mockExecSync).toHaveBeenCalledTimes(2);
+    // Only the one that succeeded is counted as stopped.
     expect(log.info).toHaveBeenCalledWith('Stopped orphaned containers', {
-      count: 2,
-      names: ['nanoclaw-a-1', 'nanoclaw-b-2'],
+      count: 1,
+      names: ['nanoclaw-b-2'],
     });
+    // The failed stop is now surfaced as a warn (was silently swallowed previously).
+    expect(log.warn).toHaveBeenCalledWith(
+      'Could not stop orphan container',
+      expect.objectContaining({ name: 'nanoclaw-a-1' }),
+    );
+  });
+
+  it('regression: quoted name from a broken shell path is now visible as a warn', () => {
+    // Before the fix, execSync on Windows + cmd.exe returned names wrapped in
+    // single quotes. They failed stopContainer's name regex and the catch
+    // silently swallowed the throw, so docker ps -q would still see the
+    // container running. This test pins the new behavior: the regex still
+    // rejects (we do not want to invoke shell with an arbitrary string), and
+    // the rejection is now logged so we'd notice.
+    mockExecFileSync.mockReturnValueOnce("'nanoclaw-quoted-1'\n");
+
+    cleanupOrphans();
+
+    // No actual stop happened, but the failure was logged (not swallowed).
+    expect(mockExecSync).not.toHaveBeenCalled();
+    expect(log.warn).toHaveBeenCalledWith(
+      'Could not stop orphan container',
+      expect.objectContaining({ name: "'nanoclaw-quoted-1'" }),
+    );
   });
 });
