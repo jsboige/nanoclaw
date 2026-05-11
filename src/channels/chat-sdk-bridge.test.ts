@@ -214,9 +214,12 @@ describe('createChatSdkBridge.deliver — display cards (send_card)', () => {
 
 describe('error classifiers (PATCH-myia anti-silent-drop)', () => {
   it('detects Telegram parse-entities rejection', () => {
-    const err = Object.assign(new Error("Bad Request: can't parse entities: Can't find end of the entity starting at byte offset 1243"), {
-      name: 'ValidationError',
-    });
+    const err = Object.assign(
+      new Error("Bad Request: can't parse entities: Can't find end of the entity starting at byte offset 1243"),
+      {
+        name: 'ValidationError',
+      },
+    );
     expect(isParseEntitiesError(err)).toBe(true);
   });
 
