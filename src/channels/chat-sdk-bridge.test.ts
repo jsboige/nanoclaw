@@ -2,7 +2,13 @@ import { describe, expect, it } from 'vitest';
 
 import type { Adapter, AdapterPostableMessage, RawMessage } from 'chat';
 
-import { createChatSdkBridge, splitForLimit } from './chat-sdk-bridge.js';
+import {
+  createChatSdkBridge,
+  isParseEntitiesError,
+  isReactionTargetGoneError,
+  postWithMarkdownFallback,
+  splitForLimit,
+} from './chat-sdk-bridge.js';
 
 function stubAdapter(partial: Partial<Adapter>): Adapter {
   return { name: 'stub', ...partial } as unknown as Adapter;
@@ -203,5 +209,142 @@ describe('createChatSdkBridge.deliver — display cards (send_card)', () => {
     expect(calls).toHaveLength(1);
     const msg = calls[0].message as { markdown?: string };
     expect(msg.markdown).toBe('plain hello');
+  });
+});
+
+describe('error classifiers (PATCH-myia anti-silent-drop)', () => {
+  it('detects Telegram parse-entities rejection', () => {
+    const err = Object.assign(new Error("Bad Request: can't parse entities: Can't find end of the entity starting at byte offset 1243"), {
+      name: 'ValidationError',
+    });
+    expect(isParseEntitiesError(err)).toBe(true);
+  });
+
+  it('does not classify generic errors as parse-entities', () => {
+    expect(isParseEntitiesError(new Error('something else'))).toBe(false);
+    expect(isParseEntitiesError(null)).toBe(false);
+    expect(isParseEntitiesError(undefined)).toBe(false);
+  });
+
+  it('detects Telegram reaction-target-gone rejection', () => {
+    const err = Object.assign(new Error('Bad Request: message to react not found'), {
+      name: 'ValidationError',
+    });
+    expect(isReactionTargetGoneError(err)).toBe(true);
+  });
+
+  it('does not confuse reaction-not-found with other not-found errors', () => {
+    expect(isReactionTargetGoneError(new Error('Bad Request: chat not found'))).toBe(false);
+  });
+});
+
+describe('postWithMarkdownFallback (PATCH-myia anti-silent-drop)', () => {
+  it('returns first attempt result when markdown succeeds', async () => {
+    const calls: Array<{ message: AdapterPostableMessage }> = [];
+    const adapter = stubAdapter({
+      postMessage: async (_threadId: string, message: AdapterPostableMessage) => {
+        calls.push({ message });
+        return { id: 'ok-1', threadId: 't', raw: {} } as RawMessage<unknown>;
+      },
+    });
+    const result = await postWithMarkdownFallback(adapter, 't', { markdown: '**bold**' });
+    expect(result?.id).toBe('ok-1');
+    expect(calls).toHaveLength(1);
+    expect((calls[0].message as { markdown?: string }).markdown).toBe('**bold**');
+  });
+
+  it('retries as raw text on parse-entities error', async () => {
+    let attempt = 0;
+    const calls: Array<{ message: AdapterPostableMessage }> = [];
+    const adapter = stubAdapter({
+      postMessage: async (_threadId: string, message: AdapterPostableMessage) => {
+        attempt += 1;
+        calls.push({ message });
+        if (attempt === 1) {
+          const err = Object.assign(new Error("Bad Request: can't parse entities: ..."), {
+            name: 'ValidationError',
+          });
+          throw err;
+        }
+        return { id: 'raw-ok', threadId: 't', raw: {} } as RawMessage<unknown>;
+      },
+    });
+    const result = await postWithMarkdownFallback(adapter, 't', { markdown: 'a *broken markdown' });
+    expect(result?.id).toBe('raw-ok');
+    expect(calls).toHaveLength(2);
+    expect((calls[0].message as { markdown?: string }).markdown).toBe('a *broken markdown');
+    expect((calls[1].message as { raw?: string }).raw).toBe('a *broken markdown');
+    expect((calls[1].message as { markdown?: string }).markdown).toBeUndefined();
+  });
+
+  it('rethrows non-parse errors without retrying', async () => {
+    let attempts = 0;
+    const adapter = stubAdapter({
+      postMessage: async () => {
+        attempts += 1;
+        throw new Error('Internal Server Error');
+      },
+    });
+    await expect(postWithMarkdownFallback(adapter, 't', { markdown: 'x' })).rejects.toThrow('Internal Server Error');
+    expect(attempts).toBe(1);
+  });
+
+  it('preserves file uploads in the raw fallback so attachments are not lost', async () => {
+    let attempt = 0;
+    const calls: Array<{ message: AdapterPostableMessage }> = [];
+    const adapter = stubAdapter({
+      postMessage: async (_threadId: string, message: AdapterPostableMessage) => {
+        attempt += 1;
+        calls.push({ message });
+        if (attempt === 1) {
+          throw Object.assign(new Error("Bad Request: can't parse entities: x"), {
+            name: 'ValidationError',
+          });
+        }
+        return { id: 'ok', threadId: 't', raw: {} } as RawMessage<unknown>;
+      },
+    });
+    const files = [{ data: Buffer.from('payload'), filename: 'a.txt' }];
+    await postWithMarkdownFallback(adapter, 't', { markdown: '_x', files });
+    expect(calls).toHaveLength(2);
+    const second = calls[1].message as { files?: Array<{ filename: string }> };
+    expect(second.files?.[0]?.filename).toBe('a.txt');
+  });
+});
+
+describe('createChatSdkBridge.deliver — reaction error handling (PATCH-myia)', () => {
+  it('swallows "message to react not found" instead of throwing', async () => {
+    let reactionCalls = 0;
+    const adapter = stubAdapter({
+      addReaction: async () => {
+        reactionCalls += 1;
+        throw Object.assign(new Error('Bad Request: message to react not found'), {
+          name: 'ValidationError',
+        });
+      },
+    });
+    const bridge = createChatSdkBridge({ adapter, supportsThreads: false });
+    await expect(
+      bridge.deliver('telegram:42', null, {
+        kind: 'chat-sdk',
+        content: { operation: 'reaction', messageId: '999', emoji: '👀' },
+      }),
+    ).resolves.toBeUndefined();
+    expect(reactionCalls).toBe(1);
+  });
+
+  it('still throws on other reaction errors so they bubble to the retry path', async () => {
+    const adapter = stubAdapter({
+      addReaction: async () => {
+        throw new Error('Bad Request: REACTION_INVALID');
+      },
+    });
+    const bridge = createChatSdkBridge({ adapter, supportsThreads: false });
+    await expect(
+      bridge.deliver('telegram:42', null, {
+        kind: 'chat-sdk',
+        content: { operation: 'reaction', messageId: '999', emoji: 'bogus' },
+      }),
+    ).rejects.toThrow(/REACTION_INVALID/);
   });
 });

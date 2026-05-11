@@ -127,6 +127,60 @@ export function splitForLimit(text: string, limit: number): string[] {
   return chunks;
 }
 
+/**
+ * [PATCH-myia] Recognize Telegram's "can't parse entities" rejection.
+ * The legacy Markdown parse_mode rejects unbalanced delimiters, mid-word
+ * underscores, dangling brackets, unescaped backticks, etc. The sanitizer
+ * (telegram-markdown-sanitize.ts) catches the common cases but content-driven
+ * combinations slip through. When this fires, drop parse_mode and resend the
+ * text raw — the user gets the message without formatting, which beats silent
+ * loss after 3 retries.
+ */
+export function isParseEntitiesError(err: unknown): boolean {
+  if (!err || typeof err !== 'object') return false;
+  const msg = (err as { message?: unknown }).message;
+  return typeof msg === 'string' && /can't parse entities/i.test(msg);
+}
+
+/**
+ * [PATCH-myia] Recognize Telegram's "message to react not found" rejection.
+ * The reaction target was deleted (or expired from the bot's view) before the
+ * reaction call landed. Swallow — the reaction is a UX cue, not load-bearing,
+ * and retrying 3× then marking failed only spams the log.
+ */
+export function isReactionTargetGoneError(err: unknown): boolean {
+  if (!err || typeof err !== 'object') return false;
+  const msg = (err as { message?: unknown }).message;
+  return typeof msg === 'string' && /message to react not found/i.test(msg);
+}
+
+/**
+ * [PATCH-myia] Post a markdown message, falling back to raw text if the
+ * platform rejects the markdown parse. Used by the Telegram path mostly,
+ * but generic enough to apply to any adapter that surfaces parse-entity
+ * errors. Files ride on the retry too so attachments aren't lost.
+ */
+export async function postWithMarkdownFallback(
+  adapter: Adapter,
+  threadId: string,
+  payload: { markdown: string; files?: Array<{ data: Buffer; filename: string }> },
+): Promise<{ id?: string } | undefined> {
+  try {
+    return await adapter.postMessage(threadId, payload);
+  } catch (err) {
+    if (!isParseEntitiesError(err)) throw err;
+    log.warn('Markdown rejected by platform — retrying as raw text', {
+      adapter: adapter.name,
+      threadId,
+      bytes: payload.markdown.length,
+      err: (err as Error).message,
+    });
+    const rawPayload: { raw: string; files?: typeof payload.files } = { raw: payload.markdown };
+    if (payload.files) rawPayload.files = payload.files;
+    return await adapter.postMessage(threadId, rawPayload);
+  }
+}
+
 export function createChatSdkBridge(config: ChatSdkBridgeConfig): ChannelAdapter {
   const { adapter } = config;
   const transformText = (t: string): string => (config.transformOutboundText ? config.transformOutboundText(t) : t);
@@ -421,7 +475,23 @@ export function createChatSdkBridge(config: ChatSdkBridgeConfig): ChannelAdapter
       }
 
       if (content.operation === 'reaction' && content.messageId && content.emoji) {
-        await adapter.addReaction(tid, content.messageId as string, content.emoji as string);
+        try {
+          await adapter.addReaction(tid, content.messageId as string, content.emoji as string);
+        } catch (err) {
+          // [PATCH-myia] Telegram returns "message to react not found" when the
+          // target was deleted (or beyond the bot's visibility window). The
+          // reaction is a UX cue — swallow so the row marks delivered instead
+          // of churning retries and clogging logs.
+          if (isReactionTargetGoneError(err)) {
+            log.info('Reaction target gone, skipping', {
+              adapter: adapter.name,
+              threadId: tid,
+              messageId: content.messageId as string,
+            });
+            return;
+          }
+          throw err;
+        }
         return;
       }
 
@@ -530,7 +600,11 @@ export function createChatSdkBridge(config: ChatSdkBridgeConfig): ChannelAdapter
         for (let i = 0; i < chunks.length; i++) {
           const chunk = chunks[i];
           const attachFiles = i === 0 && fileUploads && fileUploads.length > 0;
-          const result = await adapter.postMessage(
+          // [PATCH-myia] Markdown can fail platform parsing (e.g. Telegram
+          // "can't parse entities" on edge-case delimiters) — fall back to
+          // raw text instead of losing the message after 3 retries.
+          const result = await postWithMarkdownFallback(
+            adapter,
             tid,
             attachFiles ? { markdown: chunk, files: fileUploads } : { markdown: chunk },
           );
@@ -543,7 +617,10 @@ export function createChatSdkBridge(config: ChatSdkBridgeConfig): ChannelAdapter
           data: f.data,
           filename: f.filename,
         }));
-        const result = await adapter.postMessage(tid, { markdown: '', files: fileUploads });
+        // [PATCH-myia] Empty markdown can't really hit a parse-entity error
+        // (no content to parse), but the helper short-circuits cleanly so we
+        // route the call the same way for consistency.
+        const result = await postWithMarkdownFallback(adapter, tid, { markdown: '', files: fileUploads });
         return result?.id;
       }
     },
