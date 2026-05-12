@@ -288,11 +288,20 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
     const tasksKept = tasksInBatch.filter((t) => !skippedSet.has(t.id));
     const batchStartedAt = Date.now();
     let batchError: string | null = null;
+    let stalledAborted = false; // [PATCH-myia #26]
     // Publish the batch's in_reply_to so MCP tools (send_message, send_file)
     // can stamp it on outbound rows — needed for a2a return-path routing.
     setCurrentInReplyTo(routing.inReplyTo);
     try {
       const result = await processQuery(query, routing, processingIds, config.providerName);
+      stalledAborted = !!result.stalledAborted; // [PATCH-myia #26]
+      if (stalledAborted) {
+        // Record the stalled attempt as a failed task run; the retry on the
+        // next iteration gets its own record. Without this, the task_run_logs
+        // table would carry a status='completed' row for a turn the agent
+        // never actually answered.
+        batchError = 'stalled';
+      }
       if (result.continuation && result.continuation !== continuation) {
         continuation = result.continuation;
         setContinuation(config.providerName, continuation);
@@ -355,8 +364,17 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
 
     // Ensure completed even if processQuery ended without a result event
     // (e.g. stream closed unexpectedly).
-    markCompleted(processingIds);
-    log(`Completed ${ids.length} message(s)`);
+    //
+    // [PATCH-myia #26] Skip when the stall watchdog already reset the initial
+    // batch back to pending — otherwise we'd clobber the reset and the
+    // un-answered messages would be finalized instead of retried on the next
+    // iteration.
+    if (!stalledAborted) {
+      markCompleted(processingIds);
+      log(`Completed ${ids.length} message(s)`);
+    } else {
+      log(`Stall-aborted batch — skipping markCompleted so reset-to-pending sticks`);
+    }
 
     // Log task runs for any task messages that went through the agent.
     // Duration is the batch processing time — when several tasks ride
@@ -423,6 +441,13 @@ interface QueryResult {
    * since this code path writes its own user-visible message.
    */
   mcpRegistryLost?: { toolName: string; serverName: string };
+  /**
+   * [PATCH-myia #26] Set when the stall watchdog reset all claims and aborted
+   * the query. The outer loop must NOT run its post-call markCompleted, since
+   * the watchdog has already reset the initial batch back to pending so the
+   * next iteration re-picks those messages with a fresh query.
+   */
+  stalledAborted?: boolean;
 }
 
 async function processQuery(
@@ -450,11 +475,10 @@ async function processQuery(
   // [PATCH-myia #18] Push-mode stall recovery state.
   // - pendingFollowUpAcks: follow-up message IDs whose markCompleted is deferred
   //   until a `result` event arrives. Empty when the query is idle / fully drained.
-  // - lastPushAt: timestamp of the most recent query.push(); reset on each
-  //   `result` event. Used by the stall watchdog to decide when to give up.
   // - stalledAborted: latched once the watchdog fired, prevents racy double-aborts.
+  //   (PATCH #26 dropped lastPushAt — the watchdog now uses lastSdkEventAt
+  //   and awaitingResult as its gate, both declared below.)
   const pendingFollowUpAcks: string[] = [];
-  let lastPushAt: number | null = null;
   let stalledAborted = false;
 
   // [PATCH-myia #25] Push serialization — hold new follow-ups until the
@@ -474,6 +498,24 @@ async function processQuery(
   // injected by config.provider.query() before this function was called.
   let awaitingResult = true;
   const queuedFollowUps: MessageInRow[] = [];
+
+  // [PATCH-myia #26] Last-SDK-event timestamp. The stall watchdog uses this
+  // (rather than PATCH #18's lastPushAt) as the elapsed reference so it
+  // covers BOTH the initial batch and follow-up pushes. Updated on every
+  // SDK event in the for-await below. Initialized to processQuery entry
+  // time — that's also when `awaitingResult` starts true (initial prompt
+  // was already injected by config.provider.query before this call), so
+  // an SDK that never emits a single event is detectable from the start.
+  //
+  // Subsumes PATCH #18: with #24's heartbeat tickle suppressing the host's
+  // claim-stuck rule, an SDK that silently freezes on the initial turn
+  // (no follow-ups, no `result`) would hang forever under #18's
+  // lastPushAt-only gate (skipped on null). The user-visible symptom was
+  // the bot going silent mid-conversation with the host showing healthy
+  // heartbeats. Combined with #25's `awaitingResult` flag as the watchdog
+  // gate, this fires whenever we're expecting an SDK response and the
+  // event stream has gone quiet for STALL_TIMEOUT_MS.
+  let lastSdkEventAt: number = Date.now();
 
   // [PATCH-myia #18b] Periodic SDK query refresh — wall-clock time when this
   // query started serving requests. After QUERY_REFRESH_AFTER_MS, we end the
@@ -562,8 +604,11 @@ async function processQuery(
         // `processing` state and are either drained on the next result event,
         // or reset+retried by the stall watchdog below.
         pendingFollowUpAcks.push(...keptIds);
-        lastPushAt = Date.now();
         awaitingResult = true;
+        // [PATCH-myia #26] If the query was idle (no events) for a while
+        // before this push, lastSdkEventAt is stale. Reset so the stall
+        // watchdog gives this new turn the full STALL_TIMEOUT_MS budget.
+        lastSdkEventAt = Date.now();
       } catch (err) {
         // Without this catch the rejection escapes the void IIFE and Node
         // terminates the container on unhandled-rejection. The initial-batch
@@ -592,24 +637,45 @@ async function processQuery(
     }
   }, HEARTBEAT_TICKLE_INTERVAL_MS);
 
-  // [PATCH-myia #18] Stall watchdog — every STALL_CHECK_INTERVAL_MS, check
-  // whether a pushed follow-up has been awaiting a result for longer than
-  // STALL_TIMEOUT_MS. If so, reset the pushed messages back to pending (clear
-  // their processing_ack rows) and abort the active SDK query. The outer
-  // poll loop will then re-pick those messages on its next iteration with a
-  // fresh query.
+  // [PATCH-myia #26] Stall watchdog (subsumes #18). Every
+  // STALL_CHECK_INTERVAL_MS, check whether the SDK has gone silent while we
+  // were expecting a result. If so, reset all claimed messages back to
+  // pending (initial batch + pushed follow-ups + queued-but-not-yet-pushed
+  // follow-ups) and abort the active query so the outer loop spawns a
+  // fresh one. The `awaitingResult` gate (from #25) ensures we don't
+  // misfire during legitimate idle: a query that finished its result and
+  // is just held open for future pushes has `awaitingResult === false`.
+  // The elapsed reference is `lastSdkEventAt` rather than `lastPushAt`, so
+  // the watchdog covers stalls during the INITIAL turn too (the
+  // precipitating bug for this patch — see PATCH #26 in PATCHES.md).
   const stallHandle = setInterval(() => {
     if (done || stalledAborted) return;
-    if (lastPushAt === null) return;
-    const elapsed = Date.now() - lastPushAt;
+    if (!awaitingResult) return;
+    const elapsed = Date.now() - lastSdkEventAt;
     if (elapsed < STALL_TIMEOUT_MS) return;
 
     log(
-      `STALL DETECTED: ${pendingFollowUpAcks.length} follow-up(s) awaiting result for ${Math.round(
-        elapsed / 1000,
-      )}s. Resetting acks and aborting query.`,
+      `STALL DETECTED: SDK silent for ${Math.round(elapsed / 1000)}s while awaiting result ` +
+        `(initial=${initialBatchIds.length}, pending-follow-ups=${pendingFollowUpAcks.length}, queued=${queuedFollowUps.length}). ` +
+        `Resetting claims and aborting query.`,
     );
     stalledAborted = true;
+
+    // Reset the initial batch: those rows were marked `processing` by the
+    // outer loop before processQuery was called, but never reached a
+    // `result` event, so they need to go back to `pending` instead of
+    // being finalized by the outer markCompleted at function exit. The
+    // outer loop checks `result.stalledAborted` and skips its
+    // markCompleted to avoid clobbering this reset.
+    if (initialBatchIds.length > 0) {
+      try {
+        resetProcessingAcks(initialBatchIds);
+      } catch (err) {
+        log(
+          `Failed to reset initial-batch acks during stall: ${err instanceof Error ? err.message : String(err)}`,
+        );
+      }
+    }
     if (pendingFollowUpAcks.length > 0) {
       try {
         resetProcessingAcks(pendingFollowUpAcks);
@@ -618,9 +684,9 @@ async function processQuery(
       }
       pendingFollowUpAcks.length = 0;
     }
-    // [PATCH-myia #25] Queued (not-yet-pushed) follow-ups were claimed by
-    // markProcessing when they arrived. Release them too so the next outer-
-    // loop iteration re-picks them in a fresh query.
+    // Queued (not-yet-pushed) follow-ups were claimed by markProcessing
+    // when they arrived. Release them too so the next outer-loop
+    // iteration re-picks them in a fresh query.
     if (queuedFollowUps.length > 0) {
       const queuedIds = queuedFollowUps.map((m) => m.id);
       try {
@@ -643,6 +709,7 @@ async function processQuery(
     for await (const event of query.events) {
       handleEvent(event, routing);
       touchHeartbeat();
+      lastSdkEventAt = Date.now(); // [PATCH-myia #26]
 
       if (event.type === 'init') {
         queryContinuation = event.continuation;
@@ -671,7 +738,6 @@ async function processQuery(
           markCompleted(pendingFollowUpAcks);
           pendingFollowUpAcks.length = 0;
         }
-        lastPushAt = null;
         awaitingResult = false;
         if (event.text) {
           dispatchResultText(event.text, routing);
@@ -695,7 +761,6 @@ async function processQuery(
           log(`Draining ${batch.length} queued follow-up(s) into fresh turn`);
           query.push(prompt);
           pendingFollowUpAcks.push(...batchIds);
-          lastPushAt = Date.now();
           awaitingResult = true;
         }
         // [PATCH-myia #18b] Periodic refresh — if this query has been alive
@@ -783,7 +848,7 @@ async function processQuery(
     }
   }
 
-  return { continuation: queryContinuation, mcpRegistryLost };
+  return { continuation: queryContinuation, mcpRegistryLost, stalledAborted };
 }
 
 function handleEvent(event: ProviderEvent, _routing: RoutingContext): void {
