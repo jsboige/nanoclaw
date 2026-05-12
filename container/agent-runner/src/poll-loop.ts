@@ -65,6 +65,29 @@ const QUERY_REFRESH_AFTER_MS = 2 * 60 * 60 * 1000;
 // callback, so this doesn't mask hard hangs.
 const HEARTBEAT_TICKLE_INTERVAL_MS = 15_000;
 
+// [PATCH-myia #27] Idle-with-pending watchdog. Catches the failure mode
+// where a turn finished (`awaitingResult=false`) but new inbound messages
+// aren't being pushed into the live SDK query — either because pollHandle
+// is stuck (e.g. its IIFE hung in `applyPreTaskScripts`, latched
+// `pollInFlight=true`), `query.push()` silently no-ops because the SDK
+// subprocess has died, or the SDK accepted the push but never emits any
+// event for it.
+//
+// PATCH #26 (stall watchdog) gates on `awaitingResult === true` — it only
+// fires while we are expecting a result. This watchdog covers the
+// complementary gate: `awaitingResult === false` while trigger=1 messages
+// are piling up in `messages_in` unprocessed. Action is to force
+// `query.end()` so the outer poll loop spawns a fresh query (the
+// persisted continuation token resumes the same conversation) and
+// processes the backlog.
+//
+// 45s chosen: long enough that a normal 500ms pollHandle cycle + worst-
+// case pre-task script + push always completes within the window; short
+// enough that the user retrying after the bot's silence sees a recovered
+// response while they're still in front of the screen.
+const IDLE_WITH_PENDING_TIMEOUT_MS = 45_000;
+const IDLE_CHECK_INTERVAL_MS = 5_000;
+
 function log(msg: string): void {
   console.error(`[poll-loop] ${msg}`);
 }
@@ -517,6 +540,13 @@ async function processQuery(
   // event stream has gone quiet for STALL_TIMEOUT_MS.
   let lastSdkEventAt: number = Date.now();
 
+  // [PATCH-myia #27] Last `result` event timestamp. The idle-with-pending
+  // watchdog uses this as the elapsed reference. Initialized to entry
+  // time so a query that never receives a single result (initial-batch
+  // stall) is not double-flagged by both #26 and #27 — that case stays
+  // covered by #26 alone (gated on `awaitingResult === true`).
+  let lastResultAt: number = Date.now();
+
   // [PATCH-myia #18b] Periodic SDK query refresh — wall-clock time when this
   // query started serving requests. After QUERY_REFRESH_AFTER_MS, we end the
   // stream gracefully on the next `result` event so the outer loop spawns a
@@ -705,6 +735,53 @@ async function processQuery(
     }
   }, STALL_CHECK_INTERVAL_MS);
 
+  // [PATCH-myia #27] Idle-with-pending watchdog. Complementary to #26: that
+  // watchdog fires when we are awaiting a result and the SDK goes silent;
+  // this one fires when we are NOT awaiting a result (turn done) but
+  // trigger=1 messages are accumulating in `messages_in` without being
+  // claimed and pushed. Causes the SDK query to end gracefully — the
+  // outer poll loop respawns a fresh query (continuation preserved) and
+  // re-picks the pending messages on its next iteration.
+  const idleHandle = setInterval(() => {
+    if (done || stalledAborted || endedForCommand) return;
+    // PATCH #26's domain — don't double-fire while a turn is in flight.
+    if (awaitingResult) return;
+    // If we have queued follow-ups, the result handler will drain them on
+    // the next `result` event. (Reaching this branch with a non-empty
+    // queue would mean we got a result but skipped the drain — shouldn't
+    // happen in normal flow, but defensive.)
+    if (queuedFollowUps.length > 0) return;
+
+    let pendingTriggerCount = 0;
+    try {
+      const rows = getPendingMessages();
+      for (const m of rows) {
+        if (m.kind !== 'system' && m.trigger === 1) {
+          pendingTriggerCount++;
+          break; // we only need to know there's at least one
+        }
+      }
+    } catch (err) {
+      log(`Idle watchdog DB read failed: ${err instanceof Error ? err.message : String(err)}`);
+      return;
+    }
+    if (pendingTriggerCount === 0) return;
+
+    const elapsed = Date.now() - lastResultAt;
+    if (elapsed < IDLE_WITH_PENDING_TIMEOUT_MS) return;
+
+    log(
+      `IDLE WITH PENDING: pending trigger=1 message(s) in inbound.db but query has been idle ${Math.round(
+        elapsed / 1000,
+      )}s after last result with no push — ending stream so outer loop spawns a fresh query.`,
+    );
+    try {
+      query.end();
+    } catch (err) {
+      log(`Failed to end idle query: ${err instanceof Error ? err.message : String(err)}`);
+    }
+  }, IDLE_CHECK_INTERVAL_MS);
+
   try {
     for await (const event of query.events) {
       handleEvent(event, routing);
@@ -739,6 +816,7 @@ async function processQuery(
           pendingFollowUpAcks.length = 0;
         }
         awaitingResult = false;
+        lastResultAt = Date.now(); // [PATCH-myia #27]
         if (event.text) {
           dispatchResultText(event.text, routing);
         }
@@ -810,6 +888,7 @@ async function processQuery(
     clearInterval(pollHandle);
     clearInterval(stallHandle); // [PATCH-myia #18]
     clearInterval(heartbeatHandle); // [PATCH-myia #24]
+    clearInterval(idleHandle); // [PATCH-myia #27]
     // [PATCH-myia #18] If the stream ended (cleanly or via abort) while we
     // still had follow-up acks pending, the watchdog already reset them; but
     // if the stream ended for some OTHER reason (e.g. SDK internal error,
