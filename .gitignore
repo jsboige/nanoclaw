@@ -11,6 +11,9 @@ store/
 data/
 logs/
 
+# Backup restore-validation scratch dir (scripts/restore.ts)
+.restore-verify/
+
 # Groups - per-installation state, not tracked
 groups/*
 
