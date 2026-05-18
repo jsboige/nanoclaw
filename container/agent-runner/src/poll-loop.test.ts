@@ -4,6 +4,7 @@ import { initTestSessionDb, closeSessionDb, getInboundDb, getOutboundDb } from '
 import { getPendingMessages, markCompleted } from './db/messages-in.js';
 import { getUndeliveredMessages } from './db/messages-out.js';
 import { formatMessages, extractRouting } from './formatter.js';
+import { evaluateToolStuckBudget } from './poll-loop.js'; // [PATCH-myia #28]
 import { MockProvider } from './providers/mock.js';
 
 beforeEach(() => {
@@ -316,5 +317,142 @@ describe('end-to-end with mock provider', () => {
     expect(outMessages).toHaveLength(1);
     expect(JSON.parse(outMessages[0].content).text).toBe('The answer is 4');
     expect(outMessages[0].in_reply_to).toBe('m1');
+  });
+});
+
+// [PATCH-myia #28] Tool-stuck budget watchdog. Models the 2026-05-18 incident
+// where mcp__roo-state-manager__roosync_dashboard hung for 22h while #26's
+// SDK-event watchdog kept rearming. The decision is purely time-based on
+// container_state, so we test the pure helper rather than the setInterval.
+describe('[PATCH-myia #28] evaluateToolStuckBudget', () => {
+  const NOW = Date.parse('2026-05-19T00:00:00.000Z');
+  const DEFAULT = 5 * 60 * 1000;
+
+  it('returns abort:false when no tool is in flight (state null)', () => {
+    expect(evaluateToolStuckBudget(null, NOW).abort).toBe(false);
+  });
+
+  it('returns abort:false when current_tool is null', () => {
+    const r = evaluateToolStuckBudget(
+      { current_tool: null, tool_declared_timeout_ms: null, tool_started_at: null },
+      NOW,
+    );
+    expect(r.abort).toBe(false);
+  });
+
+  it('returns abort:false when tool_started_at is null (defensive)', () => {
+    const r = evaluateToolStuckBudget(
+      { current_tool: 'mcp__roo-state-manager__roosync_dashboard', tool_declared_timeout_ms: null, tool_started_at: null },
+      NOW,
+    );
+    expect(r.abort).toBe(false);
+  });
+
+  it('returns abort:false when tool_started_at is unparseable (defensive)', () => {
+    const r = evaluateToolStuckBudget(
+      { current_tool: 'Bash', tool_declared_timeout_ms: null, tool_started_at: 'not a date' },
+      NOW,
+    );
+    expect(r.abort).toBe(false);
+  });
+
+  it('does not abort a fresh tool call (1s elapsed << default budget)', () => {
+    const r = evaluateToolStuckBudget(
+      {
+        current_tool: 'mcp__roo-state-manager__roosync_dashboard',
+        tool_declared_timeout_ms: null,
+        tool_started_at: new Date(NOW - 1000).toISOString(),
+      },
+      NOW,
+    );
+    expect(r.abort).toBe(false);
+  });
+
+  it('does not abort just before the default budget elapses', () => {
+    const r = evaluateToolStuckBudget(
+      {
+        current_tool: 'mcp__roo-state-manager__roosync_dashboard',
+        tool_declared_timeout_ms: null,
+        tool_started_at: new Date(NOW - (DEFAULT - 1)).toISOString(),
+      },
+      NOW,
+    );
+    expect(r.abort).toBe(false);
+  });
+
+  it('aborts an MCP tool stuck past the default 5min budget', () => {
+    const r = evaluateToolStuckBudget(
+      {
+        current_tool: 'mcp__roo-state-manager__roosync_dashboard',
+        tool_declared_timeout_ms: null,
+        tool_started_at: new Date(NOW - 22 * 3600 * 1000).toISOString(), // 22h — the 2026-05-18 incident
+      },
+      NOW,
+    );
+    expect(r.abort).toBe(true);
+    if (r.abort) {
+      expect(r.tool).toBe('mcp__roo-state-manager__roosync_dashboard');
+      expect(r.elapsedMs).toBeGreaterThanOrEqual(22 * 3600 * 1000);
+      expect(r.budgetMs).toBe(DEFAULT);
+      expect(r.declaredMs).toBeNull();
+    }
+  });
+
+  it('respects a declared timeout with 1.5x slack (no abort within 1.5x)', () => {
+    // Bash with a 10min user-declared timeout: budget = max(10min*1.5, 5min) = 15min
+    const declared = 10 * 60 * 1000;
+    const r = evaluateToolStuckBudget(
+      {
+        current_tool: 'Bash',
+        tool_declared_timeout_ms: declared,
+        tool_started_at: new Date(NOW - 14 * 60 * 1000).toISOString(),
+      },
+      NOW,
+    );
+    expect(r.abort).toBe(false);
+  });
+
+  it('aborts when elapsed exceeds 1.5x declared timeout', () => {
+    const declared = 10 * 60 * 1000;
+    const r = evaluateToolStuckBudget(
+      {
+        current_tool: 'Bash',
+        tool_declared_timeout_ms: declared,
+        tool_started_at: new Date(NOW - 16 * 60 * 1000).toISOString(),
+      },
+      NOW,
+    );
+    expect(r.abort).toBe(true);
+    if (r.abort) {
+      expect(r.budgetMs).toBe(15 * 60 * 1000); // 1.5x declared
+      expect(r.declaredMs).toBe(declared);
+    }
+  });
+
+  it('uses the default budget when declared is less than default (floor)', () => {
+    // A 1min declared timeout shouldn't shrink the budget below 5min default
+    const declared = 60 * 1000;
+    const r = evaluateToolStuckBudget(
+      {
+        current_tool: 'mcp__sk-agent__call_agent',
+        tool_declared_timeout_ms: declared,
+        tool_started_at: new Date(NOW - 4 * 60 * 1000).toISOString(),
+      },
+      NOW,
+    );
+    expect(r.abort).toBe(false); // 4min < 5min default floor
+  });
+
+  it('accepts a custom default budget for tests', () => {
+    const r = evaluateToolStuckBudget(
+      {
+        current_tool: 'Bash',
+        tool_declared_timeout_ms: null,
+        tool_started_at: new Date(NOW - 11_000).toISOString(),
+      },
+      NOW,
+      10_000,
+    );
+    expect(r.abort).toBe(true);
   });
 });

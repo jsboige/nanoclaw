@@ -172,6 +172,30 @@ export function clearContainerToolInFlight(): void {
 }
 
 /**
+ * [PATCH-myia #28] Read the in-flight tool state. Used by the tool-stuck
+ * watchdog in poll-loop.ts to detect MCP/Bash tool calls that have been
+ * pending far longer than their declared (or default) budget — the SDK
+ * has no per-tool timeout and an MCP call that the server never answers
+ * blocks the SDK event stream while keepalives keep #26's lastSdkEventAt
+ * fresh, so neither #26 nor the host's heartbeat-based kill ever fires.
+ */
+export function getContainerToolInFlight(): {
+  current_tool: string | null;
+  tool_declared_timeout_ms: number | null;
+  tool_started_at: string | null;
+} | null {
+  const row = getOutboundDb()
+    .prepare(
+      `SELECT current_tool, tool_declared_timeout_ms, tool_started_at
+       FROM container_state WHERE id = 1`,
+    )
+    .get() as
+    | { current_tool: string | null; tool_declared_timeout_ms: number | null; tool_started_at: string | null }
+    | undefined;
+  return row ?? null;
+}
+
+/**
  * Touch the heartbeat file — replaces the old touchProcessing() DB writes.
  * The host checks this file's mtime for stale container detection.
  * A file touch is cheaper and avoids cross-boundary DB write contention.

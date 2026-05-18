@@ -7,7 +7,13 @@ import {
   type MessageInRow,
 } from './db/messages-in.js';
 import { writeMessageOut } from './db/messages-out.js';
-import { getInboundDb, touchHeartbeat, clearStaleProcessingAcks } from './db/connection.js';
+import {
+  getInboundDb,
+  touchHeartbeat,
+  clearStaleProcessingAcks,
+  getContainerToolInFlight, // [PATCH-myia #28]
+  clearContainerToolInFlight, // [PATCH-myia #28]
+} from './db/connection.js';
 import { recordTaskRun } from './db/task-run-logs.js'; // [PATCH-myia #9]
 import { clearContinuation, migrateLegacyContinuation, setContinuation } from './db/session-state.js';
 import { clearCurrentInReplyTo, setCurrentInReplyTo } from './current-batch.js';
@@ -87,6 +93,66 @@ const HEARTBEAT_TICKLE_INTERVAL_MS = 15_000;
 // response while they're still in front of the screen.
 const IDLE_WITH_PENDING_TIMEOUT_MS = 45_000;
 const IDLE_CHECK_INTERVAL_MS = 5_000;
+
+// [PATCH-myia #28] Tool-stuck watchdog. The complementary failure mode to
+// #26 (which gates on SDK silence): the SDK is still emitting events
+// (thinking deltas, partial assistant deltas, stream keepalives) but a
+// specific tool call has been pending far longer than reasonable. The
+// 2026-05-18 incident: `mcp__roo-state-manager__roosync_dashboard` stuck
+// for 22h because the MCP server (TBXark/sparfenyuk/roo-state-manager
+// chain) never returned a response. The Claude Agent SDK doesn't expose
+// per-tool timeouts (`McpStdioServerConfig` has none); a hung MCP call
+// dangles indefinitely. Meanwhile #24's heartbeat tickle suppresses the
+// host's kill, #26's `lastSdkEventAt` keeps getting bumped by other SDK
+// events while the tool awaits, and `container_state.tool_started_at`
+// (populated by claude.ts's PreToolUse hook) was tracked but never
+// consulted by any watchdog. Result: 18 user messages silently swallowed,
+// recovered only by manual `Stop-Service` + DELETE on processing_ack.
+//
+// Action: every TOOL_STUCK_CHECK_INTERVAL_MS read container_state. If a
+// tool is in flight beyond its budget, force `query.abort()` and reset
+// claims so the outer loop respawns. Source of truth = the DB row, not
+// SDK events — independent of whatever keepalive traffic the stream
+// carries during the stall.
+//
+// Budget: `max(declared_timeout_ms * 1.5, TOOL_STUCK_DEFAULT_MS)`. Bash
+// declares a per-call timeout via tool_input.timeout (claude.ts:178); MCP
+// servers declare it via the per-server `timeout` config (claude.ts:182).
+// For tools with no declaration, 5 min default covers legitimate slow
+// calls (Whisper batch transcribe ≤90s, large dashboard reads ≤60s) with
+// a wide margin; 30s check cadence keeps user-visible silence under
+// ~6 min worst case + fresh-query startup.
+const TOOL_STUCK_DEFAULT_MS = 5 * 60 * 1000;
+const TOOL_STUCK_CHECK_INTERVAL_MS = 30_000;
+
+/**
+ * [PATCH-myia #28] Pure decision: should we abort because a tool has been
+ * pending too long? Exported so unit tests don't have to spin up an SDK.
+ *
+ * Budget = `max(declared_timeout_ms * 1.5, defaultBudgetMs)`. The 1.5x slack
+ * on a declared timeout covers the SDK's own jitter — if a tool has its own
+ * deadline, we trust it to self-cancel within that window and only fire
+ * when it has clearly missed.
+ */
+export function evaluateToolStuckBudget(
+  state: {
+    current_tool: string | null;
+    tool_declared_timeout_ms: number | null;
+    tool_started_at: string | null;
+  } | null,
+  nowMs: number,
+  defaultBudgetMs: number = TOOL_STUCK_DEFAULT_MS,
+): { abort: false } | { abort: true; tool: string; elapsedMs: number; budgetMs: number; declaredMs: number | null } {
+  if (!state || !state.current_tool || !state.tool_started_at) return { abort: false };
+  const startedMs = Date.parse(state.tool_started_at);
+  if (Number.isNaN(startedMs)) return { abort: false };
+  const declared = state.tool_declared_timeout_ms;
+  const budget =
+    declared && declared > 0 ? Math.max(declared * 1.5, defaultBudgetMs) : defaultBudgetMs;
+  const elapsed = nowMs - startedMs;
+  if (elapsed < budget) return { abort: false };
+  return { abort: true, tool: state.current_tool, elapsedMs: elapsed, budgetMs: budget, declaredMs: declared };
+}
 
 function log(msg: string): void {
   console.error(`[poll-loop] ${msg}`);
@@ -782,6 +848,70 @@ async function processQuery(
     }
   }, IDLE_CHECK_INTERVAL_MS);
 
+  // [PATCH-myia #28] Tool-stuck watchdog. See header comment near
+  // TOOL_STUCK_DEFAULT_MS for rationale. Fires independently of SDK
+  // event traffic — reads container_state row populated by claude.ts's
+  // PreToolUse hook. Reuses `stalledAborted` so the outer loop's
+  // skip-markCompleted branch covers this case too.
+  const toolStuckHandle = setInterval(() => {
+    if (done || stalledAborted || endedForCommand) return;
+    let state: ReturnType<typeof getContainerToolInFlight>;
+    try {
+      state = getContainerToolInFlight();
+    } catch (err) {
+      log(`Tool-stuck watchdog DB read failed: ${err instanceof Error ? err.message : String(err)}`);
+      return;
+    }
+    const decision = evaluateToolStuckBudget(state, Date.now());
+    if (!decision.abort) return;
+
+    log(
+      `TOOL STUCK: ${decision.tool} in flight for ${Math.round(decision.elapsedMs / 1000)}s ` +
+        `(budget=${Math.round(decision.budgetMs / 1000)}s, declared=${decision.declaredMs ?? 'none'}). ` +
+        `Aborting query so outer loop respawns.`,
+    );
+    stalledAborted = true;
+
+    // Clear stale container_state — the next container spawn shouldn't
+    // inherit our "tool in flight" flag from the aborted call. PostToolUse
+    // won't fire for an aborted tool, so we clear it explicitly here.
+    try {
+      clearContainerToolInFlight();
+    } catch (err) {
+      log(`Failed to clear container_state during tool-stuck abort: ${err instanceof Error ? err.message : String(err)}`);
+    }
+
+    if (initialBatchIds.length > 0) {
+      try {
+        resetProcessingAcks(initialBatchIds);
+      } catch (err) {
+        log(`Failed to reset initial-batch acks during tool-stuck: ${err instanceof Error ? err.message : String(err)}`);
+      }
+    }
+    if (pendingFollowUpAcks.length > 0) {
+      try {
+        resetProcessingAcks(pendingFollowUpAcks);
+      } catch (err) {
+        log(`Failed to reset processing acks during tool-stuck: ${err instanceof Error ? err.message : String(err)}`);
+      }
+      pendingFollowUpAcks.length = 0;
+    }
+    if (queuedFollowUps.length > 0) {
+      const queuedIds = queuedFollowUps.map((m) => m.id);
+      try {
+        resetProcessingAcks(queuedIds);
+      } catch (err) {
+        log(`Failed to reset queued follow-up acks during tool-stuck: ${err instanceof Error ? err.message : String(err)}`);
+      }
+      queuedFollowUps.length = 0;
+    }
+    try {
+      query.abort();
+    } catch (err) {
+      log(`Failed to abort tool-stuck query: ${err instanceof Error ? err.message : String(err)}`);
+    }
+  }, TOOL_STUCK_CHECK_INTERVAL_MS);
+
   try {
     for await (const event of query.events) {
       handleEvent(event, routing);
@@ -889,6 +1019,7 @@ async function processQuery(
     clearInterval(stallHandle); // [PATCH-myia #18]
     clearInterval(heartbeatHandle); // [PATCH-myia #24]
     clearInterval(idleHandle); // [PATCH-myia #27]
+    clearInterval(toolStuckHandle); // [PATCH-myia #28]
     // [PATCH-myia #18] If the stream ended (cleanly or via abort) while we
     // still had follow-up acks pending, the watchdog already reset them; but
     // if the stream ended for some OTHER reason (e.g. SDK internal error,
