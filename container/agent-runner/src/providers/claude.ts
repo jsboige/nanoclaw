@@ -359,9 +359,23 @@ export class ClaudeProvider implements AgentProvider {
 
     const instructions = input.systemContext?.instructions;
 
+    // [PATCH-myia #28] AbortController so the tool-stuck watchdog can break
+    // out of a hung SDK iteration. `abort()` alone (setting a flag + ending
+    // stdin) doesn't unstick a `for await (const msg of sdkResult)` that is
+    // suspended awaiting the next message — the flag check only runs when
+    // a new message arrives, which never happens during a hung MCP call.
+    // Passing the signal here lets the SDK tear down the CLI subprocess
+    // + MCP transports when we abort, which causes the async iterator to
+    // settle and the for-await to exit. Belt-and-braces: we also call
+    // sdkResult.close() in abort() below — the SDK doc on Query.close()
+    // says it "forcefully ends the query, cleaning up all resources
+    // including pending requests, MCP transports, and the CLI subprocess."
+    const abortController = new AbortController();
+
     const sdkResult = sdkQuery({
       prompt: stream,
       options: {
+        abortController,
         cwd: input.cwd,
         additionalDirectories: this.additionalDirectories,
         resume: input.continuation,
@@ -477,6 +491,23 @@ export class ClaudeProvider implements AgentProvider {
       events: translateEvents(),
       abort: () => {
         aborted = true;
+        // [PATCH-myia #28] Force the SDK to tear down its CLI subprocess +
+        // MCP transports. Without this, a query hung in an MCP tool call
+        // never wakes — the for-await in translateEvents stays suspended
+        // awaiting a message that will never arrive. Calling abort on the
+        // AbortController + close() on the Query both target the same
+        // underlying cleanup, but covering both shields us from SDK
+        // versions where one path lags.
+        try {
+          abortController.abort();
+        } catch (err) {
+          log(`abortController.abort() failed: ${err instanceof Error ? err.message : String(err)}`);
+        }
+        try {
+          sdkResult.close();
+        } catch (err) {
+          log(`sdkResult.close() failed: ${err instanceof Error ? err.message : String(err)}`);
+        }
         stream.end();
       },
     };
