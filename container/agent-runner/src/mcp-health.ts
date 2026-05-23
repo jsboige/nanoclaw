@@ -150,6 +150,14 @@ const cache = new Map<string, CacheEntry>();
  * proxy on every batch. Keyed by URL — token rotation is rare and a stale
  * "ok" cache entry would only mask a freshly-broken auth, which the next
  * tool call would surface anyway.
+ *
+ * [PATCH-myia #29] Cache successes ONLY. Caching a failure for 60s meant a
+ * sub-second proxy blip (chain mid-restart) blocked every inbound for a full
+ * minute even after the chain recovered — the fail-fast gate kept reading the
+ * stale "down" entry. Now a failed probe is never cached, so the next turn
+ * re-probes against the (possibly recovered) chain and unblocks immediately.
+ * The cost is one extra live probe per blocked turn, which the gate's retry
+ * backoff (BLOCKED_RETRY_BACKOFF_MS) already paces.
  */
 export async function probeMcpRemoteCached(
   parsed: ParsedMcpRemote,
@@ -159,7 +167,12 @@ export async function probeMcpRemoteCached(
   const hit = cache.get(parsed.url);
   if (hit && hit.expiresAt > now) return hit.result;
   const result = await probeMcpRemote(parsed);
-  cache.set(parsed.url, { result, expiresAt: now + ttlMs });
+  if (result.ok) {
+    cache.set(parsed.url, { result, expiresAt: now + ttlMs });
+  } else {
+    // Don't let a transient failure linger in the cache and block recovery.
+    cache.delete(parsed.url);
+  }
   return result;
 }
 

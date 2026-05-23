@@ -125,6 +125,44 @@ const IDLE_CHECK_INTERVAL_MS = 5_000;
 const TOOL_STUCK_DEFAULT_MS = 5 * 60 * 1000;
 const TOOL_STUCK_CHECK_INTERVAL_MS = 30_000;
 
+// [PATCH-myia #30] Idle heartbeat keep-alive window. The host-sweep absolute
+// ceiling (src/host-sweep.ts ABSOLUTE_CEILING_MS) kills any container whose
+// heartbeat file is older than 30 min — INCLUDING idle ones, because the idle
+// branch of this loop never touched the heartbeat. The result was hourly cold
+// churn: an always-on agent (cron tasks, an always-warm bot) gets reaped at
+// the 30-min mark, then respawned on the next inbound, and the cold-restart
+// startup window (first roosync_dashboard call / pre-turn MCP probe racing the
+// proxy) is exactly where the "lost MCPs" symptom shows up. Tickling the
+// heartbeat while idle keeps a healthy container warm so it isn't paying that
+// restart tax every hour.
+//
+// Bounded so a genuinely-abandoned container still dies: after this much
+// continuous idle we STOP tickling, the heartbeat goes stale, and the next
+// sweep reaps it on the normal ceiling rule. The budget resets to 0 every
+// time a real (trigger=1) batch is processed, so an active agent never hits
+// it. 2h chosen: longer than any plausible quiet stretch for an always-on
+// agent between cron fires, short enough that an orphaned container frees its
+// resources the same afternoon.
+const IDLE_KEEPALIVE_MS = 2 * 60 * 60 * 1000;
+
+// [PATCH-myia #29] Fail-fast gate softening. The per-turn required-MCP gate
+// (further down) previously, on a probe failure, wrote a 🛑 BLOCKED chat
+// message AND `markCompleted`'d the user's message — permanently dropping it.
+// Combined with the 60s probe-failure cache, a single sub-second proxy blip
+// (e.g. the MCP chain mid-restart) turned into a 60s window during which every
+// inbound was answered with 🛑 and then discarded. The bot looked like it had
+// "lost its MCPs" when the chain was actually fine seconds later.
+//
+// New behavior: on a blocked turn we RESET the claim (resetProcessingAcks) so
+// the message stays pending and is retried once the chain recovers; we THROTTLE
+// the user-visible 🛑 notice to at most once per BLOCKED_NOTICE_THROTTLE_MS so a
+// flapping chain doesn't spam the channel; and we sleep BLOCKED_RETRY_BACKOFF_MS
+// before the next iteration so the retry loop doesn't hot-spin on the proxy.
+// Paired with mcp-health caching successes only, so a recovered chain unblocks
+// within one retry window instead of waiting out a cached failure.
+const BLOCKED_NOTICE_THROTTLE_MS = 5 * 60 * 1000;
+const BLOCKED_RETRY_BACKOFF_MS = 10_000;
+
 /**
  * [PATCH-myia #28] Pure decision: should we abort because a tool has been
  * pending too long? Exported so unit tests don't have to spin up an SDK.
@@ -208,7 +246,23 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
   // This lets the new container re-process those messages.
   clearStaleProcessingAcks();
 
+  // [PATCH-myia #28] Clear any stale in-flight tool marker from a previous
+  // container that was killed mid-tool. PostToolUse never fires for a
+  // killed tool call, so `container_state` keeps a non-NULL `tool_started_at`
+  // pointing at the dead container's clock. Without this, the tool-stuck
+  // watchdog reads that stale row on the very first check of the new
+  // container and can abort a brand-new query for a tool that isn't running.
+  // (This is the 7qx60e-zombie failure mode: a `roosync_dashboard` row left
+  // in flight survived the restart and tripped #28.)
+  clearContainerToolInFlight();
+
   let pollCount = 0;
+  // [PATCH-myia #30] Idle keep-alive bookkeeping. Timestamp of when the
+  // current uninterrupted idle stretch began (0 = not currently idle).
+  let idleSince = 0;
+  // [PATCH-myia #29] When we last posted a 🛑 BLOCKED notice (0 = never).
+  // Throttles the user-visible message while the MCP chain is flapping.
+  let lastBlockedNoticeAt = 0;
   while (true) {
     // Skip system messages — they're responses for MCP tools (e.g., ask_user_question)
     const messages = getPendingMessages().filter((m) => m.kind !== 'system');
@@ -220,6 +274,15 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
     }
 
     if (messages.length === 0) {
+      // [PATCH-myia #30] Bounded idle heartbeat keep-alive. While genuinely
+      // idle, prove liveness to the host so the absolute-ceiling sweep
+      // doesn't reap a healthy container at 30 min (avoiding the hourly cold
+      // churn that triggers the rough-startup "lost MCPs" window). Stop after
+      // IDLE_KEEPALIVE_MS of continuous idle so an abandoned container still
+      // goes stale and gets reaped.
+      const nowIdle = Date.now();
+      if (idleSince === 0) idleSince = nowIdle;
+      if (nowIdle - idleSince < IDLE_KEEPALIVE_MS) touchHeartbeat();
       await sleep(POLL_INTERVAL_MS);
       continue;
     }
@@ -236,6 +299,10 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
       await sleep(POLL_INTERVAL_MS);
       continue;
     }
+
+    // [PATCH-myia #30] Real work this iteration — reset the idle keep-alive
+    // budget so the next quiet stretch gets the full IDLE_KEEPALIVE_MS window.
+    idleSince = 0;
 
     const ids = messages.map((m) => m.id);
     markProcessing(ids);
@@ -340,7 +407,15 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
         const failList = formatFailures(failed);
         log(`BLOCKED: required MCP remote(s) DOWN — ${failList}`);
         const blockedIds = keep.map((m) => m.id);
-        if (routing.platformId && routing.channelType) {
+        // [PATCH-myia #29] Throttle the user-visible 🛑 notice so a flapping
+        // chain doesn't spam the channel. Only post once per window.
+        const nowBlocked = Date.now();
+        if (
+          routing.platformId &&
+          routing.channelType &&
+          nowBlocked - lastBlockedNoticeAt >= BLOCKED_NOTICE_THROTTLE_MS
+        ) {
+          lastBlockedNoticeAt = nowBlocked;
           writeMessageOut({
             id: generateId(),
             kind: 'chat',
@@ -348,11 +423,17 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
             channel_type: routing.channelType,
             thread_id: routing.threadId,
             content: JSON.stringify({
-              text: `🛑 BLOCKED: required MCP server(s) unreachable: ${failList}\n\nNot processing this message — repair in progress, retry after the chain recovers.`,
+              text: `🛑 BLOCKED: required MCP server(s) unreachable: ${failList}\n\nHolding your message — I'll process it once the chain recovers.`,
             }),
           });
         }
-        markCompleted(blockedIds);
+        // [PATCH-myia #29] Reset the claim instead of completing it, so the
+        // message stays pending and is retried on a later iteration once the
+        // chain is back. Back off before retrying so we don't hot-spin the
+        // proxy. mcp-health caches successes only, so the next probe sees the
+        // recovered chain immediately rather than a stale cached failure.
+        resetProcessingAcks(blockedIds);
+        await sleep(BLOCKED_RETRY_BACKOFF_MS);
         continue;
       }
     }

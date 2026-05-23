@@ -456,3 +456,37 @@ describe('[PATCH-myia #28] evaluateToolStuckBudget', () => {
     expect(r.abort).toBe(true);
   });
 });
+
+// [PATCH-myia #28 startup cleanup] A container killed by the host (ceiling /
+// claim-stuck) or crashed mid-tool leaves a stale container_state row whose
+// tool_started_at points at the dead container's clock — PostToolUse never
+// fired to clear it. The next container's first tool-stuck check would read
+// that row and spuriously abort a brand-new query. runPollLoop now clears the
+// row at startup (alongside clearStaleProcessingAcks). This reproduces the
+// 7qx60e zombie (a roosync_dashboard call left in flight that survived
+// restarts) and proves the cleanup defuses it.
+describe('[PATCH-myia #28] startup container_state cleanup', () => {
+  it('clearContainerToolInFlight defuses a stale in-flight row left by a dead container', async () => {
+    const { setContainerToolInFlight, clearContainerToolInFlight, getContainerToolInFlight } =
+      await import('./db/connection.js');
+
+    // Simulate the zombie: a dashboard call claimed in flight by a container
+    // that was then killed, with tool_started_at far in the past.
+    setContainerToolInFlight('mcp__roo-state-manager__roosync_dashboard', 600_000);
+    getOutboundDb()
+      .prepare(`UPDATE container_state SET tool_started_at = ? WHERE id = 1`)
+      .run(new Date(Date.now() - 12 * 3600 * 1000).toISOString());
+
+    // Before cleanup: a fresh container's first watchdog tick would abort.
+    const stale = getContainerToolInFlight();
+    expect(evaluateToolStuckBudget(stale, Date.now()).abort).toBe(true);
+
+    // Startup cleanup — what runPollLoop now runs next to clearStaleProcessingAcks.
+    clearContainerToolInFlight();
+
+    const cleared = getContainerToolInFlight();
+    expect(cleared?.current_tool).toBeNull();
+    expect(cleared?.tool_started_at).toBeNull();
+    expect(evaluateToolStuckBudget(cleared, Date.now()).abort).toBe(false);
+  });
+});

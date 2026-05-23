@@ -1,6 +1,11 @@
-import { describe, expect, test, afterEach } from 'bun:test';
+import { describe, expect, test, beforeEach, afterEach } from 'bun:test';
 
-import { clearHealthCache, parseMcpRemote, selectRequiredRemotes } from './mcp-health.js';
+import {
+  clearHealthCache,
+  parseMcpRemote,
+  probeMcpRemoteCached,
+  selectRequiredRemotes,
+} from './mcp-health.js';
 
 afterEach(() => {
   clearHealthCache();
@@ -102,5 +107,55 @@ describe('selectRequiredRemotes', () => {
     });
     expect(result).toHaveLength(1);
     expect(result[0].name).toBe('roo-state-manager');
+  });
+});
+
+// [PATCH-myia #29] The per-turn fail-fast gate caches probe results to avoid
+// hammering the proxy. Caching a FAILURE for 60s turned a sub-second proxy
+// blip into a 60s window where every inbound was blocked — the bug behind the
+// 2026-05-23 "lost MCPs" symptom (36 spurious 🛑 BLOCKED rows while the chain
+// was actually healthy). The cache must therefore store successes only.
+describe('[PATCH-myia #29] probeMcpRemoteCached cache policy', () => {
+  const parsed = { url: 'https://cache-policy.test/mcp', bearer: null } as const;
+  const OK_BODY = JSON.stringify({ jsonrpc: '2.0', id: 1, result: { protocolVersion: '2024-11-05' } });
+  let originalFetch: typeof globalThis.fetch;
+
+  beforeEach(() => {
+    originalFetch = globalThis.fetch;
+  });
+  afterEach(() => {
+    globalThis.fetch = originalFetch;
+  });
+
+  /** Stub fetch with a fixed response sequence; returns a call counter. */
+  function stubFetch(seq: Array<{ status: number; body: string }>): () => number {
+    let calls = 0;
+    globalThis.fetch = (async () => {
+      const r = seq[Math.min(calls, seq.length - 1)];
+      calls += 1;
+      return new Response(r.body, { status: r.status });
+    }) as unknown as typeof globalThis.fetch;
+    return () => calls;
+  }
+
+  test('a successful probe is cached — the second call is served without re-fetching', async () => {
+    const calls = stubFetch([{ status: 200, body: OK_BODY }]);
+    const first = await probeMcpRemoteCached(parsed);
+    const second = await probeMcpRemoteCached(parsed);
+    expect(first.ok).toBe(true);
+    expect(second.ok).toBe(true);
+    expect(calls()).toBe(1); // second served from cache
+  });
+
+  test('a failed probe is NOT cached — the next call re-probes and recovers immediately', async () => {
+    const calls = stubFetch([
+      { status: 500, body: 'upstream boom' }, // transient blip
+      { status: 200, body: OK_BODY }, // chain recovered
+    ]);
+    const first = await probeMcpRemoteCached(parsed);
+    expect(first.ok).toBe(false);
+    const second = await probeMcpRemoteCached(parsed);
+    expect(second.ok).toBe(true); // unblocked within one retry window
+    expect(calls()).toBe(2); // failure was not cached → re-probed
   });
 });
