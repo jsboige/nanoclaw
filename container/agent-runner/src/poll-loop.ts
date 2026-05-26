@@ -160,6 +160,10 @@ const IDLE_KEEPALIVE_MS = 2 * 60 * 60 * 1000;
 // before the next iteration so the retry loop doesn't hot-spin on the proxy.
 // Paired with mcp-health caching successes only, so a recovered chain unblocks
 // within one retry window instead of waiting out a cached failure.
+//
+// [PATCH-myia #31] extends the same softening to the reactive catch path
+// (SDK init throws "MCP servers not connected at init" after the proactive
+// probe passed). Both constants are reused there.
 const BLOCKED_NOTICE_THROTTLE_MS = 5 * 60 * 1000;
 const BLOCKED_RETRY_BACKOFF_MS = 10_000;
 
@@ -513,21 +517,69 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
       // Stale/corrupt continuation recovery: ask the provider whether
       // this error means the stored continuation is unusable, and clear
       // it so the next attempt starts fresh.
-      if (continuation && config.provider.isSessionInvalid(err)) {
+      const isStale = config.provider.isSessionInvalid(err);
+      if (continuation && isStale) {
         log(`Stale session detected (${continuation}) — clearing for next retry`);
         continuation = undefined;
         clearContinuation(config.providerName);
       }
 
-      // Write error response so the user knows something went wrong
-      writeMessageOut({
-        id: generateId(),
-        kind: 'chat',
-        platform_id: routing.platformId,
-        channel_type: routing.channelType,
-        thread_id: routing.threadId,
-        content: JSON.stringify({ text: `Error: ${errMsg}` }),
-      });
+      if (isStale) {
+        // [PATCH-myia #31] Soft fail-fast for transient SDK init failures.
+        // The catch path previously wrote `Error: ${errMsg}` to the user
+        // AND `markCompleted`'d the batch (default branch below at the
+        // `if (!stalledAborted)` check) — permanently losing the message
+        // on every transient MCP-init blip. The classic symptom was the
+        // overnight wave of `Error: MCP servers not connected at init`
+        // messages posted to Telegram (2026-05-25/26: 5+ across cron +
+        // hermes sessions, each one a sub-minute init handshake that the
+        // next iteration would have completed cleanly).
+        //
+        // PATCH #29 already implements this softening for the requiredRemotes
+        // probe path (the proactive gate above provider.query()). This
+        // extends the same shape to the reactive path: throttle the user
+        // notice (reuse BLOCKED_NOTICE_THROTTLE_MS so a flapping chain
+        // doesn't spam the channel), reset the claim so the message stays
+        // pending and is retried on the next iteration, sleep
+        // BLOCKED_RETRY_BACKOFF_MS before retrying so we don't hot-spin
+        // the SDK, and re-route through the `stalledAborted` skip-
+        // markCompleted branch below so the batch isn't finalized.
+        //
+        // `isSessionInvalid` matches the STALE_SESSION_RE in
+        // providers/claude.ts — currently: "no conversation found",
+        // "ENOENT.*\.jsonl", "session.*not found", "MCP servers not
+        // connected at init", "MCP registry lost mid-session".
+        const nowBlocked = Date.now();
+        if (
+          routing.platformId &&
+          routing.channelType &&
+          nowBlocked - lastBlockedNoticeAt >= BLOCKED_NOTICE_THROTTLE_MS
+        ) {
+          lastBlockedNoticeAt = nowBlocked;
+          writeMessageOut({
+            id: generateId(),
+            kind: 'chat',
+            platform_id: routing.platformId,
+            channel_type: routing.channelType,
+            thread_id: routing.threadId,
+            content: JSON.stringify({
+              text: `🔄 Transient session error — holding your message, I'll retry once the chain recovers.`,
+            }),
+          });
+        }
+        resetProcessingAcks(processingIds);
+        stalledAborted = true;
+        await sleep(BLOCKED_RETRY_BACKOFF_MS);
+      } else {
+        writeMessageOut({
+          id: generateId(),
+          kind: 'chat',
+          platform_id: routing.platformId,
+          channel_type: routing.channelType,
+          thread_id: routing.threadId,
+          content: JSON.stringify({ text: `Error: ${errMsg}` }),
+        });
+      }
     } finally {
       clearCurrentInReplyTo();
     }
