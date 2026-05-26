@@ -23,7 +23,13 @@ import {
 import { materializeContainerJson } from './container-config.js';
 import { getContainerConfig } from './db/container-configs.js';
 import { updateContainerConfigScalars, updateContainerConfigJson } from './db/container-configs.js';
-import { CONTAINER_RUNTIME_BIN, hostGatewayArgs, readonlyMountArgs, stopContainer } from './container-runtime.js';
+import {
+  CONTAINER_RUNTIME_BIN,
+  hostGatewayArgs,
+  readonlyMountArgs,
+  retryOnTransientRuntimeError,
+  stopContainer,
+} from './container-runtime.js';
 import { composeGroupClaudeMd } from './claude-md-compose.js';
 import { getAgentGroup } from './db/agent-groups.js';
 import { getDb, hasTable } from './db/connection.js';
@@ -481,10 +487,21 @@ async function buildContainerArgs(
   // a transient hard failure: if we can't wire the gateway, we don't spawn.
   // The caller (router or host-sweep) catches the throw, leaves the inbound
   // message pending, and the next sweep tick retries.
+  // [PATCH-myia #33] Wrap OneCLI gateway hits in a bounded transient-retry.
+  // The SDK's underlying fetch can blip when OneCLI restarts or Windows pipe
+  // is briefly unreachable, surfacing as `OneCLIError: fetch failed`. Pre-fix:
+  // a single blip threw out of wakeContainer → host-sweep didn't re-try for
+  // 60s → inbound message backed up that long. Now 3× × 1s.
   if (agentIdentifier) {
-    await onecli.ensureAgent({ name: agentGroup.name, identifier: agentIdentifier });
+    await retryOnTransientRuntimeError(
+      () => onecli.ensureAgent({ name: agentGroup.name, identifier: agentIdentifier }),
+      { label: `onecli.ensureAgent[${agentIdentifier}]` },
+    );
   }
-  const onecliApplied = await onecli.applyContainerConfig(args, { addHostMapping: false, agent: agentIdentifier });
+  const onecliApplied = await retryOnTransientRuntimeError(
+    () => onecli.applyContainerConfig(args, { addHostMapping: false, agent: agentIdentifier }),
+    { label: 'onecli.applyContainerConfig' },
+  );
   if (!onecliApplied) {
     throw new Error('OneCLI gateway not applied — refusing to spawn container without credentials');
   }

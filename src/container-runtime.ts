@@ -105,6 +105,85 @@ export async function ensureContainerRuntimeRunning(
 }
 
 /**
+ * [PATCH-myia #33] Markers that identify a transient network/pipe failure
+ * we're willing to retry. Conservative — anything else (auth, validation,
+ * unknown agent) bubbles immediately so we don't mask genuine outages.
+ *
+ * `fetch failed` is OneCLI SDK's wrapped node-fetch error when the gateway
+ * socket blips; the `pipe` / `cannot find the file specified` markers are
+ * the Windows docker pipe equivalent. The rest are stock Node net errors
+ * for the same class.
+ */
+const TRANSIENT_ERROR_MARKERS = [
+  'fetch failed',
+  'ECONNREFUSED',
+  'ETIMEDOUT',
+  'ECONNRESET',
+  'EPIPE',
+  'socket hang up',
+  'docker_engine',
+  'cannot find the file specified',
+];
+
+function isTransientRuntimeError(err: unknown): boolean {
+  const msg = (err as { message?: string })?.message ?? '';
+  if (!msg) return false;
+  return TRANSIENT_ERROR_MARKERS.some((marker) => msg.includes(marker));
+}
+
+/**
+ * [PATCH-myia #33] Wrap a runtime-path async call (OneCLI gateway hit,
+ * docker invocation) with bounded retry on transient pipe/network blips.
+ *
+ * Tighter than {@link ensureContainerRuntimeRunning} (PATCH #22) on purpose:
+ * the startup probe can afford ~180s before it bails because the host is
+ * still booting; runtime calls are inside `wakeContainer`, which the
+ * router or host-sweep is awaiting per-message. 3 attempts × 1s sleep =
+ * ~3s worst-case stall is fine; longer would back the inbound queue up.
+ *
+ * Bails immediately on non-transient errors (e.g. OneCLI 401, unknown
+ * agent name) so genuine misconfiguration surfaces fast.
+ *
+ * Why this isn't merged into {@link ensureContainerRuntimeRunning}: that
+ * helper retries a synchronous `execSync('docker info')`; this one retries
+ * an arbitrary `Promise<T>` factory. Different shapes, deliberately separate.
+ */
+export async function retryOnTransientRuntimeError<T>(
+  fn: () => Promise<T>,
+  opts: { label: string; attempts?: number; delayMs?: number },
+): Promise<T> {
+  const attempts = opts.attempts ?? 3;
+  const delayMs = opts.delayMs ?? 1000;
+  let lastErr: unknown;
+  for (let i = 0; i < attempts; i++) {
+    try {
+      const result = await fn();
+      if (i > 0) {
+        log.info('retryOnTransientRuntimeError recovered', {
+          label: opts.label,
+          attempts: i + 1,
+        });
+      }
+      return result;
+    } catch (err) {
+      lastErr = err;
+      if (!isTransientRuntimeError(err) || i === attempts - 1) {
+        throw err;
+      }
+      log.warn('retryOnTransientRuntimeError: transient error, will retry', {
+        label: opts.label,
+        attempt: i + 1,
+        maxAttempts: attempts,
+        nextRetryInMs: delayMs,
+        err: (err as { message?: string }).message ?? 'unknown',
+      });
+      await new Promise<void>((resolve) => setTimeout(resolve, delayMs));
+    }
+  }
+  throw lastErr;
+}
+
+/**
  * Kill orphaned NanoClaw containers from THIS install's previous runs.
  *
  * Scoped by label `nanoclaw-install=<slug>` so a crash-looping peer install

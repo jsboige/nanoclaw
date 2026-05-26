@@ -25,6 +25,7 @@ import {
   stopContainer,
   ensureContainerRuntimeRunning,
   cleanupOrphans,
+  retryOnTransientRuntimeError,
 } from './container-runtime.js';
 import { CONTAINER_INSTALL_LABEL } from './config.js';
 import { log } from './log.js';
@@ -226,5 +227,72 @@ describe('cleanupOrphans', () => {
       'Could not stop orphan container',
       expect.objectContaining({ name: "'nanoclaw-quoted-1'" }),
     );
+  });
+});
+
+// --- retryOnTransientRuntimeError (PATCH #33) ---
+
+describe('retryOnTransientRuntimeError', () => {
+  it('returns the value on first success without sleeping', async () => {
+    const fn = vi.fn().mockResolvedValue('ok');
+
+    const result = await retryOnTransientRuntimeError(fn, { label: 'noop', delayMs: 0 });
+
+    expect(result).toBe('ok');
+    expect(fn).toHaveBeenCalledTimes(1);
+    expect(log.warn).not.toHaveBeenCalled();
+  });
+
+  it('retries on `fetch failed` (the OneCLI SDK transient marker) and recovers', async () => {
+    const fn = vi
+      .fn()
+      .mockRejectedValueOnce(Object.assign(new Error('fetch failed'), { name: 'OneCLIError' }))
+      .mockResolvedValueOnce('recovered');
+
+    const result = await retryOnTransientRuntimeError(fn, { label: 'onecli.test', delayMs: 0 });
+
+    expect(result).toBe('recovered');
+    expect(fn).toHaveBeenCalledTimes(2);
+    expect(log.warn).toHaveBeenCalledWith(
+      'retryOnTransientRuntimeError: transient error, will retry',
+      expect.objectContaining({ label: 'onecli.test', attempt: 1 }),
+    );
+    expect(log.info).toHaveBeenCalledWith(
+      'retryOnTransientRuntimeError recovered',
+      expect.objectContaining({ label: 'onecli.test', attempts: 2 }),
+    );
+  });
+
+  it('retries on Windows docker pipe error message', async () => {
+    const fn = vi
+      .fn()
+      .mockRejectedValueOnce(new Error('open //./pipe/docker_engine: cannot find the file specified'))
+      .mockResolvedValueOnce('ok');
+
+    const result = await retryOnTransientRuntimeError(fn, { label: 'docker.test', delayMs: 0 });
+
+    expect(result).toBe('ok');
+    expect(fn).toHaveBeenCalledTimes(2);
+  });
+
+  it('bails immediately on a non-transient error (auth, validation, …)', async () => {
+    const err = Object.assign(new Error('Unauthorized: invalid API key'), { status: 401 });
+    const fn = vi.fn().mockRejectedValue(err);
+
+    await expect(
+      retryOnTransientRuntimeError(fn, { label: 'authz', delayMs: 0 }),
+    ).rejects.toBe(err);
+    // No retry — single attempt, no warn.
+    expect(fn).toHaveBeenCalledTimes(1);
+    expect(log.warn).not.toHaveBeenCalled();
+  });
+
+  it('throws after exhausting all attempts', async () => {
+    const fn = vi.fn().mockRejectedValue(new Error('fetch failed'));
+
+    await expect(
+      retryOnTransientRuntimeError(fn, { label: 'persistent', attempts: 3, delayMs: 0 }),
+    ).rejects.toThrow('fetch failed');
+    expect(fn).toHaveBeenCalledTimes(3);
   });
 });
