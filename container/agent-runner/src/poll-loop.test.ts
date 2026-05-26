@@ -4,7 +4,7 @@ import { initTestSessionDb, closeSessionDb, getInboundDb, getOutboundDb } from '
 import { getPendingMessages, markCompleted } from './db/messages-in.js';
 import { getUndeliveredMessages } from './db/messages-out.js';
 import { formatMessages, extractRouting } from './formatter.js';
-import { evaluateToolStuckBudget } from './poll-loop.js'; // [PATCH-myia #28]
+import { evaluateToolStuckBudget, isCorruptionError } from './poll-loop.js'; // [PATCH-myia #28] evaluateToolStuckBudget
 import { MockProvider } from './providers/mock.js';
 
 beforeEach(() => {
@@ -15,13 +15,18 @@ afterEach(() => {
   closeSessionDb();
 });
 
-function insertMessage(id: string, kind: string, content: object, opts?: { processAfter?: string; trigger?: 0 | 1 }) {
+function insertMessage(
+  id: string,
+  kind: string,
+  content: object,
+  opts?: { processAfter?: string; trigger?: 0 | 1; onWake?: 0 | 1 },
+) {
   getInboundDb()
     .prepare(
-      `INSERT INTO messages_in (id, kind, timestamp, status, process_after, trigger, content)
-     VALUES (?, ?, datetime('now'), 'pending', ?, ?, ?)`,
+      `INSERT INTO messages_in (id, kind, timestamp, status, process_after, trigger, on_wake, content)
+     VALUES (?, ?, datetime('now'), 'pending', ?, ?, ?, ?)`,
     )
-    .run(id, kind, opts?.processAfter ?? null, opts?.trigger ?? 1, JSON.stringify(content));
+    .run(id, kind, opts?.processAfter ?? null, opts?.trigger ?? 1, opts?.onWake ?? 0, JSON.stringify(content));
 }
 
 describe('formatter', () => {
@@ -33,13 +38,15 @@ describe('formatter', () => {
     expect(prompt).toContain('Hello world');
   });
 
-  it('should format multiple chat messages as XML block', () => {
+  it('should format multiple chat messages as distinct <message> blocks', () => {
     insertMessage('m1', 'chat', { sender: 'John', text: 'Hello' });
     insertMessage('m2', 'chat', { sender: 'Jane', text: 'Hi there' });
     const messages = getPendingMessages();
     const prompt = formatMessages(messages);
-    expect(prompt).toContain('<messages>');
-    expect(prompt).toContain('</messages>');
+    // The <messages> envelope was dropped in fe2e881b (#2556) so the SDK calls
+    // the API; each message is now its own self-contained <message> block.
+    expect(prompt).not.toContain('<messages>');
+    expect(prompt.match(/<message /g) ?? []).toHaveLength(2);
     expect(prompt).toContain('sender="John"');
     expect(prompt).toContain('sender="Jane"');
   });
@@ -129,6 +136,58 @@ describe('accumulate gate (trigger column)', () => {
       .run();
     const [msg] = getPendingMessages();
     expect(msg.trigger).toBe(1);
+  });
+});
+
+describe('on_wake filtering', () => {
+  it('first poll returns on_wake=1 messages', () => {
+    insertMessage('m1', 'chat', { sender: 'system', text: 'Resuming.' }, { onWake: 1 });
+    const messages = getPendingMessages(true);
+    expect(messages).toHaveLength(1);
+    expect(messages[0].id).toBe('m1');
+  });
+
+  it('subsequent polls skip on_wake=1 messages', () => {
+    insertMessage('m1', 'chat', { sender: 'system', text: 'Resuming.' }, { onWake: 1 });
+    const messages = getPendingMessages(false);
+    expect(messages).toHaveLength(0);
+  });
+
+  it('normal messages returned regardless of isFirstPoll', () => {
+    insertMessage('m1', 'chat', { sender: 'A', text: 'hello' });
+    expect(getPendingMessages(true)).toHaveLength(1);
+
+    // Reset: mark completed so we can re-test with a fresh message
+    markCompleted(['m1']);
+    insertMessage('m2', 'chat', { sender: 'A', text: 'hello again' });
+    expect(getPendingMessages(false)).toHaveLength(1);
+  });
+
+  it('mixed batch: first poll returns both normal and on_wake messages', () => {
+    insertMessage('m1', 'chat', { sender: 'A', text: 'user msg' });
+    insertMessage('m2', 'chat', { sender: 'system', text: 'Resuming.' }, { onWake: 1 });
+    const messages = getPendingMessages(true);
+    expect(messages).toHaveLength(2);
+    expect(messages.map((m) => m.id).sort()).toEqual(['m1', 'm2']);
+  });
+
+  it('mixed batch: subsequent poll returns only normal messages', () => {
+    insertMessage('m1', 'chat', { sender: 'A', text: 'user msg' });
+    insertMessage('m2', 'chat', { sender: 'system', text: 'Resuming.' }, { onWake: 1 });
+    const messages = getPendingMessages(false);
+    expect(messages).toHaveLength(1);
+    expect(messages[0].id).toBe('m1');
+  });
+
+  it('on_wake defaults to 0 for inserts without explicit value', () => {
+    getInboundDb()
+      .prepare(
+        `INSERT INTO messages_in (id, kind, timestamp, status, content)
+         VALUES ('m1', 'chat', datetime('now'), 'pending', '{"text":"hi"}')`,
+      )
+      .run();
+    // Should be returned even on non-first poll (on_wake=0)
+    expect(getPendingMessages(false)).toHaveLength(1);
   });
 });
 
@@ -488,5 +547,25 @@ describe('[PATCH-myia #28] startup container_state cleanup', () => {
     expect(cleared?.current_tool).toBeNull();
     expect(cleared?.tool_started_at).toBeNull();
     expect(evaluateToolStuckBudget(cleared, Date.now()).abort).toBe(false);
+  });
+});
+
+// Upstream corruption-detection helper. Pairs with CORRUPTION_STREAK_EXIT in
+// poll-loop.ts — when 10 successive errors match this predicate, the runner
+// hard-exits so the host can recreate the cross-mount session DBs cleanly.
+describe('isCorruptionError', () => {
+  it('matches the Docker Desktop macOS torn-read symptom', () => {
+    expect(isCorruptionError('database disk image is malformed')).toBe(true);
+  });
+
+  it('matches wrapped SQLite corruption codes', () => {
+    expect(isCorruptionError('SqliteError: SQLITE_CORRUPT_VTAB: ...')).toBe(true);
+    expect(isCorruptionError('file is not a database')).toBe(true);
+  });
+
+  it('returns false for unrelated errors', () => {
+    expect(isCorruptionError('database is locked')).toBe(false);
+    expect(isCorruptionError('no such table: messages_in')).toBe(false);
+    expect(isCorruptionError('')).toBe(false);
   });
 });

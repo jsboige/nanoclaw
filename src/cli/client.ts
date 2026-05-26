@@ -21,6 +21,7 @@ import { formatResponse } from './format.js';
 import type { RequestFrame } from './frame.js';
 import { SocketTransport } from './socket-client.js';
 import type { Transport } from './transport.js';
+import { formatTransportError } from './transport-errors.js';
 
 async function main(): Promise<void> {
   const argv = process.argv.slice(2);
@@ -85,20 +86,11 @@ function parseArgv(argv: string[]): {
     process.exit(2);
   }
 
-  // Single word: `ncl help`
-  // Two words: `ncl groups list`, `ncl groups help`
-  // Three words: `ncl groups get abc123`
-  let command: string;
-  if (positional.length === 1) {
-    command = positional[0];
-  } else {
-    command = `${positional[0]}-${positional[1]}`;
-  }
-
-  // Third positional is the target ID
-  if (positional.length >= 3) {
-    args.id = positional[2];
-  }
+  // Join all positionals with dashes to form the command name.
+  // If the full name isn't a command, the dispatcher will try trimming
+  // the last segment and using it as the target ID (e.g. `groups get abc`
+  // → command "groups-get", id "abc").
+  const command = positional.join('-');
 
   return { command, args, json };
 }
@@ -112,21 +104,6 @@ function printUsage(): void {
       '',
     ].join('\n'),
   );
-}
-
-function formatTransportError(e: unknown): string {
-  const msg = e instanceof Error ? e.message : String(e);
-  if (msg.includes('ENOENT') || msg.includes('ECONNREFUSED')) {
-    return [
-      `ncl: cannot reach NanoClaw host (${msg}).`,
-      `Is the host running? Start it with: pnpm run dev`,
-      `Or, if installed as a service:`,
-      `  macOS:  launchctl kickstart -k gui/$(id -u)/com.nanoclaw`,
-      `  Linux:  systemctl --user restart nanoclaw`,
-      ``,
-    ].join('\n');
-  }
-  return `ncl: transport error: ${msg}\n`;
 }
 
 main().catch((err) => {

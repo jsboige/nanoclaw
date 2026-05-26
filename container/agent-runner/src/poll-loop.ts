@@ -196,6 +196,30 @@ export function evaluateToolStuckBudget(
   return { abort: true, tool: state.current_tool, elapsedMs: elapsed, budgetMs: budget, declaredMs: declared };
 }
 
+/**
+ * Number of consecutive `database disk image is malformed` errors after which
+ * the follow-up poll gives up and exits the process. At ACTIVE_POLL_INTERVAL_MS
+ * = 500ms this is roughly 5 seconds — long enough to dodge a transient torn
+ * read during a host write, short enough to recover quickly from a poisoned
+ * page cache (host-sweep then respawns with a fresh mount).
+ */
+const CORRUPTION_STREAK_EXIT = 10;
+
+/**
+ * True for SQLite errors that indicate a corrupt READ view — almost always a
+ * cross-mount page-cache coherency issue on Docker Desktop macOS rather than
+ * actual file damage (host-side integrity_check passes). Reopening the DB
+ * handle inside this process does NOT recover; only a fresh container mount
+ * does. Caller's job is to exit so host-sweep respawns the container.
+ */
+export function isCorruptionError(msg: string): boolean {
+  return (
+    msg.includes('database disk image is malformed') ||
+    msg.includes('SQLITE_CORRUPT') ||
+    msg.includes('file is not a database')
+  );
+}
+
 function log(msg: string): void {
   console.error(`[poll-loop] ${msg}`);
 }
@@ -242,6 +266,19 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
   // a Codex thread id never gets handed to Claude or vice versa.
   let continuation: string | undefined = migrateLegacyContinuation(config.providerName);
 
+  // Before resuming, drop a session whose on-disk transcript has grown too
+  // large/old to cold-resume within the host's idle ceiling. Without this a
+  // long-lived hub keeps trying to reload an ever-growing .jsonl, hangs the
+  // first turn, and gets killed before it can reply (then repeats forever).
+  if (continuation) {
+    const rotateReason = config.provider.maybeRotateContinuation?.(continuation, config.cwd);
+    if (rotateReason) {
+      log(`Rotating session — ${rotateReason}; starting fresh`);
+      clearContinuation(config.providerName);
+      continuation = undefined;
+    }
+  }
+
   if (continuation) {
     log(`Resuming agent session ${continuation}`);
   }
@@ -267,9 +304,11 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
   // [PATCH-myia #29] When we last posted a 🛑 BLOCKED notice (0 = never).
   // Throttles the user-visible message while the MCP chain is flapping.
   let lastBlockedNoticeAt = 0;
+  let isFirstPoll = true;
   while (true) {
     // Skip system messages — they're responses for MCP tools (e.g., ask_user_question)
-    const messages = getPendingMessages().filter((m) => m.kind !== 'system');
+    const messages = getPendingMessages(isFirstPoll).filter((m) => m.kind !== 'system');
+    isFirstPoll = false;
     pollCount++;
 
     // Periodic heartbeat so we know the loop is alive
@@ -681,6 +720,7 @@ async function processQuery(
   let queryContinuation: string | undefined;
   let mcpRegistryLost: { toolName: string; serverName: string } | undefined;
   let done = false;
+  let unwrappedNudged = false;
 
   // Concurrent polling: push follow-ups into the active query as they arrive.
   // We do NOT force-end the stream on silence — keeping the query open avoids
@@ -693,6 +733,7 @@ async function processQuery(
   // will kill the container and messages get reset to pending.
   let pollInFlight = false;
   let endedForCommand = false;
+  let corruptionStreak = 0;
 
   // [PATCH-myia #18] Push-mode stall recovery state.
   // - pendingFollowUpAcks: follow-up message IDs whose markCompleted is deferred
@@ -825,6 +866,7 @@ async function processQuery(
         const keptIds = keep.map((m) => m.id);
         const prompt = formatMessages(keep);
         log(`Pushing ${keep.length} follow-up message(s) into active query`);
+        unwrappedNudged = false;
         query.push(prompt);
         // [PATCH-myia #18] Defer markCompleted until a `result` event arrives.
         // The previous behavior marked these completed immediately after push,
@@ -845,6 +887,31 @@ async function processQuery(
         // path is not, so it needs its own.
         const errMsg = err instanceof Error ? err.message : String(err);
         log(`Follow-up poll error: ${errMsg}`);
+
+        // Detect SQLite cross-mount corruption (Docker Desktop macOS virtiofs /
+        // gRPC-FUSE coherency bug — the kernel page cache for the inbound.db
+        // bind mount can latch a torn snapshot mid-host-write, after which
+        // every fresh openInboundDb() in this process sees the same broken
+        // view. Reopening inside the container does NOT recover; only a fresh
+        // container mount does. Exit so the host sweep respawns us.
+        if (isCorruptionError(errMsg)) {
+          corruptionStreak += 1;
+          if (corruptionStreak >= CORRUPTION_STREAK_EXIT) {
+            log(
+              `Follow-up poll: ${corruptionStreak} consecutive '${errMsg}' errors — ` +
+                `inbound.db page cache is poisoned. Exiting so host respawns with a fresh mount.`,
+            );
+            // Stop touching the heartbeat so host-sweep stale detection fires
+            // promptly even if exit() races with in-flight async work.
+            done = true;
+            clearInterval(pollHandle);
+            // Defer exit one tick so this log line flushes through Docker's
+            // log driver before the process dies.
+            setTimeout(() => process.exit(75), 100);
+          }
+        } else {
+          corruptionStreak = 0;
+        }
       } finally {
         pollInFlight = false;
       }
@@ -1081,7 +1148,24 @@ async function processQuery(
         awaitingResult = false;
         lastResultAt = Date.now(); // [PATCH-myia #27]
         if (event.text) {
-          dispatchResultText(event.text, routing);
+          // Upstream nudge (preferred recovery): when the agent omitted
+          // <message to="…"> wrapping, push a <system> message asking it
+          // to re-send properly. [PATCH-myia #19] in dispatchResultText
+          // ALSO delivers the bare text to the routing source — layered
+          // defense, so the user gets *something* this turn even if the
+          // nudge doesn't take. See PATCHES.md#19.
+          const { hasUnwrapped } = dispatchResultText(event.text, routing);
+          if (hasUnwrapped && !unwrappedNudged) {
+            unwrappedNudged = true;
+            const destinations = getAllDestinations();
+            const names = destinations.map((d) => d.name).join(', ');
+            query.push(
+              `<system>Your response was not delivered — it was not wrapped in <message to="name">...</message> blocks. ` +
+                `All output must be wrapped: use <message to="name"> for content to send, or <internal> for scratchpad. ` +
+                `Your destinations: ${names}. ` +
+                `Please re-send your response with the correct wrapping.</system>`,
+            );
+          }
         }
         // [PATCH-myia #25] Drain queued follow-ups into a fresh turn. Any
         // messages that arrived while the previous turn was in flight have
@@ -1127,23 +1211,6 @@ async function processQuery(
         markCompleted(initialBatchIds);
         query.abort();
         break;
-      } else if (event.type === 'compacted') {
-        // The SDK auto-compacted the conversation. After compaction the
-        // model often drops the learned `<message to="…">` wrapping
-        // discipline (the destinations are still in the system prompt,
-        // but the behavioral pattern is summarized away). Inject a
-        // reminder back into the live query so the next turn re-anchors
-        // on the destination model. Only do this when there's >1
-        // destination — single-destination groups have a fallback that
-        // works without wrapping. See qwibitai/nanoclaw#2325.
-        const destinations = getAllDestinations();
-        if (destinations.length > 1) {
-          const names = destinations.map((d) => d.name).join(', ');
-          query.push(
-            `[system] Context was just compacted. Reminder: you have ${destinations.length} destinations (${names}). ` +
-              `Use <message to="name"> blocks to address them. Bare text goes to the scratchpad fallback only.`,
-          );
-        }
       }
     }
   } finally {
@@ -1213,9 +1280,6 @@ function handleEvent(event: ProviderEvent, _routing: RoutingContext): void {
     case 'mcp_tool_missing':
       log(`MCP tool missing: ${event.toolName} (server=${event.serverName})`);
       break;
-    case 'compacted':
-      log(`Compacted: ${event.text}`);
-      break;
   }
 }
 
@@ -1230,7 +1294,7 @@ function handleEvent(event: ProviderEvent, _routing: RoutingContext): void {
  * fallback ensures the user still gets the reply on the channel they
  * messaged from — better than silently dropping it into scratchpad.
  */
-function dispatchResultText(text: string, routing: RoutingContext): void {
+function dispatchResultText(text: string, routing: RoutingContext): { sent: number; hasUnwrapped: boolean } {
   const MESSAGE_RE = /<message\s+to="([^"]+)"\s*>([\s\S]*?)<\/message>/g;
 
   let match: RegExpExecArray | null;
@@ -1298,16 +1362,23 @@ function dispatchResultText(text: string, routing: RoutingContext): void {
       thread_id: routing.threadId ?? null,
       content: JSON.stringify({ text: scratchpad.trim() }),
     });
-    return;
+    // Suppress upstream's nudge here: PATCH #19 already delivered the bare
+    // text to the user's channel this turn, so re-prompting the agent to
+    // "re-send with proper wrapping" would just trigger the same unwrapped
+    // emission again (test verifies this — see PATCHES.md#19). The nudge
+    // path remains active for the unwrapped-with-no-fallback case below.
+    return { sent: 0, hasUnwrapped: false };
   }
 
   if (scratchpad) {
     log(`[scratchpad] ${scratchpad.slice(0, 500)}${scratchpad.length > 500 ? '…' : ''}`);
   }
 
-  if (sent === 0 && text.trim()) {
+  const hasUnwrapped = sent === 0 && !!scratchpad;
+  if (hasUnwrapped) {
     log(`WARNING: agent output had no <message to="..."> blocks — nothing was sent`);
   }
+  return { sent, hasUnwrapped };
 }
 
 function sendToDestination(dest: DestinationEntry, body: string, routing: RoutingContext): void {

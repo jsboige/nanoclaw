@@ -16,6 +16,8 @@ export interface RunnerConfig {
   agentGroupId: string;
   maxMessagesPerPrompt: number;
   mcpServers: Record<string, { command: string; args: string[]; env: Record<string, string> }>;
+  model?: string;
+  effort?: string;
 }
 
 const DEFAULT_MAX_MESSAGES = 10;
@@ -67,7 +69,9 @@ export function loadConfig(): RunnerConfig {
     groupName: (raw.groupName as string) || '',
     agentGroupId: (raw.agentGroupId as string) || '',
     maxMessagesPerPrompt: (raw.maxMessagesPerPrompt as number) || DEFAULT_MAX_MESSAGES,
-    mcpServers,
+    mcpServers, // [PATCH-myia #2] use ${VAR}-expanded copy, not raw
+    model: (raw.model as string) || undefined,
+    effort: (raw.effort as string) || undefined,
   };
 
   return _config;

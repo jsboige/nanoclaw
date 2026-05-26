@@ -2,7 +2,17 @@
 
 Minimal `src/` and `container/` patches applied on top of upstream v2. Every entry includes its commit hash, reason, and exit condition. Target: ≤ 10 active patches at any time. Monthly review removes those whose exit condition is satisfied.
 
-Baseline: upstream `main` at `ef43cbb` (v2.0.46) — sync 2026-05-09. Previous baseline was `1404f7f` (v2.0.30, 2026-05-04).
+Baseline: upstream `main` at `2492259` (v2.0.70) — sync 2026-05-27. Previous baseline was `ef43cbb` (v2.0.46, 2026-05-09).
+
+## Sync notes — v2.0.46 → v2.0.70 (165 commits)
+
+- **PATCH #19 (routing-source fallback)** — layered with upstream's new `7f4fa65` nudge:
+  - When the agent emits unwrapped text AND a routing source channel is resolvable, PATCH #19 delivers the bare text immediately and **returns `hasUnwrapped: false` to suppress the nudge** — already delivered, no point re-prompting to re-send.
+  - When the agent emits unwrapped text but no routing source is resolvable (rare path), `hasUnwrapped: true` flows up and upstream's nudge fires, asking the agent to wrap properly on the next turn.
+  - Test coverage: `bare text falls back to the routing-source channel (PATCH-myia #19)` in `integration.test.ts` — expects exactly 1 outbound message (PATCH #19 fallback only).
+- **Upstream `a760da7` (compaction reminder revert)** — the upstream `compacted` ProviderEvent variant + reminder injection were REVERTED upstream (caused agent to send unintended messages). Our merge removes the corresponding `else if (event.type === 'compacted')` blocks in `poll-loop.ts` and the dead-code path in `handleEvent`'s debug logger. The two integration tests `should inject destination reminder after a compacted event` and `should NOT inject destination reminder with a single destination` are removed as well — the feature they tested no longer exists upstream.
+- **Pre-existing baseline test failure** — `poll loop — stale session recovery > clears continuation when provider reports session invalid` still fails: PATCH #31 changed the soft-fail message text from `Error:` to `🔄 Transient session error — holding your message…`. The assertion `expect(text).toContain('Error:')` no longer matches. Pre-dates this sync; tracked separately.
+- **Windows test environment** — `host-core.test.ts` symlink tests + `scheduling/db.test.ts` directory-rm tests fail with EPERM on Windows non-elevated processes. Pre-existing platform limitation.
 
 ## Anti-divergence discipline
 
