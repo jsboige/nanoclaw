@@ -279,9 +279,7 @@ describe('retryOnTransientRuntimeError', () => {
     const err = Object.assign(new Error('Unauthorized: invalid API key'), { status: 401 });
     const fn = vi.fn().mockRejectedValue(err);
 
-    await expect(
-      retryOnTransientRuntimeError(fn, { label: 'authz', delayMs: 0 }),
-    ).rejects.toBe(err);
+    await expect(retryOnTransientRuntimeError(fn, { label: 'authz', delayMs: 0 })).rejects.toBe(err);
     // No retry — single attempt, no warn.
     expect(fn).toHaveBeenCalledTimes(1);
     expect(log.warn).not.toHaveBeenCalled();
@@ -290,9 +288,9 @@ describe('retryOnTransientRuntimeError', () => {
   it('throws after exhausting all attempts', async () => {
     const fn = vi.fn().mockRejectedValue(new Error('fetch failed'));
 
-    await expect(
-      retryOnTransientRuntimeError(fn, { label: 'persistent', attempts: 3, delayMs: 0 }),
-    ).rejects.toThrow('fetch failed');
+    await expect(retryOnTransientRuntimeError(fn, { label: 'persistent', attempts: 3, delayMs: 0 })).rejects.toThrow(
+      'fetch failed',
+    );
     expect(fn).toHaveBeenCalledTimes(3);
   });
 });
