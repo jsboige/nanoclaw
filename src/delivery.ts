@@ -23,6 +23,7 @@ import {
 } from './db/session-db.js';
 import { log } from './log.js';
 import { normalizeOptions } from './channels/ask-question.js';
+import { isReactionTargetGoneError } from './channels/chat-sdk-bridge.js';
 import { clearOutbox, openInboundDb, openOutboundDb, readOutboxFiles } from './session-manager.js';
 import { pauseTypingRefreshAfterDelivery, setTypingAdapter } from './modules/typing/index.js';
 import type { OutboundFile } from './channels/adapter.js';
@@ -213,6 +214,24 @@ async function drainSession(session: Session): Promise<void> {
           pauseTypingRefreshAfterDelivery(session.id);
         }
       } catch (err) {
+        // [PATCH-myia #21] Defense-in-depth widening of the reaction-target-gone
+        // swallow. The bridge-level swallow (chat-sdk-bridge.ts:485) is the
+        // primary defense; this delivery-layer net catches any addReaction
+        // call that bypasses the bridge swallow (e.g. a future adapter that
+        // routes reactions through a different code path, or a regression in
+        // the bridge). A "react not found" error means the target message is
+        // gone — the reaction is a UX cue, not load-bearing, so we mark the
+        // row delivered instead of burning the retry budget and spamming the
+        // permanently-failed log. See PATCHES.md#21.
+        if (isReactionTargetGoneError(err)) {
+          log.info('Reaction target gone (delivery layer swallow), marking delivered', {
+            messageId: msg.id,
+            sessionId: session.id,
+          });
+          markDelivered(inDb, msg.id, null);
+          deliveryAttempts.delete(msg.id);
+          continue;
+        }
         const attempts = (deliveryAttempts.get(msg.id) ?? 0) + 1;
         deliveryAttempts.set(msg.id, attempts);
         if (attempts >= MAX_DELIVERY_ATTEMPTS) {

@@ -218,6 +218,42 @@ describe('deliverSessionMessages — retry and permanent failure', () => {
     await deliverSessionMessages(session);
     expect(callCount).toBe(2);
   });
+
+  it('marks reaction-target-gone errors as delivered, not retryable (PATCH #21 delivery-layer swallow)', async () => {
+    // Defense-in-depth: if the bridge-level swallow at chat-sdk-bridge.ts:485
+    // misses (future regression, new code path), the delivery layer treats
+    // "message to react not found" as success — the target message is gone,
+    // the reaction is cosmetic, no point burning the retry budget.
+    seedAgentAndChannel();
+    const { session } = resolveSession('ag-1', 'mg-1', null, 'shared');
+    insertOutbound('ag-1', session.id, 'out-reaction-gone');
+
+    let callCount = 0;
+    setDeliveryAdapter({
+      async deliver() {
+        callCount++;
+        const err = Object.assign(new Error('Bad Request: message to react not found'), {
+          name: 'ValidationError',
+        });
+        throw err;
+      },
+    });
+
+    // Single call — should mark delivered and not retry
+    await deliverSessionMessages(session);
+    expect(callCount).toBe(1);
+
+    // Subsequent calls — adapter must not be invoked again
+    await deliverSessionMessages(session);
+    await deliverSessionMessages(session);
+    expect(callCount).toBe(1);
+
+    // Message is in delivered table after a single attempt
+    const inDb = openInboundDb('ag-1', session.id);
+    const delivered = getDeliveredIds(inDb);
+    inDb.close();
+    expect(delivered.has('out-reaction-gone')).toBe(true);
+  });
 });
 
 describe('deliverSessionMessages — permission check', () => {
