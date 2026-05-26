@@ -158,7 +158,40 @@ const cache = new Map<string, CacheEntry>();
  * re-probes against the (possibly recovered) chain and unblocks immediately.
  * The cost is one extra live probe per blocked turn, which the gate's retry
  * backoff (BLOCKED_RETRY_BACKOFF_MS) already paces.
+ *
+ * [PATCH-myia #32] Retry once on timeout/abort before declaring failure.
+ * Observed mode: a single SDK stall (#2177) is immediately followed by a
+ * per-turn probe that times out on every required remote in parallel — IIS
+ * ARR + TBXark + sparfenyuk + stdio MCP take longer than the 8s probe budget
+ * to respond when the chain is recovering from load. Two timeouts in a row
+ * is a real outage; one timeout is a blip. We retry only on the
+ * "aborted"/timeout class — definitive HTTP failures (4xx/5xx) skip retry
+ * since they're authoritative.
  */
+function isTimeoutError(result: HealthResult): boolean {
+  return !result.ok && !!result.error && /aborted|timeout|ETIMEDOUT/i.test(result.error);
+}
+
+/**
+ * [PATCH-myia #32] Probe with a single transparent retry on timeout/abort.
+ *
+ * Worst-case latency on failure: 8s + 20s = 28s. HTTP 4xx/5xx skip retry
+ * (definitive failure). Used by both the boot-time fail-fast check and the
+ * per-turn cached gate — same blip-tolerance policy everywhere.
+ *
+ * Observed 2026-05-26: the proxy chain (IIS ARR → TBXark → sparfenyuk →
+ * upstream) can stall for >8s mid-blip while still recovering. Without the
+ * retry, every fresh container exited code=1 at boot during a blip and the
+ * host crash-looped respawning ~every minute until the chain recovered.
+ */
+export async function probeMcpRemoteWithRetry(parsed: ParsedMcpRemote): Promise<HealthResult> {
+  let result = await probeMcpRemote(parsed);
+  if (!result.ok && isTimeoutError(result)) {
+    result = await probeMcpRemote(parsed, 20_000);
+  }
+  return result;
+}
+
 export async function probeMcpRemoteCached(
   parsed: ParsedMcpRemote,
   ttlMs = 60_000,
@@ -166,7 +199,7 @@ export async function probeMcpRemoteCached(
   const now = Date.now();
   const hit = cache.get(parsed.url);
   if (hit && hit.expiresAt > now) return hit.result;
-  const result = await probeMcpRemote(parsed);
+  const result = await probeMcpRemoteWithRetry(parsed);
   if (result.ok) {
     cache.set(parsed.url, { result, expiresAt: now + ttlMs });
   } else {

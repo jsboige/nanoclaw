@@ -29,7 +29,7 @@ import { loadConfig } from './config.js';
 import { clearStaleProcessingAcks, touchHeartbeat } from './db/connection.js';
 import { writeMessageOut } from './db/messages-out.js';
 import { buildSystemPromptAddendum, getAllDestinations } from './destinations.js';
-import { formatFailures, probeMcpRemote, selectRequiredRemotes, type RequiredRemote } from './mcp-health.js';
+import { formatFailures, probeMcpRemoteWithRetry, selectRequiredRemotes, type RequiredRemote } from './mcp-health.js';
 // Providers barrel — each enabled provider self-registers on import.
 // Provider skills append imports to providers/index.ts.
 import './providers/index.js';
@@ -115,7 +115,7 @@ async function main(): Promise<void> {
   if (requiredRemotes.length > 0) {
     log(`Health-checking ${requiredRemotes.length} required MCP remote(s): ${requiredRemotes.map((r) => r.name).join(', ')}`);
     const results = await Promise.all(
-      requiredRemotes.map(async (r) => ({ name: r.name, result: await probeMcpRemote(r.parsed) })),
+      requiredRemotes.map(async (r) => ({ name: r.name, result: await probeMcpRemoteWithRetry(r.parsed) })),
     );
     const failed = results.filter((r) => !r.result.ok);
     if (failed.length > 0) {
