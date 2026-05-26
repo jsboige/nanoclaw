@@ -7,7 +7,13 @@ import {
   type MessageInRow,
 } from './db/messages-in.js';
 import { writeMessageOut } from './db/messages-out.js';
-import { getInboundDb, touchHeartbeat, clearStaleProcessingAcks } from './db/connection.js';
+import {
+  getInboundDb,
+  touchHeartbeat,
+  clearStaleProcessingAcks,
+  getContainerToolInFlight, // [PATCH-myia #28]
+  clearContainerToolInFlight, // [PATCH-myia #28]
+} from './db/connection.js';
 import { recordTaskRun } from './db/task-run-logs.js'; // [PATCH-myia #9]
 import { clearContinuation, migrateLegacyContinuation, setContinuation } from './db/session-state.js';
 import { clearCurrentInReplyTo, setCurrentInReplyTo } from './current-batch.js';
@@ -88,6 +94,132 @@ const HEARTBEAT_TICKLE_INTERVAL_MS = 15_000;
 const IDLE_WITH_PENDING_TIMEOUT_MS = 45_000;
 const IDLE_CHECK_INTERVAL_MS = 5_000;
 
+// [PATCH-myia #28] Tool-stuck watchdog. The complementary failure mode to
+// #26 (which gates on SDK silence): the SDK is still emitting events
+// (thinking deltas, partial assistant deltas, stream keepalives) but a
+// specific tool call has been pending far longer than reasonable. The
+// 2026-05-18 incident: `mcp__roo-state-manager__roosync_dashboard` stuck
+// for 22h because the MCP server (TBXark/sparfenyuk/roo-state-manager
+// chain) never returned a response. The Claude Agent SDK doesn't expose
+// per-tool timeouts (`McpStdioServerConfig` has none); a hung MCP call
+// dangles indefinitely. Meanwhile #24's heartbeat tickle suppresses the
+// host's kill, #26's `lastSdkEventAt` keeps getting bumped by other SDK
+// events while the tool awaits, and `container_state.tool_started_at`
+// (populated by claude.ts's PreToolUse hook) was tracked but never
+// consulted by any watchdog. Result: 18 user messages silently swallowed,
+// recovered only by manual `Stop-Service` + DELETE on processing_ack.
+//
+// Action: every TOOL_STUCK_CHECK_INTERVAL_MS read container_state. If a
+// tool is in flight beyond its budget, force `query.abort()` and reset
+// claims so the outer loop respawns. Source of truth = the DB row, not
+// SDK events — independent of whatever keepalive traffic the stream
+// carries during the stall.
+//
+// Budget: `max(declared_timeout_ms * 1.5, TOOL_STUCK_DEFAULT_MS)`. Bash
+// declares a per-call timeout via tool_input.timeout (claude.ts:178); MCP
+// servers declare it via the per-server `timeout` config (claude.ts:182).
+// For tools with no declaration, 5 min default covers legitimate slow
+// calls (Whisper batch transcribe ≤90s, large dashboard reads ≤60s) with
+// a wide margin; 30s check cadence keeps user-visible silence under
+// ~6 min worst case + fresh-query startup.
+const TOOL_STUCK_DEFAULT_MS = 5 * 60 * 1000;
+const TOOL_STUCK_CHECK_INTERVAL_MS = 30_000;
+
+// [PATCH-myia #30] Idle heartbeat keep-alive window. The host-sweep absolute
+// ceiling (src/host-sweep.ts ABSOLUTE_CEILING_MS) kills any container whose
+// heartbeat file is older than 30 min — INCLUDING idle ones, because the idle
+// branch of this loop never touched the heartbeat. The result was hourly cold
+// churn: an always-on agent (cron tasks, an always-warm bot) gets reaped at
+// the 30-min mark, then respawned on the next inbound, and the cold-restart
+// startup window (first roosync_dashboard call / pre-turn MCP probe racing the
+// proxy) is exactly where the "lost MCPs" symptom shows up. Tickling the
+// heartbeat while idle keeps a healthy container warm so it isn't paying that
+// restart tax every hour.
+//
+// Bounded so a genuinely-abandoned container still dies: after this much
+// continuous idle we STOP tickling, the heartbeat goes stale, and the next
+// sweep reaps it on the normal ceiling rule. The budget resets to 0 every
+// time a real (trigger=1) batch is processed, so an active agent never hits
+// it. 2h chosen: longer than any plausible quiet stretch for an always-on
+// agent between cron fires, short enough that an orphaned container frees its
+// resources the same afternoon.
+const IDLE_KEEPALIVE_MS = 2 * 60 * 60 * 1000;
+
+// [PATCH-myia #29] Fail-fast gate softening. The per-turn required-MCP gate
+// (further down) previously, on a probe failure, wrote a 🛑 BLOCKED chat
+// message AND `markCompleted`'d the user's message — permanently dropping it.
+// Combined with the 60s probe-failure cache, a single sub-second proxy blip
+// (e.g. the MCP chain mid-restart) turned into a 60s window during which every
+// inbound was answered with 🛑 and then discarded. The bot looked like it had
+// "lost its MCPs" when the chain was actually fine seconds later.
+//
+// New behavior: on a blocked turn we RESET the claim (resetProcessingAcks) so
+// the message stays pending and is retried once the chain recovers; we THROTTLE
+// the user-visible 🛑 notice to at most once per BLOCKED_NOTICE_THROTTLE_MS so a
+// flapping chain doesn't spam the channel; and we sleep BLOCKED_RETRY_BACKOFF_MS
+// before the next iteration so the retry loop doesn't hot-spin on the proxy.
+// Paired with mcp-health caching successes only, so a recovered chain unblocks
+// within one retry window instead of waiting out a cached failure.
+//
+// [PATCH-myia #31] extends the same softening to the reactive catch path
+// (SDK init throws "MCP servers not connected at init" after the proactive
+// probe passed). Both constants are reused there.
+const BLOCKED_NOTICE_THROTTLE_MS = 5 * 60 * 1000;
+const BLOCKED_RETRY_BACKOFF_MS = 10_000;
+
+/**
+ * [PATCH-myia #28] Pure decision: should we abort because a tool has been
+ * pending too long? Exported so unit tests don't have to spin up an SDK.
+ *
+ * Budget = `max(declared_timeout_ms * 1.5, defaultBudgetMs)`. The 1.5x slack
+ * on a declared timeout covers the SDK's own jitter — if a tool has its own
+ * deadline, we trust it to self-cancel within that window and only fire
+ * when it has clearly missed.
+ */
+export function evaluateToolStuckBudget(
+  state: {
+    current_tool: string | null;
+    tool_declared_timeout_ms: number | null;
+    tool_started_at: string | null;
+  } | null,
+  nowMs: number,
+  defaultBudgetMs: number = TOOL_STUCK_DEFAULT_MS,
+): { abort: false } | { abort: true; tool: string; elapsedMs: number; budgetMs: number; declaredMs: number | null } {
+  if (!state || !state.current_tool || !state.tool_started_at) return { abort: false };
+  const startedMs = Date.parse(state.tool_started_at);
+  if (Number.isNaN(startedMs)) return { abort: false };
+  const declared = state.tool_declared_timeout_ms;
+  const budget =
+    declared && declared > 0 ? Math.max(declared * 1.5, defaultBudgetMs) : defaultBudgetMs;
+  const elapsed = nowMs - startedMs;
+  if (elapsed < budget) return { abort: false };
+  return { abort: true, tool: state.current_tool, elapsedMs: elapsed, budgetMs: budget, declaredMs: declared };
+}
+
+/**
+ * Number of consecutive `database disk image is malformed` errors after which
+ * the follow-up poll gives up and exits the process. At ACTIVE_POLL_INTERVAL_MS
+ * = 500ms this is roughly 5 seconds — long enough to dodge a transient torn
+ * read during a host write, short enough to recover quickly from a poisoned
+ * page cache (host-sweep then respawns with a fresh mount).
+ */
+const CORRUPTION_STREAK_EXIT = 10;
+
+/**
+ * True for SQLite errors that indicate a corrupt READ view — almost always a
+ * cross-mount page-cache coherency issue on Docker Desktop macOS rather than
+ * actual file damage (host-side integrity_check passes). Reopening the DB
+ * handle inside this process does NOT recover; only a fresh container mount
+ * does. Caller's job is to exit so host-sweep respawns the container.
+ */
+export function isCorruptionError(msg: string): boolean {
+  return (
+    msg.includes('database disk image is malformed') ||
+    msg.includes('SQLITE_CORRUPT') ||
+    msg.includes('file is not a database')
+  );
+}
+
 function log(msg: string): void {
   console.error(`[poll-loop] ${msg}`);
 }
@@ -134,6 +266,19 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
   // a Codex thread id never gets handed to Claude or vice versa.
   let continuation: string | undefined = migrateLegacyContinuation(config.providerName);
 
+  // Before resuming, drop a session whose on-disk transcript has grown too
+  // large/old to cold-resume within the host's idle ceiling. Without this a
+  // long-lived hub keeps trying to reload an ever-growing .jsonl, hangs the
+  // first turn, and gets killed before it can reply (then repeats forever).
+  if (continuation) {
+    const rotateReason = config.provider.maybeRotateContinuation?.(continuation, config.cwd);
+    if (rotateReason) {
+      log(`Rotating session — ${rotateReason}; starting fresh`);
+      clearContinuation(config.providerName);
+      continuation = undefined;
+    }
+  }
+
   if (continuation) {
     log(`Resuming agent session ${continuation}`);
   }
@@ -142,10 +287,28 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
   // This lets the new container re-process those messages.
   clearStaleProcessingAcks();
 
+  // [PATCH-myia #28] Clear any stale in-flight tool marker from a previous
+  // container that was killed mid-tool. PostToolUse never fires for a
+  // killed tool call, so `container_state` keeps a non-NULL `tool_started_at`
+  // pointing at the dead container's clock. Without this, the tool-stuck
+  // watchdog reads that stale row on the very first check of the new
+  // container and can abort a brand-new query for a tool that isn't running.
+  // (This is the 7qx60e-zombie failure mode: a `roosync_dashboard` row left
+  // in flight survived the restart and tripped #28.)
+  clearContainerToolInFlight();
+
   let pollCount = 0;
+  // [PATCH-myia #30] Idle keep-alive bookkeeping. Timestamp of when the
+  // current uninterrupted idle stretch began (0 = not currently idle).
+  let idleSince = 0;
+  // [PATCH-myia #29] When we last posted a 🛑 BLOCKED notice (0 = never).
+  // Throttles the user-visible message while the MCP chain is flapping.
+  let lastBlockedNoticeAt = 0;
+  let isFirstPoll = true;
   while (true) {
     // Skip system messages — they're responses for MCP tools (e.g., ask_user_question)
-    const messages = getPendingMessages().filter((m) => m.kind !== 'system');
+    const messages = getPendingMessages(isFirstPoll).filter((m) => m.kind !== 'system');
+    isFirstPoll = false;
     pollCount++;
 
     // Periodic heartbeat so we know the loop is alive
@@ -154,6 +317,15 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
     }
 
     if (messages.length === 0) {
+      // [PATCH-myia #30] Bounded idle heartbeat keep-alive. While genuinely
+      // idle, prove liveness to the host so the absolute-ceiling sweep
+      // doesn't reap a healthy container at 30 min (avoiding the hourly cold
+      // churn that triggers the rough-startup "lost MCPs" window). Stop after
+      // IDLE_KEEPALIVE_MS of continuous idle so an abandoned container still
+      // goes stale and gets reaped.
+      const nowIdle = Date.now();
+      if (idleSince === 0) idleSince = nowIdle;
+      if (nowIdle - idleSince < IDLE_KEEPALIVE_MS) touchHeartbeat();
       await sleep(POLL_INTERVAL_MS);
       continue;
     }
@@ -170,6 +342,10 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
       await sleep(POLL_INTERVAL_MS);
       continue;
     }
+
+    // [PATCH-myia #30] Real work this iteration — reset the idle keep-alive
+    // budget so the next quiet stretch gets the full IDLE_KEEPALIVE_MS window.
+    idleSince = 0;
 
     const ids = messages.map((m) => m.id);
     markProcessing(ids);
@@ -274,7 +450,15 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
         const failList = formatFailures(failed);
         log(`BLOCKED: required MCP remote(s) DOWN — ${failList}`);
         const blockedIds = keep.map((m) => m.id);
-        if (routing.platformId && routing.channelType) {
+        // [PATCH-myia #29] Throttle the user-visible 🛑 notice so a flapping
+        // chain doesn't spam the channel. Only post once per window.
+        const nowBlocked = Date.now();
+        if (
+          routing.platformId &&
+          routing.channelType &&
+          nowBlocked - lastBlockedNoticeAt >= BLOCKED_NOTICE_THROTTLE_MS
+        ) {
+          lastBlockedNoticeAt = nowBlocked;
           writeMessageOut({
             id: generateId(),
             kind: 'chat',
@@ -282,11 +466,17 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
             channel_type: routing.channelType,
             thread_id: routing.threadId,
             content: JSON.stringify({
-              text: `🛑 BLOCKED: required MCP server(s) unreachable: ${failList}\n\nNot processing this message — repair in progress, retry after the chain recovers.`,
+              text: `🛑 BLOCKED: required MCP server(s) unreachable: ${failList}\n\nHolding your message — I'll process it once the chain recovers.`,
             }),
           });
         }
-        markCompleted(blockedIds);
+        // [PATCH-myia #29] Reset the claim instead of completing it, so the
+        // message stays pending and is retried on a later iteration once the
+        // chain is back. Back off before retrying so we don't hot-spin the
+        // proxy. mcp-health caches successes only, so the next probe sees the
+        // recovered chain immediately rather than a stale cached failure.
+        resetProcessingAcks(blockedIds);
+        await sleep(BLOCKED_RETRY_BACKOFF_MS);
         continue;
       }
     }
@@ -366,21 +556,69 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
       // Stale/corrupt continuation recovery: ask the provider whether
       // this error means the stored continuation is unusable, and clear
       // it so the next attempt starts fresh.
-      if (continuation && config.provider.isSessionInvalid(err)) {
+      const isStale = config.provider.isSessionInvalid(err);
+      if (continuation && isStale) {
         log(`Stale session detected (${continuation}) — clearing for next retry`);
         continuation = undefined;
         clearContinuation(config.providerName);
       }
 
-      // Write error response so the user knows something went wrong
-      writeMessageOut({
-        id: generateId(),
-        kind: 'chat',
-        platform_id: routing.platformId,
-        channel_type: routing.channelType,
-        thread_id: routing.threadId,
-        content: JSON.stringify({ text: `Error: ${errMsg}` }),
-      });
+      if (isStale) {
+        // [PATCH-myia #31] Soft fail-fast for transient SDK init failures.
+        // The catch path previously wrote `Error: ${errMsg}` to the user
+        // AND `markCompleted`'d the batch (default branch below at the
+        // `if (!stalledAborted)` check) — permanently losing the message
+        // on every transient MCP-init blip. The classic symptom was the
+        // overnight wave of `Error: MCP servers not connected at init`
+        // messages posted to Telegram (2026-05-25/26: 5+ across cron +
+        // hermes sessions, each one a sub-minute init handshake that the
+        // next iteration would have completed cleanly).
+        //
+        // PATCH #29 already implements this softening for the requiredRemotes
+        // probe path (the proactive gate above provider.query()). This
+        // extends the same shape to the reactive path: throttle the user
+        // notice (reuse BLOCKED_NOTICE_THROTTLE_MS so a flapping chain
+        // doesn't spam the channel), reset the claim so the message stays
+        // pending and is retried on the next iteration, sleep
+        // BLOCKED_RETRY_BACKOFF_MS before retrying so we don't hot-spin
+        // the SDK, and re-route through the `stalledAborted` skip-
+        // markCompleted branch below so the batch isn't finalized.
+        //
+        // `isSessionInvalid` matches the STALE_SESSION_RE in
+        // providers/claude.ts — currently: "no conversation found",
+        // "ENOENT.*\.jsonl", "session.*not found", "MCP servers not
+        // connected at init", "MCP registry lost mid-session".
+        const nowBlocked = Date.now();
+        if (
+          routing.platformId &&
+          routing.channelType &&
+          nowBlocked - lastBlockedNoticeAt >= BLOCKED_NOTICE_THROTTLE_MS
+        ) {
+          lastBlockedNoticeAt = nowBlocked;
+          writeMessageOut({
+            id: generateId(),
+            kind: 'chat',
+            platform_id: routing.platformId,
+            channel_type: routing.channelType,
+            thread_id: routing.threadId,
+            content: JSON.stringify({
+              text: `🔄 Transient session error — holding your message, I'll retry once the chain recovers.`,
+            }),
+          });
+        }
+        resetProcessingAcks(processingIds);
+        stalledAborted = true;
+        await sleep(BLOCKED_RETRY_BACKOFF_MS);
+      } else {
+        writeMessageOut({
+          id: generateId(),
+          kind: 'chat',
+          platform_id: routing.platformId,
+          channel_type: routing.channelType,
+          thread_id: routing.threadId,
+          content: JSON.stringify({ text: `Error: ${errMsg}` }),
+        });
+      }
     } finally {
       clearCurrentInReplyTo();
     }
@@ -482,6 +720,7 @@ async function processQuery(
   let queryContinuation: string | undefined;
   let mcpRegistryLost: { toolName: string; serverName: string } | undefined;
   let done = false;
+  let unwrappedNudged = false;
 
   // Concurrent polling: push follow-ups into the active query as they arrive.
   // We do NOT force-end the stream on silence — keeping the query open avoids
@@ -494,6 +733,7 @@ async function processQuery(
   // will kill the container and messages get reset to pending.
   let pollInFlight = false;
   let endedForCommand = false;
+  let corruptionStreak = 0;
 
   // [PATCH-myia #18] Push-mode stall recovery state.
   // - pendingFollowUpAcks: follow-up message IDs whose markCompleted is deferred
@@ -626,6 +866,7 @@ async function processQuery(
         const keptIds = keep.map((m) => m.id);
         const prompt = formatMessages(keep);
         log(`Pushing ${keep.length} follow-up message(s) into active query`);
+        unwrappedNudged = false;
         query.push(prompt);
         // [PATCH-myia #18] Defer markCompleted until a `result` event arrives.
         // The previous behavior marked these completed immediately after push,
@@ -646,6 +887,31 @@ async function processQuery(
         // path is not, so it needs its own.
         const errMsg = err instanceof Error ? err.message : String(err);
         log(`Follow-up poll error: ${errMsg}`);
+
+        // Detect SQLite cross-mount corruption (Docker Desktop macOS virtiofs /
+        // gRPC-FUSE coherency bug — the kernel page cache for the inbound.db
+        // bind mount can latch a torn snapshot mid-host-write, after which
+        // every fresh openInboundDb() in this process sees the same broken
+        // view. Reopening inside the container does NOT recover; only a fresh
+        // container mount does. Exit so the host sweep respawns us.
+        if (isCorruptionError(errMsg)) {
+          corruptionStreak += 1;
+          if (corruptionStreak >= CORRUPTION_STREAK_EXIT) {
+            log(
+              `Follow-up poll: ${corruptionStreak} consecutive '${errMsg}' errors — ` +
+                `inbound.db page cache is poisoned. Exiting so host respawns with a fresh mount.`,
+            );
+            // Stop touching the heartbeat so host-sweep stale detection fires
+            // promptly even if exit() races with in-flight async work.
+            done = true;
+            clearInterval(pollHandle);
+            // Defer exit one tick so this log line flushes through Docker's
+            // log driver before the process dies.
+            setTimeout(() => process.exit(75), 100);
+          }
+        } else {
+          corruptionStreak = 0;
+        }
       } finally {
         pollInFlight = false;
       }
@@ -782,6 +1048,70 @@ async function processQuery(
     }
   }, IDLE_CHECK_INTERVAL_MS);
 
+  // [PATCH-myia #28] Tool-stuck watchdog. See header comment near
+  // TOOL_STUCK_DEFAULT_MS for rationale. Fires independently of SDK
+  // event traffic — reads container_state row populated by claude.ts's
+  // PreToolUse hook. Reuses `stalledAborted` so the outer loop's
+  // skip-markCompleted branch covers this case too.
+  const toolStuckHandle = setInterval(() => {
+    if (done || stalledAborted || endedForCommand) return;
+    let state: ReturnType<typeof getContainerToolInFlight>;
+    try {
+      state = getContainerToolInFlight();
+    } catch (err) {
+      log(`Tool-stuck watchdog DB read failed: ${err instanceof Error ? err.message : String(err)}`);
+      return;
+    }
+    const decision = evaluateToolStuckBudget(state, Date.now());
+    if (!decision.abort) return;
+
+    log(
+      `TOOL STUCK: ${decision.tool} in flight for ${Math.round(decision.elapsedMs / 1000)}s ` +
+        `(budget=${Math.round(decision.budgetMs / 1000)}s, declared=${decision.declaredMs ?? 'none'}). ` +
+        `Aborting query so outer loop respawns.`,
+    );
+    stalledAborted = true;
+
+    // Clear stale container_state — the next container spawn shouldn't
+    // inherit our "tool in flight" flag from the aborted call. PostToolUse
+    // won't fire for an aborted tool, so we clear it explicitly here.
+    try {
+      clearContainerToolInFlight();
+    } catch (err) {
+      log(`Failed to clear container_state during tool-stuck abort: ${err instanceof Error ? err.message : String(err)}`);
+    }
+
+    if (initialBatchIds.length > 0) {
+      try {
+        resetProcessingAcks(initialBatchIds);
+      } catch (err) {
+        log(`Failed to reset initial-batch acks during tool-stuck: ${err instanceof Error ? err.message : String(err)}`);
+      }
+    }
+    if (pendingFollowUpAcks.length > 0) {
+      try {
+        resetProcessingAcks(pendingFollowUpAcks);
+      } catch (err) {
+        log(`Failed to reset processing acks during tool-stuck: ${err instanceof Error ? err.message : String(err)}`);
+      }
+      pendingFollowUpAcks.length = 0;
+    }
+    if (queuedFollowUps.length > 0) {
+      const queuedIds = queuedFollowUps.map((m) => m.id);
+      try {
+        resetProcessingAcks(queuedIds);
+      } catch (err) {
+        log(`Failed to reset queued follow-up acks during tool-stuck: ${err instanceof Error ? err.message : String(err)}`);
+      }
+      queuedFollowUps.length = 0;
+    }
+    try {
+      query.abort();
+    } catch (err) {
+      log(`Failed to abort tool-stuck query: ${err instanceof Error ? err.message : String(err)}`);
+    }
+  }, TOOL_STUCK_CHECK_INTERVAL_MS);
+
   try {
     for await (const event of query.events) {
       handleEvent(event, routing);
@@ -818,7 +1148,24 @@ async function processQuery(
         awaitingResult = false;
         lastResultAt = Date.now(); // [PATCH-myia #27]
         if (event.text) {
-          dispatchResultText(event.text, routing);
+          // Upstream nudge (preferred recovery): when the agent omitted
+          // <message to="…"> wrapping, push a <system> message asking it
+          // to re-send properly. [PATCH-myia #19] in dispatchResultText
+          // ALSO delivers the bare text to the routing source — layered
+          // defense, so the user gets *something* this turn even if the
+          // nudge doesn't take. See PATCHES.md#19.
+          const { hasUnwrapped } = dispatchResultText(event.text, routing);
+          if (hasUnwrapped && !unwrappedNudged) {
+            unwrappedNudged = true;
+            const destinations = getAllDestinations();
+            const names = destinations.map((d) => d.name).join(', ');
+            query.push(
+              `<system>Your response was not delivered — it was not wrapped in <message to="name">...</message> blocks. ` +
+                `All output must be wrapped: use <message to="name"> for content to send, or <internal> for scratchpad. ` +
+                `Your destinations: ${names}. ` +
+                `Please re-send your response with the correct wrapping.</system>`,
+            );
+          }
         }
         // [PATCH-myia #25] Drain queued follow-ups into a fresh turn. Any
         // messages that arrived while the previous turn was in flight have
@@ -864,23 +1211,6 @@ async function processQuery(
         markCompleted(initialBatchIds);
         query.abort();
         break;
-      } else if (event.type === 'compacted') {
-        // The SDK auto-compacted the conversation. After compaction the
-        // model often drops the learned `<message to="…">` wrapping
-        // discipline (the destinations are still in the system prompt,
-        // but the behavioral pattern is summarized away). Inject a
-        // reminder back into the live query so the next turn re-anchors
-        // on the destination model. Only do this when there's >1
-        // destination — single-destination groups have a fallback that
-        // works without wrapping. See qwibitai/nanoclaw#2325.
-        const destinations = getAllDestinations();
-        if (destinations.length > 1) {
-          const names = destinations.map((d) => d.name).join(', ');
-          query.push(
-            `[system] Context was just compacted. Reminder: you have ${destinations.length} destinations (${names}). ` +
-              `Use <message to="name"> blocks to address them. Bare text goes to the scratchpad fallback only.`,
-          );
-        }
       }
     }
   } finally {
@@ -889,6 +1219,7 @@ async function processQuery(
     clearInterval(stallHandle); // [PATCH-myia #18]
     clearInterval(heartbeatHandle); // [PATCH-myia #24]
     clearInterval(idleHandle); // [PATCH-myia #27]
+    clearInterval(toolStuckHandle); // [PATCH-myia #28]
     // [PATCH-myia #18] If the stream ended (cleanly or via abort) while we
     // still had follow-up acks pending, the watchdog already reset them; but
     // if the stream ended for some OTHER reason (e.g. SDK internal error,
@@ -949,9 +1280,6 @@ function handleEvent(event: ProviderEvent, _routing: RoutingContext): void {
     case 'mcp_tool_missing':
       log(`MCP tool missing: ${event.toolName} (server=${event.serverName})`);
       break;
-    case 'compacted':
-      log(`Compacted: ${event.text}`);
-      break;
   }
 }
 
@@ -966,7 +1294,7 @@ function handleEvent(event: ProviderEvent, _routing: RoutingContext): void {
  * fallback ensures the user still gets the reply on the channel they
  * messaged from — better than silently dropping it into scratchpad.
  */
-function dispatchResultText(text: string, routing: RoutingContext): void {
+function dispatchResultText(text: string, routing: RoutingContext): { sent: number; hasUnwrapped: boolean } {
   const MESSAGE_RE = /<message\s+to="([^"]+)"\s*>([\s\S]*?)<\/message>/g;
 
   let match: RegExpExecArray | null;
@@ -1034,16 +1362,23 @@ function dispatchResultText(text: string, routing: RoutingContext): void {
       thread_id: routing.threadId ?? null,
       content: JSON.stringify({ text: scratchpad.trim() }),
     });
-    return;
+    // Suppress upstream's nudge here: PATCH #19 already delivered the bare
+    // text to the user's channel this turn, so re-prompting the agent to
+    // "re-send with proper wrapping" would just trigger the same unwrapped
+    // emission again (test verifies this — see PATCHES.md#19). The nudge
+    // path remains active for the unwrapped-with-no-fallback case below.
+    return { sent: 0, hasUnwrapped: false };
   }
 
   if (scratchpad) {
     log(`[scratchpad] ${scratchpad.slice(0, 500)}${scratchpad.length > 500 ? '…' : ''}`);
   }
 
-  if (sent === 0 && text.trim()) {
+  const hasUnwrapped = sent === 0 && !!scratchpad;
+  if (hasUnwrapped) {
     log(`WARNING: agent output had no <message to="..."> blocks — nothing was sent`);
   }
+  return { sent, hasUnwrapped };
 }
 
 function sendToDestination(dest: DestinationEntry, body: string, routing: RoutingContext): void {

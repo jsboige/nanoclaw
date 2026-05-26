@@ -4,6 +4,7 @@ import { initTestSessionDb, closeSessionDb, getInboundDb, getOutboundDb } from '
 import { getPendingMessages, markCompleted } from './db/messages-in.js';
 import { getUndeliveredMessages } from './db/messages-out.js';
 import { formatMessages, extractRouting } from './formatter.js';
+import { evaluateToolStuckBudget, isCorruptionError } from './poll-loop.js'; // [PATCH-myia #28] evaluateToolStuckBudget
 import { MockProvider } from './providers/mock.js';
 
 beforeEach(() => {
@@ -14,13 +15,18 @@ afterEach(() => {
   closeSessionDb();
 });
 
-function insertMessage(id: string, kind: string, content: object, opts?: { processAfter?: string; trigger?: 0 | 1 }) {
+function insertMessage(
+  id: string,
+  kind: string,
+  content: object,
+  opts?: { processAfter?: string; trigger?: 0 | 1; onWake?: 0 | 1 },
+) {
   getInboundDb()
     .prepare(
-      `INSERT INTO messages_in (id, kind, timestamp, status, process_after, trigger, content)
-     VALUES (?, ?, datetime('now'), 'pending', ?, ?, ?)`,
+      `INSERT INTO messages_in (id, kind, timestamp, status, process_after, trigger, on_wake, content)
+     VALUES (?, ?, datetime('now'), 'pending', ?, ?, ?, ?)`,
     )
-    .run(id, kind, opts?.processAfter ?? null, opts?.trigger ?? 1, JSON.stringify(content));
+    .run(id, kind, opts?.processAfter ?? null, opts?.trigger ?? 1, opts?.onWake ?? 0, JSON.stringify(content));
 }
 
 describe('formatter', () => {
@@ -32,13 +38,15 @@ describe('formatter', () => {
     expect(prompt).toContain('Hello world');
   });
 
-  it('should format multiple chat messages as XML block', () => {
+  it('should format multiple chat messages as distinct <message> blocks', () => {
     insertMessage('m1', 'chat', { sender: 'John', text: 'Hello' });
     insertMessage('m2', 'chat', { sender: 'Jane', text: 'Hi there' });
     const messages = getPendingMessages();
     const prompt = formatMessages(messages);
-    expect(prompt).toContain('<messages>');
-    expect(prompt).toContain('</messages>');
+    // The <messages> envelope was dropped in fe2e881b (#2556) so the SDK calls
+    // the API; each message is now its own self-contained <message> block.
+    expect(prompt).not.toContain('<messages>');
+    expect(prompt.match(/<message /g) ?? []).toHaveLength(2);
     expect(prompt).toContain('sender="John"');
     expect(prompt).toContain('sender="Jane"');
   });
@@ -128,6 +136,58 @@ describe('accumulate gate (trigger column)', () => {
       .run();
     const [msg] = getPendingMessages();
     expect(msg.trigger).toBe(1);
+  });
+});
+
+describe('on_wake filtering', () => {
+  it('first poll returns on_wake=1 messages', () => {
+    insertMessage('m1', 'chat', { sender: 'system', text: 'Resuming.' }, { onWake: 1 });
+    const messages = getPendingMessages(true);
+    expect(messages).toHaveLength(1);
+    expect(messages[0].id).toBe('m1');
+  });
+
+  it('subsequent polls skip on_wake=1 messages', () => {
+    insertMessage('m1', 'chat', { sender: 'system', text: 'Resuming.' }, { onWake: 1 });
+    const messages = getPendingMessages(false);
+    expect(messages).toHaveLength(0);
+  });
+
+  it('normal messages returned regardless of isFirstPoll', () => {
+    insertMessage('m1', 'chat', { sender: 'A', text: 'hello' });
+    expect(getPendingMessages(true)).toHaveLength(1);
+
+    // Reset: mark completed so we can re-test with a fresh message
+    markCompleted(['m1']);
+    insertMessage('m2', 'chat', { sender: 'A', text: 'hello again' });
+    expect(getPendingMessages(false)).toHaveLength(1);
+  });
+
+  it('mixed batch: first poll returns both normal and on_wake messages', () => {
+    insertMessage('m1', 'chat', { sender: 'A', text: 'user msg' });
+    insertMessage('m2', 'chat', { sender: 'system', text: 'Resuming.' }, { onWake: 1 });
+    const messages = getPendingMessages(true);
+    expect(messages).toHaveLength(2);
+    expect(messages.map((m) => m.id).sort()).toEqual(['m1', 'm2']);
+  });
+
+  it('mixed batch: subsequent poll returns only normal messages', () => {
+    insertMessage('m1', 'chat', { sender: 'A', text: 'user msg' });
+    insertMessage('m2', 'chat', { sender: 'system', text: 'Resuming.' }, { onWake: 1 });
+    const messages = getPendingMessages(false);
+    expect(messages).toHaveLength(1);
+    expect(messages[0].id).toBe('m1');
+  });
+
+  it('on_wake defaults to 0 for inserts without explicit value', () => {
+    getInboundDb()
+      .prepare(
+        `INSERT INTO messages_in (id, kind, timestamp, status, content)
+         VALUES ('m1', 'chat', datetime('now'), 'pending', '{"text":"hi"}')`,
+      )
+      .run();
+    // Should be returned even on non-first poll (on_wake=0)
+    expect(getPendingMessages(false)).toHaveLength(1);
   });
 });
 
@@ -316,5 +376,196 @@ describe('end-to-end with mock provider', () => {
     expect(outMessages).toHaveLength(1);
     expect(JSON.parse(outMessages[0].content).text).toBe('The answer is 4');
     expect(outMessages[0].in_reply_to).toBe('m1');
+  });
+});
+
+// [PATCH-myia #28] Tool-stuck budget watchdog. Models the 2026-05-18 incident
+// where mcp__roo-state-manager__roosync_dashboard hung for 22h while #26's
+// SDK-event watchdog kept rearming. The decision is purely time-based on
+// container_state, so we test the pure helper rather than the setInterval.
+describe('[PATCH-myia #28] evaluateToolStuckBudget', () => {
+  const NOW = Date.parse('2026-05-19T00:00:00.000Z');
+  const DEFAULT = 5 * 60 * 1000;
+
+  it('returns abort:false when no tool is in flight (state null)', () => {
+    expect(evaluateToolStuckBudget(null, NOW).abort).toBe(false);
+  });
+
+  it('returns abort:false when current_tool is null', () => {
+    const r = evaluateToolStuckBudget(
+      { current_tool: null, tool_declared_timeout_ms: null, tool_started_at: null },
+      NOW,
+    );
+    expect(r.abort).toBe(false);
+  });
+
+  it('returns abort:false when tool_started_at is null (defensive)', () => {
+    const r = evaluateToolStuckBudget(
+      { current_tool: 'mcp__roo-state-manager__roosync_dashboard', tool_declared_timeout_ms: null, tool_started_at: null },
+      NOW,
+    );
+    expect(r.abort).toBe(false);
+  });
+
+  it('returns abort:false when tool_started_at is unparseable (defensive)', () => {
+    const r = evaluateToolStuckBudget(
+      { current_tool: 'Bash', tool_declared_timeout_ms: null, tool_started_at: 'not a date' },
+      NOW,
+    );
+    expect(r.abort).toBe(false);
+  });
+
+  it('does not abort a fresh tool call (1s elapsed << default budget)', () => {
+    const r = evaluateToolStuckBudget(
+      {
+        current_tool: 'mcp__roo-state-manager__roosync_dashboard',
+        tool_declared_timeout_ms: null,
+        tool_started_at: new Date(NOW - 1000).toISOString(),
+      },
+      NOW,
+    );
+    expect(r.abort).toBe(false);
+  });
+
+  it('does not abort just before the default budget elapses', () => {
+    const r = evaluateToolStuckBudget(
+      {
+        current_tool: 'mcp__roo-state-manager__roosync_dashboard',
+        tool_declared_timeout_ms: null,
+        tool_started_at: new Date(NOW - (DEFAULT - 1)).toISOString(),
+      },
+      NOW,
+    );
+    expect(r.abort).toBe(false);
+  });
+
+  it('aborts an MCP tool stuck past the default 5min budget', () => {
+    const r = evaluateToolStuckBudget(
+      {
+        current_tool: 'mcp__roo-state-manager__roosync_dashboard',
+        tool_declared_timeout_ms: null,
+        tool_started_at: new Date(NOW - 22 * 3600 * 1000).toISOString(), // 22h — the 2026-05-18 incident
+      },
+      NOW,
+    );
+    expect(r.abort).toBe(true);
+    if (r.abort) {
+      expect(r.tool).toBe('mcp__roo-state-manager__roosync_dashboard');
+      expect(r.elapsedMs).toBeGreaterThanOrEqual(22 * 3600 * 1000);
+      expect(r.budgetMs).toBe(DEFAULT);
+      expect(r.declaredMs).toBeNull();
+    }
+  });
+
+  it('respects a declared timeout with 1.5x slack (no abort within 1.5x)', () => {
+    // Bash with a 10min user-declared timeout: budget = max(10min*1.5, 5min) = 15min
+    const declared = 10 * 60 * 1000;
+    const r = evaluateToolStuckBudget(
+      {
+        current_tool: 'Bash',
+        tool_declared_timeout_ms: declared,
+        tool_started_at: new Date(NOW - 14 * 60 * 1000).toISOString(),
+      },
+      NOW,
+    );
+    expect(r.abort).toBe(false);
+  });
+
+  it('aborts when elapsed exceeds 1.5x declared timeout', () => {
+    const declared = 10 * 60 * 1000;
+    const r = evaluateToolStuckBudget(
+      {
+        current_tool: 'Bash',
+        tool_declared_timeout_ms: declared,
+        tool_started_at: new Date(NOW - 16 * 60 * 1000).toISOString(),
+      },
+      NOW,
+    );
+    expect(r.abort).toBe(true);
+    if (r.abort) {
+      expect(r.budgetMs).toBe(15 * 60 * 1000); // 1.5x declared
+      expect(r.declaredMs).toBe(declared);
+    }
+  });
+
+  it('uses the default budget when declared is less than default (floor)', () => {
+    // A 1min declared timeout shouldn't shrink the budget below 5min default
+    const declared = 60 * 1000;
+    const r = evaluateToolStuckBudget(
+      {
+        current_tool: 'mcp__sk-agent__call_agent',
+        tool_declared_timeout_ms: declared,
+        tool_started_at: new Date(NOW - 4 * 60 * 1000).toISOString(),
+      },
+      NOW,
+    );
+    expect(r.abort).toBe(false); // 4min < 5min default floor
+  });
+
+  it('accepts a custom default budget for tests', () => {
+    const r = evaluateToolStuckBudget(
+      {
+        current_tool: 'Bash',
+        tool_declared_timeout_ms: null,
+        tool_started_at: new Date(NOW - 11_000).toISOString(),
+      },
+      NOW,
+      10_000,
+    );
+    expect(r.abort).toBe(true);
+  });
+});
+
+// [PATCH-myia #28 startup cleanup] A container killed by the host (ceiling /
+// claim-stuck) or crashed mid-tool leaves a stale container_state row whose
+// tool_started_at points at the dead container's clock — PostToolUse never
+// fired to clear it. The next container's first tool-stuck check would read
+// that row and spuriously abort a brand-new query. runPollLoop now clears the
+// row at startup (alongside clearStaleProcessingAcks). This reproduces the
+// 7qx60e zombie (a roosync_dashboard call left in flight that survived
+// restarts) and proves the cleanup defuses it.
+describe('[PATCH-myia #28] startup container_state cleanup', () => {
+  it('clearContainerToolInFlight defuses a stale in-flight row left by a dead container', async () => {
+    const { setContainerToolInFlight, clearContainerToolInFlight, getContainerToolInFlight } =
+      await import('./db/connection.js');
+
+    // Simulate the zombie: a dashboard call claimed in flight by a container
+    // that was then killed, with tool_started_at far in the past.
+    setContainerToolInFlight('mcp__roo-state-manager__roosync_dashboard', 600_000);
+    getOutboundDb()
+      .prepare(`UPDATE container_state SET tool_started_at = ? WHERE id = 1`)
+      .run(new Date(Date.now() - 12 * 3600 * 1000).toISOString());
+
+    // Before cleanup: a fresh container's first watchdog tick would abort.
+    const stale = getContainerToolInFlight();
+    expect(evaluateToolStuckBudget(stale, Date.now()).abort).toBe(true);
+
+    // Startup cleanup — what runPollLoop now runs next to clearStaleProcessingAcks.
+    clearContainerToolInFlight();
+
+    const cleared = getContainerToolInFlight();
+    expect(cleared?.current_tool).toBeNull();
+    expect(cleared?.tool_started_at).toBeNull();
+    expect(evaluateToolStuckBudget(cleared, Date.now()).abort).toBe(false);
+  });
+});
+
+// Upstream corruption-detection helper. Pairs with CORRUPTION_STREAK_EXIT in
+// poll-loop.ts — when 10 successive errors match this predicate, the runner
+// hard-exits so the host can recreate the cross-mount session DBs cleanly.
+describe('isCorruptionError', () => {
+  it('matches the Docker Desktop macOS torn-read symptom', () => {
+    expect(isCorruptionError('database disk image is malformed')).toBe(true);
+  });
+
+  it('matches wrapped SQLite corruption codes', () => {
+    expect(isCorruptionError('SqliteError: SQLITE_CORRUPT_VTAB: ...')).toBe(true);
+    expect(isCorruptionError('file is not a database')).toBe(true);
+  });
+
+  it('returns false for unrelated errors', () => {
+    expect(isCorruptionError('database is locked')).toBe(false);
+    expect(isCorruptionError('no such table: messages_in')).toBe(false);
+    expect(isCorruptionError('')).toBe(false);
   });
 });
