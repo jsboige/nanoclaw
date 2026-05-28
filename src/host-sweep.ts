@@ -372,9 +372,7 @@ async function resetStuckProcessingRows(
       // the audit trail is intact either way.
       // MODULE-HOOK:scheduling-recurrence-failure:start
       try {
-        const { advanceRecurringTaskAfterFailure } = await import(
-          './modules/scheduling/recurrence.js'
-        );
+        const { advanceRecurringTaskAfterFailure } = await import('./modules/scheduling/recurrence.js');
         await advanceRecurringTaskAfterFailure(inDb, msg.id, session);
       } catch (err) {
         log.error('Auto-advance threw while handling MAX_TRIES failure', {

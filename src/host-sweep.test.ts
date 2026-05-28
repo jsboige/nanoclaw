@@ -343,24 +343,25 @@ describe('resetStuckProcessingRows — orphan claim cleanup', () => {
     await _resetStuckProcessingRowsForTesting(inDb, outDb, fakeSession(), 'claim-stuck');
 
     // The failed row is sealed for audit and its recurrence is cleared.
-    const failed = inDb
-      .prepare('SELECT status, recurrence FROM messages_in WHERE id = ?')
-      .get('task-recur') as { status: string; recurrence: string | null };
+    const failed = inDb.prepare('SELECT status, recurrence FROM messages_in WHERE id = ?').get('task-recur') as {
+      status: string;
+      recurrence: string | null;
+    };
     expect(failed.status).toBe('failed');
     expect(failed.recurrence).toBeNull();
 
     // The series carries forward as a new pending row with same recurrence.
     const carry = inDb
-      .prepare(
-        "SELECT id, status, recurrence, series_id, process_after FROM messages_in WHERE id != 'task-recur'",
-      )
-      .get() as {
-      id: string;
-      status: string;
-      recurrence: string | null;
-      series_id: string;
-      process_after: string;
-    } | undefined;
+      .prepare("SELECT id, status, recurrence, series_id, process_after FROM messages_in WHERE id != 'task-recur'")
+      .get() as
+      | {
+          id: string;
+          status: string;
+          recurrence: string | null;
+          series_id: string;
+          process_after: string;
+        }
+      | undefined;
     expect(carry).toBeDefined();
     expect(carry!.status).toBe('pending');
     expect(carry!.recurrence).toBe('15 8-22 * * *');
