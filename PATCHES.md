@@ -227,6 +227,14 @@ If none works, document the patch here with justification.
 - **Exit condition:** Either (a) upstream adopts retry-with-backoff for the container runtime probe (we should file an issue/PR), or (b) the host gains a "degraded mode" where channel adapters keep running for inbound buffering while the runtime is unreachable. Until then, this patch is the right shape: don't conflate a transient pipe failure with "Docker not installed".
 - **Lines:** ~50 (function rewrite + caller `await` + 4 vitest cases including the hiccup-recovery path).
 
+### 34. Auto-advance recurring tasks past MAX_TRIES failure (sweep safety net)
+
+- **File:** `src/host-sweep.ts` (`resetStuckProcessingRows` — call new helper inside the `tries >= MAX_TRIES` branch before `markMessageFailed`; functions and test helper made `async` to allow the dynamic import in the same style as `handleRecurrence`); `src/modules/scheduling/recurrence.ts` (new `advanceRecurringTaskAfterFailure` exported alongside `handleRecurrence`).
+- **Summary:** When a `messages_in` row carrying a cron `recurrence` is about to be sealed as `failed` after MAX_TRIES (transient stall / session-invalid / OneCLI cascade), enqueue the next series instance via the same `cron-parser + insertRecurrence + clearRecurrence` flow used by `handleRecurrence`. The failed row keeps `status='failed'` (with `recurrence` cleared) for audit; the new pending row carries the series forward with the same `series_id`. Pre-fix path: `handleRecurrence` only ever picks up `status='completed' AND recurrence IS NOT NULL`, so once a row was marked failed the cron series was silently dead — no operator alert, no next instance. Post-fix: a single chain-flap cascade no longer kills the series.
+- **Why:** Reproduced 2026-05-28 with the ClusterManager `15 8-22 * * *` and `30 8-22 * * *` review crons on the `main` agent group. Stall retries (PATCH #26 `stalledAborted` flagging) exhausted MAX_TRIES around 10:00Z, both rows were marked `failed`, then `handleRecurrence` skipped them forever. The bot went silent on its review schedule for ~3h before the user noticed. Manual recovery had to flip the rows back to `completed` so the recurrence engine would re-pick them up — not scalable. The safety net moves recovery into the sweep itself.
+- **Exit condition:** Upstream changes the recurrence engine to also pick up `status='failed' AND recurrence IS NOT NULL`, or removes the dual-status filter entirely.
+- **Lines:** ~60 host (helper + import + 1 call-site wrap + async signature plumbing) + ~140 tests (6 helper cases in `recurrence.test.ts` + 1 integration case in `host-sweep.test.ts`).
+
 ### 33. Runtime-path OneCLI / Docker transient retry (extends #22 intent)
 
 - **File:** `src/container-runtime.ts` (new `retryOnTransientRuntimeError` helper + `isTransientRuntimeError` + `TRANSIENT_ERROR_MARKERS` constant); `src/container-runner.ts` (wraps the two OneCLI calls — `ensureAgent` and `applyContainerConfig` — at spawn time).
