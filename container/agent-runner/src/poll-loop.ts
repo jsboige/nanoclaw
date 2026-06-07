@@ -1377,19 +1377,40 @@ function handleEvent(event: ProviderEvent, _routing: RoutingContext): void {
  */
 function dispatchResultText(text: string, routing: RoutingContext): { sent: number; hasUnwrapped: boolean } {
   const MESSAGE_RE = /<message\s+to="([^"]+)"\s*>([\s\S]*?)<\/message>/g;
+  // [PATCH-myia #36] Cap messages per LLM response. Without this, a looping
+  // model (observed with GLM: 500+ identical <message> blocks in one response)
+  // floods messages_out and triggers a delivery runaway. 10 is generous — normal
+  // agent turns produce 1-3 messages (one per destination). Hitting the cap logs
+  // a warning and stops processing further blocks in this response.
+  const MAX_MESSAGES_PER_POLL = 10;
 
   let match: RegExpExecArray | null;
   let sent = 0;
   let lastIndex = 0;
   const scratchpadParts: string[] = [];
+  const seenMessages = new Set<string>(); // dedup for #36
 
   while ((match = MESSAGE_RE.exec(text)) !== null) {
+    if (sent >= MAX_MESSAGES_PER_POLL) {
+      log(`WARNING: hit MAX_MESSAGES_PER_POLL (${MAX_MESSAGES_PER_POLL}) — dropping remaining <message> blocks in this response`);
+      scratchpadParts.push(text.slice(lastIndex));
+      break;
+    }
     if (match.index > lastIndex) {
       scratchpadParts.push(text.slice(lastIndex, match.index));
     }
     const toName = match[1];
     const body = match[2].trim();
     lastIndex = MESSAGE_RE.lastIndex;
+
+    // [PATCH-myia #36] Dedup: skip if we already sent an identical message to
+    // the same destination in this response. Catches the GLM loop pattern where
+    // the model emits 100+ identical <message to="X">blocks.
+    const dedupKey = `${toName}:${body}`;
+    if (seenMessages.has(dedupKey)) {
+      continue;
+    }
+    seenMessages.add(dedupKey);
 
     const dest = findByName(toName);
     if (!dest) {
