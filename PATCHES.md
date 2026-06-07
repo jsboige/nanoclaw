@@ -251,6 +251,14 @@ If none works, document the patch here with justification.
 - **Exit condition:** Upstream's poll-loop adds a message cap per response in `dispatchResultText`, OR the Claude Agent SDK adds server-side output length limiting that prevents a single response from containing more than ~10 message blocks.
 - **Lines:** ~15 container (constant + Set init + cap check + dedup check) + ~50 tests (3 integration test cases).
 
+### 37. Cap send_message MCP tool calls per batch (tool-call loop defense)
+
+- **File:** `container/agent-runner/src/current-batch.ts` (`MAX_SENDS_PER_BATCH=20` constant; `batchSendCount` counter; `checkAndIncrementSendCount()` returns `true` when cap exceeded; counter reset in `clearCurrentInReplyTo`); `container/agent-runner/src/mcp-tools/core.ts` (`sendMessage.handler` — cap check before `writeMessageOut`); `container/agent-runner/src/mcp-tools/core.test.ts` (3 new test cases: allow up to 20, reject beyond cap, reset on batch clear).
+- **Summary:** PATCH #36 caps `<message to>` text blocks in `dispatchResultText`, but the GLM model can also loop on **MCP tool calls** — calling `send_message` with identical args 40+ times in a single batch. Each call writes directly to `messages_out` via `writeMessageOut`, bypassing the text-block cap entirely. On 2026-06-07 (second runaway same day), the bot emitted 39 "stop loop" messages via repeated `send_message` calls while trying to stop itself. PATCH #37 adds a per-batch counter in `current-batch.ts` (reset at each poll-loop batch boundary via `clearCurrentInReplyTo`) and checks it in `sendMessage.handler`. After 20 calls, subsequent `send_message` calls return an error, breaking the tool-call loop.
+- **Why:** 2026-06-07 second ClusterManager runaway. Same root cause as PATCH #36 (GLM production loop) but through a different vector (MCP tool calls vs text blocks). The model was self-aware ("stop loop") but couldn't break out of its own tool-call repetition.
+- **Exit condition:** Upstream adds a per-tool call cap in the MCP tool layer, OR the Claude Agent SDK adds server-side tool-call rate limiting that prevents repeated identical calls within a single turn.
+- **Lines:** ~15 container (counter + check in current-batch + guard in core.ts) + ~30 tests (3 bun:test cases).
+
 ### 33. Runtime-path OneCLI / Docker transient retry (extends #22 intent)
 
 - **File:** `src/container-runtime.ts` (new `retryOnTransientRuntimeError` helper + `isTransientRuntimeError` + `TRANSIENT_ERROR_MARKERS` constant); `src/container-runner.ts` (wraps the two OneCLI calls — `ensureAgent` and `applyContainerConfig` — at spawn time).

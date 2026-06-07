@@ -15,15 +15,30 @@
  */
 let currentInReplyTo: string | null = null;
 
+// [PATCH-myia #37] Per-batch send_message call counter. Prevents GLM tool-call
+// loops where the model calls send_message with identical args hundreds of times
+// in a single batch. PATCH #36 caps <message to> blocks in the text output, but
+// tool-call loops bypass that entirely — each call writes directly to messages_out.
+// The cap is generous (20) to avoid blocking legitimate multi-destination sends.
+const MAX_SENDS_PER_BATCH = 20;
+let batchSendCount = 0;
+
 export function setCurrentInReplyTo(id: string | null): void {
   currentInReplyTo = id;
 }
 
 export function clearCurrentInReplyTo(): void {
   currentInReplyTo = null;
+  batchSendCount = 0; // reset on batch boundary
 }
 
 export function getCurrentInReplyTo(): string | null {
   return currentInReplyTo;
+}
+
+/** [PATCH-myia #37] Increment send count and check if the batch cap has been hit. */
+export function checkAndIncrementSendCount(): boolean {
+  batchSendCount++;
+  return batchSendCount > MAX_SENDS_PER_BATCH;
 }
 
