@@ -467,3 +467,72 @@ class InvalidSessionProvider {
     };
   }
 }
+
+describe('PATCH #36 — dispatchResultText cap and dedup', () => {
+  it('should cap outbound messages at 10 per poll iteration', async () => {
+    insertMessage('m1', { sender: 'Alice', text: 'trigger' }, { platformId: 'chan-1', channelType: 'discord' });
+
+    // Provider returns 15 identical <message> blocks — only 10 should be written
+    const blocks = Array.from({ length: 15 }, () => '<message to="discord-test">spam</message>').join('\n');
+    const provider = new MockProvider({}, () => blocks);
+
+    const controller = new AbortController();
+    const loopPromise = runPollLoopWithTimeout(provider, controller.signal, 2000);
+
+    await waitFor(() => getUndeliveredMessages().length > 0, 2000);
+    controller.abort();
+
+    const out = getUndeliveredMessages();
+    // With dedup, only 1 unique message should survive (all 15 are identical)
+    // But the cap at 10 means at most 10 are even considered
+    expect(out.length).toBeLessThanOrEqual(10);
+
+    await loopPromise.catch(() => {});
+  });
+
+  it('should deduplicate identical <message> blocks in a single response', async () => {
+    insertMessage('m1', { sender: 'Alice', text: 'trigger' }, { platformId: 'chan-1', channelType: 'discord' });
+
+    // 5 identical messages — only 1 should be written
+    const blocks = Array.from({ length: 5 }, () => '<message to="discord-test">duplicate content</message>').join('\n');
+    const provider = new MockProvider({}, () => blocks);
+
+    const controller = new AbortController();
+    const loopPromise = runPollLoopWithTimeout(provider, controller.signal, 2000);
+
+    await waitFor(() => getUndeliveredMessages().length > 0, 2000);
+    controller.abort();
+
+    const out = getUndeliveredMessages();
+    expect(out).toHaveLength(1);
+    expect(JSON.parse(out[0].content).text).toBe('duplicate content');
+
+    await loopPromise.catch(() => {});
+  });
+
+  it('should allow different messages to different destinations', async () => {
+    getInboundDb()
+      .prepare(
+        `INSERT INTO destinations (name, display_name, type, channel_type, platform_id, agent_group_id)
+         VALUES ('slack-test', 'Slack Test', 'channel', 'slack', 'chan-2', NULL)`,
+      )
+      .run();
+
+    insertMessage('m1', { sender: 'Alice', text: 'trigger' }, { platformId: 'chan-1', channelType: 'discord' });
+
+    const provider = new MockProvider({}, () =>
+      '<message to="discord-test">hello discord</message>\n<message to="slack-test">hello slack</message>',
+    );
+
+    const controller = new AbortController();
+    const loopPromise = runPollLoopWithTimeout(provider, controller.signal, 2000);
+
+    await waitFor(() => getUndeliveredMessages().length >= 2, 2000);
+    controller.abort();
+
+    const out = getUndeliveredMessages();
+    expect(out).toHaveLength(2);
+
+    await loopPromise.catch(() => {});
+  });
+});

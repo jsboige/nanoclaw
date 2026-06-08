@@ -167,6 +167,52 @@ const IDLE_KEEPALIVE_MS = 2 * 60 * 60 * 1000;
 const BLOCKED_NOTICE_THROTTLE_MS = 5 * 60 * 1000;
 const BLOCKED_RETRY_BACKOFF_MS = 10_000;
 
+// [PATCH-myia #35] Cap consecutive isSessionInvalid retries on the same
+// processingIds set so the reactive PATCH #31 path can't loop forever when
+// the failure is persistent (not transient). PATCH #31 was designed for a
+// brief MCP-init handshake blip that the next iteration would clear; the
+// 2026-05-28 cert SAN gap exposed a persistent failure mode (TLS workaround
+// makes the proactive `mcp-health` probe pass while the SDK's own MCP init
+// still rejects). Without an upper bound, a single cron firing emitted one
+// "Review cycle :30 starting" PING per retry until the host killed the
+// container. Cap chosen as 3: enough to cover a transient init handshake
+// (1-2 retries typical), tight enough to keep per-cycle Telegram noise
+// within the user's "<=3 lines per cycle" directive (2026-05-27). On cap
+// exhaustion, batchError records 'stale_retry_cap_exhausted' so
+// task_run_logs reflects the failure truthfully; markCompleted fires so the
+// host's syncProcessingAcks + handleRecurrence advance the cron series at
+// the next sweep tick instead of looping the same dead message.
+const STALE_RETRY_CAP = 3;
+
+/**
+ * [PATCH-myia #35] Pure decision: increment the per-message-id stale-retry
+ * counters for this batch and report whether any has reached the cap.
+ *
+ * Exported as a pure helper so the test doesn't have to spin up the whole
+ * poll loop. The caller owns the Map; this function mutates it in place
+ * (caller controls lifetime — typically scoped to one `runPollLoop`
+ * invocation, cleared on successful or surrendered batches).
+ *
+ * Returns `{ exhausted: true }` once any id in `processingIds` has been
+ * seen `cap` consecutive times without a clearing event. The caller's
+ * responsibility on `exhausted`: delete the counter entries for these ids
+ * and fall through to `markCompleted` so the host's `handleRecurrence`
+ * advances the cron series at the next sweep tick.
+ */
+export function evaluateStaleRetryCap(
+  counter: Map<string, number>,
+  processingIds: string[],
+  cap: number = STALE_RETRY_CAP,
+): { exhausted: boolean; maxRetries: number } {
+  let maxRetries = 0;
+  for (const id of processingIds) {
+    const next = (counter.get(id) ?? 0) + 1;
+    counter.set(id, next);
+    if (next > maxRetries) maxRetries = next;
+  }
+  return { exhausted: maxRetries >= cap, maxRetries };
+}
+
 /**
  * [PATCH-myia #28] Pure decision: should we abort because a tool has been
  * pending too long? Exported so unit tests don't have to spin up an SDK.
@@ -304,6 +350,12 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
   // [PATCH-myia #29] When we last posted a 🛑 BLOCKED notice (0 = never).
   // Throttles the user-visible message while the MCP chain is flapping.
   let lastBlockedNoticeAt = 0;
+  // [PATCH-myia #35] Per-message-id counter of consecutive
+  // isSessionInvalid retries since the last successful (or surrendered)
+  // batch. Reset on success; entries for ids that get markCompleted
+  // (success OR cap exhaustion) are removed so future re-queued rows start
+  // fresh. Container respawn on next cron also clears this.
+  const staleRetryCount = new Map<string, number>();
   let isFirstPoll = true;
   while (true) {
     // Skip system messages — they're responses for MCP tools (e.g., ask_user_question)
@@ -588,27 +640,50 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
         // providers/claude.ts — currently: "no conversation found",
         // "ENOENT.*\.jsonl", "session.*not found", "MCP servers not
         // connected at init", "MCP registry lost mid-session".
-        const nowBlocked = Date.now();
-        if (
-          routing.platformId &&
-          routing.channelType &&
-          nowBlocked - lastBlockedNoticeAt >= BLOCKED_NOTICE_THROTTLE_MS
-        ) {
-          lastBlockedNoticeAt = nowBlocked;
-          writeMessageOut({
-            id: generateId(),
-            kind: 'chat',
-            platform_id: routing.platformId,
-            channel_type: routing.channelType,
-            thread_id: routing.threadId,
-            content: JSON.stringify({
-              text: `🔄 Transient session error — holding your message, I'll retry once the chain recovers.`,
-            }),
-          });
+        //
+        // [PATCH-myia #35] Bound the retry loop. Without a cap, a
+        // persistent failure (e.g. cert SAN gap making MCP init reject on
+        // every attempt) creates a hot loop: PATCH #31 resets the ack,
+        // sleeps BLOCKED_RETRY_BACKOFF_MS, the next iteration re-picks the
+        // same processingIds and re-spawns a fresh agent → fresh "starting"
+        // PING → same SDK error → loop forever. The user-visible system
+        // notice is throttled, but the agent-emitted PINGs are not. After
+        // STALE_RETRY_CAP consecutive failures on this id set, surrender:
+        // fall through to markCompleted so the host's syncProcessingAcks
+        // marks messages_in.status='completed', and host-sweep's
+        // handleRecurrence advances the cron series at the next tick
+        // (functionally equivalent to PATCH #34's MAX_TRIES path).
+        const capDecision = evaluateStaleRetryCap(staleRetryCount, processingIds, STALE_RETRY_CAP);
+        if (capDecision.exhausted) {
+          log(
+            `Stale retry cap (${STALE_RETRY_CAP}) reached for ${processingIds.length} message(s) — surrendering, markCompleted will let host advance recurrence`,
+          );
+          for (const id of processingIds) staleRetryCount.delete(id);
+          batchError = 'stale_retry_cap_exhausted';
+          // Fall through: stalledAborted stays false → markCompleted runs.
+        } else {
+          const nowBlocked = Date.now();
+          if (
+            routing.platformId &&
+            routing.channelType &&
+            nowBlocked - lastBlockedNoticeAt >= BLOCKED_NOTICE_THROTTLE_MS
+          ) {
+            lastBlockedNoticeAt = nowBlocked;
+            writeMessageOut({
+              id: generateId(),
+              kind: 'chat',
+              platform_id: routing.platformId,
+              channel_type: routing.channelType,
+              thread_id: routing.threadId,
+              content: JSON.stringify({
+                text: `🔄 Transient session error — holding your message, I'll retry once the chain recovers.`,
+              }),
+            });
+          }
+          resetProcessingAcks(processingIds);
+          stalledAborted = true;
+          await sleep(BLOCKED_RETRY_BACKOFF_MS);
         }
-        resetProcessingAcks(processingIds);
-        stalledAborted = true;
-        await sleep(BLOCKED_RETRY_BACKOFF_MS);
       } else {
         writeMessageOut({
           id: generateId(),
@@ -632,6 +707,12 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
     // iteration.
     if (!stalledAborted) {
       markCompleted(processingIds);
+      // [PATCH-myia #35] Counter cleanup. Whether the batch succeeded or
+      // we surrendered after the cap, the message is now finalized — clear
+      // the counter so any subsequently re-queued row with the same id
+      // (none expected today, but defensive against future retry policies)
+      // starts with a fresh budget.
+      for (const id of processingIds) staleRetryCount.delete(id);
       log(`Completed ${ids.length} message(s)`);
     } else {
       log(`Stall-aborted batch — skipping markCompleted so reset-to-pending sticks`);
@@ -1296,19 +1377,40 @@ function handleEvent(event: ProviderEvent, _routing: RoutingContext): void {
  */
 function dispatchResultText(text: string, routing: RoutingContext): { sent: number; hasUnwrapped: boolean } {
   const MESSAGE_RE = /<message\s+to="([^"]+)"\s*>([\s\S]*?)<\/message>/g;
+  // [PATCH-myia #36] Cap messages per LLM response. Without this, a looping
+  // model (observed with GLM: 500+ identical <message> blocks in one response)
+  // floods messages_out and triggers a delivery runaway. 10 is generous — normal
+  // agent turns produce 1-3 messages (one per destination). Hitting the cap logs
+  // a warning and stops processing further blocks in this response.
+  const MAX_MESSAGES_PER_POLL = 10;
 
   let match: RegExpExecArray | null;
   let sent = 0;
   let lastIndex = 0;
   const scratchpadParts: string[] = [];
+  const seenMessages = new Set<string>(); // dedup for #36
 
   while ((match = MESSAGE_RE.exec(text)) !== null) {
+    if (sent >= MAX_MESSAGES_PER_POLL) {
+      log(`WARNING: hit MAX_MESSAGES_PER_POLL (${MAX_MESSAGES_PER_POLL}) — dropping remaining <message> blocks in this response`);
+      scratchpadParts.push(text.slice(lastIndex));
+      break;
+    }
     if (match.index > lastIndex) {
       scratchpadParts.push(text.slice(lastIndex, match.index));
     }
     const toName = match[1];
     const body = match[2].trim();
     lastIndex = MESSAGE_RE.lastIndex;
+
+    // [PATCH-myia #36] Dedup: skip if we already sent an identical message to
+    // the same destination in this response. Catches the GLM loop pattern where
+    // the model emits 100+ identical <message to="X">blocks.
+    const dedupKey = `${toName}:${body}`;
+    if (seenMessages.has(dedupKey)) {
+      continue;
+    }
+    seenMessages.add(dedupKey);
 
     const dest = findByName(toName);
     if (!dest) {

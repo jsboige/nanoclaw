@@ -4,7 +4,7 @@ import { initTestSessionDb, closeSessionDb, getInboundDb, getOutboundDb } from '
 import { getPendingMessages, markCompleted } from './db/messages-in.js';
 import { getUndeliveredMessages } from './db/messages-out.js';
 import { formatMessages, extractRouting } from './formatter.js';
-import { evaluateToolStuckBudget, isCorruptionError } from './poll-loop.js'; // [PATCH-myia #28] evaluateToolStuckBudget
+import { evaluateStaleRetryCap, evaluateToolStuckBudget, isCorruptionError } from './poll-loop.js'; // [PATCH-myia #28] evaluateToolStuckBudget, [PATCH-myia #35] evaluateStaleRetryCap
 import { MockProvider } from './providers/mock.js';
 
 beforeEach(() => {
@@ -547,6 +547,81 @@ describe('[PATCH-myia #28] startup container_state cleanup', () => {
     expect(cleared?.current_tool).toBeNull();
     expect(cleared?.tool_started_at).toBeNull();
     expect(evaluateToolStuckBudget(cleared, Date.now()).abort).toBe(false);
+  });
+});
+
+// [PATCH-myia #35] Stale-retry cap. PATCH #31 introduced a soft fail-fast loop
+// for transient SDK init failures (resetProcessingAcks + sleep + retry). The
+// 2026-05-28 cert SAN gap revealed that the loop had no upper bound: a
+// persistent failure (TLS-workaround on, but SDK MCP init still rejecting)
+// produced one "Review cycle :30 starting" PING per retry until the host
+// killed the container. The fix is a per-id counter that flips
+// `stalledAborted=false` on cap exhaustion so markCompleted runs and the host's
+// handleRecurrence advances the cron series at the next sweep.
+describe('[PATCH-myia #35] evaluateStaleRetryCap', () => {
+  it('first failure on a single id does not exhaust', () => {
+    const counter = new Map<string, number>();
+    const decision = evaluateStaleRetryCap(counter, ['task-1'], 3);
+    expect(decision.exhausted).toBe(false);
+    expect(decision.maxRetries).toBe(1);
+    expect(counter.get('task-1')).toBe(1);
+  });
+
+  it('exhausts when any id in the batch reaches the cap', () => {
+    const counter = new Map<string, number>();
+    evaluateStaleRetryCap(counter, ['task-1'], 3);
+    evaluateStaleRetryCap(counter, ['task-1'], 3);
+    const third = evaluateStaleRetryCap(counter, ['task-1'], 3);
+    expect(third.exhausted).toBe(true);
+    expect(third.maxRetries).toBe(3);
+  });
+
+  it('does not exhaust before the cap', () => {
+    const counter = new Map<string, number>();
+    evaluateStaleRetryCap(counter, ['task-1'], 3);
+    const second = evaluateStaleRetryCap(counter, ['task-1'], 3);
+    expect(second.exhausted).toBe(false);
+    expect(second.maxRetries).toBe(2);
+  });
+
+  it('accumulates per-id across batches that mix ids', () => {
+    const counter = new Map<string, number>();
+    evaluateStaleRetryCap(counter, ['task-1', 'task-2'], 3);
+    evaluateStaleRetryCap(counter, ['task-1'], 3);
+    const decision = evaluateStaleRetryCap(counter, ['task-1', 'task-2'], 3);
+    expect(decision.maxRetries).toBe(3); // task-1 hit 3 first
+    expect(decision.exhausted).toBe(true);
+    expect(counter.get('task-1')).toBe(3);
+    expect(counter.get('task-2')).toBe(2);
+  });
+
+  it('caller-driven reset (delete on markCompleted) restores fresh budget', () => {
+    const counter = new Map<string, number>();
+    evaluateStaleRetryCap(counter, ['task-1'], 3);
+    evaluateStaleRetryCap(counter, ['task-1'], 3);
+    // Simulate successful batch — caller clears entries.
+    counter.delete('task-1');
+    const fresh = evaluateStaleRetryCap(counter, ['task-1'], 3);
+    expect(fresh.exhausted).toBe(false);
+    expect(fresh.maxRetries).toBe(1);
+  });
+
+  it('a configurable cap of 2 surrenders on the second consecutive failure', () => {
+    // Documents the tuning knob: matches the user's "<=3 lines per cycle"
+    // directive at the strictest setting (1 initial attempt + 1 retry = cap).
+    const counter = new Map<string, number>();
+    const first = evaluateStaleRetryCap(counter, ['task-1'], 2);
+    expect(first.exhausted).toBe(false);
+    const second = evaluateStaleRetryCap(counter, ['task-1'], 2);
+    expect(second.exhausted).toBe(true);
+  });
+
+  it('empty batch never exhausts (defensive — no rows means no work to gate)', () => {
+    const counter = new Map<string, number>();
+    const decision = evaluateStaleRetryCap(counter, [], 3);
+    expect(decision.exhausted).toBe(false);
+    expect(decision.maxRetries).toBe(0);
+    expect(counter.size).toBe(0);
   });
 });
 

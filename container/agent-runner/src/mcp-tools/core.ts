@@ -9,7 +9,7 @@
 import fs from 'fs';
 import path from 'path';
 
-import { getCurrentInReplyTo } from '../current-batch.js';
+import { checkAndIncrementSendCount, getCurrentInReplyTo } from '../current-batch.js';
 import { findByName, getAllDestinations } from '../destinations.js';
 import { getMessageIdBySeq, getRoutingBySeq, writeMessageOut } from '../db/messages-out.js';
 import { getSessionRouting } from '../db/session-routing.js';
@@ -111,6 +111,12 @@ export const sendMessage: McpToolDefinition = {
   async handler(args) {
     const text = args.text as string;
     if (!text) return err('text is required');
+
+    // [PATCH-myia #37] Cap send_message calls per batch to prevent GLM tool-call loops.
+    if (checkAndIncrementSendCount()) {
+      log(`WARNING: send_message cap hit — dropping (tool-call loop detected)`);
+      return err('Rate limited: too many send_message calls in this batch. Stop calling send_message and move on.');
+    }
 
     const routing = resolveRouting(args.to as string | undefined);
     if ('error' in routing) return err(routing.error);
