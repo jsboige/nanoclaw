@@ -368,10 +368,10 @@ describe('poll loop — stale session recovery', () => {
     await waitFor(() => getUndeliveredMessages().length > 0, 2000);
     controller.abort();
 
-    // Error was written to outbound
+    // Error was written to outbound (PATCH #31 changed from 'Error:' to 'Transient session error')
     const out = getUndeliveredMessages();
     expect(out).toHaveLength(1);
-    expect(JSON.parse(out[0].content).text).toContain('Error:');
+    expect(JSON.parse(out[0].content).text).toContain('Transient session error');
 
     // Continuation was cleared (isSessionInvalid returned true)
     expect(getContinuation('mock')).toBeUndefined();

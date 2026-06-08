@@ -267,7 +267,7 @@ describe('deleteOrphanProcessingClaims', () => {
 });
 
 describe('resetStuckProcessingRows — orphan claim cleanup', () => {
-  it('deletes orphan processing_ack rows so next sweep tick does not see them', () => {
+  it('deletes orphan processing_ack rows so next sweep tick does not see them', async () => {
     const { inDb, outDb } = makeSessionDbs();
     const claimedAt = new Date(Date.now() - 2 * 60 * 60 * 1000).toISOString(); // 2h ago
 
@@ -284,7 +284,7 @@ describe('resetStuckProcessingRows — orphan claim cleanup', () => {
     // Sanity: the orphan claim is what would trip claim-stuck.
     expect(getProcessingClaims(outDb)).toHaveLength(1);
 
-    _resetStuckProcessingRowsForTesting(inDb, outDb, fakeSession(), 'absolute-ceiling');
+    await _resetStuckProcessingRowsForTesting(inDb, outDb, fakeSession(), 'absolute-ceiling');
 
     // Regression assertion: orphan claim is gone — next sweep tick will see
     // an empty claims list and not kill the freshly respawned container.
@@ -301,7 +301,7 @@ describe('resetStuckProcessingRows — orphan claim cleanup', () => {
     expect(row.process_after).not.toBeNull();
   });
 
-  it('still clears orphan claims even when the inbound message has already been retried (skip path)', () => {
+  it('still clears orphan claims even when the inbound message has already been retried (skip path)', async () => {
     // Edge case: the inbound row was already rescheduled (process_after in
     // future), so the per-message retry loop skips it. The orphan in
     // processing_ack must still be removed — otherwise the bug remains.
@@ -316,11 +316,57 @@ describe('resetStuckProcessingRows — orphan claim cleanup', () => {
       .run(claimedAt, future);
     outDb.prepare("INSERT INTO processing_ack VALUES ('m-2', 'processing', ?)").run(claimedAt);
 
-    _resetStuckProcessingRowsForTesting(inDb, outDb, fakeSession(), 'claim-stuck');
+    await _resetStuckProcessingRowsForTesting(inDb, outDb, fakeSession(), 'claim-stuck');
 
     expect(getProcessingClaims(outDb)).toEqual([]);
     const row = inDb.prepare('SELECT tries FROM messages_in WHERE id = ?').get('m-2') as { tries: number };
     expect(row.tries).toBe(1); // not bumped, the skip path held
+  });
+
+  // Regression: 2026-05-28 ClusterManager cron series silent for ~3h. Stall
+  // retries hit MAX_TRIES=5, row was marked 'failed', handleRecurrence's
+  // `status='completed'` filter then skipped it forever — series dead. The
+  // safety net advances the recurrence before sealing the failure.
+  it('auto-advances a recurring task when it hits MAX_TRIES instead of silently killing the series', async () => {
+    const { inDb, outDb } = makeSessionDbs();
+    const claimedAt = new Date(Date.now() - 2 * 60 * 60 * 1000).toISOString();
+
+    // Recurring task row at MAX_TRIES, still pending, same shape as the
+    // production ClusterManager rows (`15 8-22 * * *`).
+    inDb
+      .prepare(
+        "INSERT INTO messages_in (id, seq, kind, timestamp, status, tries, recurrence, series_id, content) VALUES ('task-recur', 1, 'task', ?, 'pending', 5, '15 8-22 * * *', 'task-recur', '{}')",
+      )
+      .run(claimedAt);
+    outDb.prepare("INSERT INTO processing_ack VALUES ('task-recur', 'processing', ?)").run(claimedAt);
+
+    await _resetStuckProcessingRowsForTesting(inDb, outDb, fakeSession(), 'claim-stuck');
+
+    // The failed row is sealed for audit and its recurrence is cleared.
+    const failed = inDb.prepare('SELECT status, recurrence FROM messages_in WHERE id = ?').get('task-recur') as {
+      status: string;
+      recurrence: string | null;
+    };
+    expect(failed.status).toBe('failed');
+    expect(failed.recurrence).toBeNull();
+
+    // The series carries forward as a new pending row with same recurrence.
+    const carry = inDb
+      .prepare("SELECT id, status, recurrence, series_id, process_after FROM messages_in WHERE id != 'task-recur'")
+      .get() as
+      | {
+          id: string;
+          status: string;
+          recurrence: string | null;
+          series_id: string;
+          process_after: string;
+        }
+      | undefined;
+    expect(carry).toBeDefined();
+    expect(carry!.status).toBe('pending');
+    expect(carry!.recurrence).toBe('15 8-22 * * *');
+    expect(carry!.series_id).toBe('task-recur');
+    expect(new Date(carry!.process_after).getTime()).toBeGreaterThan(Date.now());
   });
 });
 

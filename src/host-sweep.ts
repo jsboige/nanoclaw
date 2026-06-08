@@ -263,7 +263,7 @@ async function sweepSession(session: Session): Promise<void> {
 
     // 3. Running-container SLA: absolute ceiling + per-claim stuck rules.
     if (alive && outDb) {
-      enforceRunningContainerSla(inDb, outDb, session, agentGroup.id);
+      await enforceRunningContainerSla(inDb, outDb, session, agentGroup.id);
     }
 
     // 4. Crashed-container cleanup: processing rows left behind get retried.
@@ -271,7 +271,7 @@ async function sweepSession(session: Session): Promise<void> {
     // or wake failed). resetStuckProcessingRows itself is idempotent — it
     // skips messages already scheduled for a future retry.
     if (!alive && outDb) {
-      resetStuckProcessingRows(inDb, outDb, session, 'container not running');
+      await resetStuckProcessingRows(inDb, outDb, session, 'container not running');
     }
 
     // 5. Recurrence fanout for completed recurring tasks.
@@ -299,12 +299,12 @@ function declaredToolTimeoutMs(state: ContainerState | null): number | null {
   return typeof state.tool_declared_timeout_ms === 'number' ? state.tool_declared_timeout_ms : null;
 }
 
-function enforceRunningContainerSla(
+async function enforceRunningContainerSla(
   inDb: Database.Database,
   outDb: Database.Database,
   session: Session,
   agentGroupId: string,
-): void {
+): Promise<void> {
   const decision = decideStuckAction({
     now: Date.now(),
     heartbeatMtimeMs: heartbeatMtimeMs(agentGroupId, session.id),
@@ -322,7 +322,7 @@ function enforceRunningContainerSla(
       ceilingMs: decision.ceilingMs,
     });
     killContainer(session.id, 'absolute-ceiling');
-    resetStuckProcessingRows(inDb, outDb, session, 'absolute-ceiling');
+    await resetStuckProcessingRows(inDb, outDb, session, 'absolute-ceiling');
     return;
   }
 
@@ -333,25 +333,25 @@ function enforceRunningContainerSla(
     toleranceMs: decision.toleranceMs,
   });
   killContainer(session.id, 'claim-stuck');
-  resetStuckProcessingRows(inDb, outDb, session, 'claim-stuck');
+  await resetStuckProcessingRows(inDb, outDb, session, 'claim-stuck');
 }
 
-export function _resetStuckProcessingRowsForTesting(
+export async function _resetStuckProcessingRowsForTesting(
   inDb: Database.Database,
   outDb: Database.Database,
   session: Session,
   reason: string,
-): void {
-  resetStuckProcessingRows(inDb, outDb, session, reason, outDb);
+): Promise<void> {
+  await resetStuckProcessingRows(inDb, outDb, session, reason, outDb);
 }
 
-function resetStuckProcessingRows(
+async function resetStuckProcessingRows(
   inDb: Database.Database,
   outDb: Database.Database,
   session: Session,
   reason: string,
   writableOutDb?: Database.Database,
-): void {
+): Promise<void> {
   const claims = getProcessingClaims(outDb);
   const now = Date.now();
   for (const { message_id } of claims) {
@@ -364,6 +364,25 @@ function resetStuckProcessingRows(
     if (msg.processAfter && parseSqliteUtc(msg.processAfter) > now) continue;
 
     if (msg.tries >= MAX_TRIES) {
+      // Recurring-task safety net: if this failing message carries a cron
+      // recurrence, enqueue the next instance before sealing this row as
+      // failed. Without this, a chain-flap cascade (stalls, session-invalid,
+      // OneCLI hiccups) silently kills the cron series — no next row is ever
+      // produced. Failure is best-effort; markMessageFailed still runs so
+      // the audit trail is intact either way.
+      // MODULE-HOOK:scheduling-recurrence-failure:start
+      try {
+        const { advanceRecurringTaskAfterFailure } = await import('./modules/scheduling/recurrence.js');
+        await advanceRecurringTaskAfterFailure(inDb, msg.id, session);
+      } catch (err) {
+        log.error('Auto-advance threw while handling MAX_TRIES failure', {
+          messageId: msg.id,
+          sessionId: session.id,
+          err,
+        });
+      }
+      // MODULE-HOOK:scheduling-recurrence-failure:end
+
       markMessageFailed(inDb, msg.id);
       log.warn('Message marked as failed after max retries', {
         messageId: msg.id,

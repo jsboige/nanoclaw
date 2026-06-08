@@ -16,7 +16,7 @@ import type Database from 'better-sqlite3';
 import { TIMEZONE } from '../../config.js';
 import { log } from '../../log.js';
 import type { Session } from '../../types.js';
-import { clearRecurrence, getCompletedRecurring, insertRecurrence } from './db.js';
+import { clearRecurrence, getCompletedRecurring, insertRecurrence, type RecurringMessage } from './db.js';
 
 export async function handleRecurrence(inDb: Database.Database, session: Session): Promise<void> {
   const recurring = getCompletedRecurring(inDb);
@@ -62,5 +62,65 @@ export async function handleRecurrence(inDb: Database.Database, session: Session
         err,
       });
     }
+  }
+}
+
+/**
+ * Auto-advance a recurring task after MAX_TRIES failure.
+ *
+ * Mirrors handleRecurrence but operates on a single message id regardless of
+ * status. Without this, a transient failure cascade (5 stalls,
+ * session-invalid hits, OneCLI hiccups) silently kills the cron series: the
+ * row gets status='failed', handleRecurrence's `status='completed'` filter
+ * skips it, no next instance is ever enqueued, and the bot goes quiet
+ * indefinitely. Reproduced 2026-05-28 with two ClusterManager cron series
+ * (`15 8-22 * * *` + `30 8-22 * * *`) both flat-lined for ~3h after stall
+ * retries exhausted.
+ *
+ * Returns true if a next instance was enqueued, false otherwise. Errors are
+ * logged, never thrown — the caller's markMessageFailed must still run.
+ */
+export async function advanceRecurringTaskAfterFailure(
+  inDb: Database.Database,
+  messageId: string,
+  session: Session,
+): Promise<boolean> {
+  const msg = inDb
+    .prepare("SELECT * FROM messages_in WHERE id = ? AND kind = 'task' AND recurrence IS NOT NULL AND recurrence != ''")
+    .get(messageId) as RecurringMessage | undefined;
+  if (!msg) return false;
+
+  try {
+    const { CronExpressionParser } = await import('cron-parser');
+    const interval = CronExpressionParser.parse(msg.recurrence, { tz: TIMEZONE });
+    const nextRun = interval.next().toISOString();
+    const newId = `task-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+
+    insertRecurrence(inDb, msg, newId, nextRun);
+    clearRecurrence(inDb, msg.id);
+
+    log.warn('Auto-advanced recurring task after MAX_TRIES failure', {
+      failedId: msg.id,
+      newId,
+      seriesId: msg.series_id,
+      nextRun,
+      sessionId: session.id,
+    });
+    return true;
+  } catch (err) {
+    try {
+      clearRecurrence(inDb, msg.id);
+    } catch (clearErr) {
+      log.error('Failed to clear recurrence after MAX_TRIES failure advance error', {
+        messageId: msg.id,
+        err: clearErr,
+      });
+    }
+    log.error('Failed to advance recurring task after MAX_TRIES failure', {
+      messageId: msg.id,
+      recurrence: msg.recurrence,
+      err,
+    });
+    return false;
   }
 }
