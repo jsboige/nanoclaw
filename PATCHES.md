@@ -2,7 +2,21 @@
 
 Minimal `src/` and `container/` patches applied on top of upstream v2. Every entry includes its commit hash, reason, and exit condition. Target: ≤ 10 active patches at any time. Monthly review removes those whose exit condition is satisfied.
 
-Baseline: upstream `main` at `2492259` (v2.0.70) — sync 2026-05-27. Previous baseline was `ef43cbb` (v2.0.46, 2026-05-09).
+Baseline: upstream `main` at `ee7f891` (v2.1.17) — sync 2026-06-18. Previous baseline was `2492259` (v2.0.70, 2026-05-27).
+
+## Sync notes — v2.0.70 → v2.1.17 (254 files, +13 067 / −5 410)
+
+Whole minor behind upstream. 7 conflicted files / 14 hunks; the rest auto-merged. Patches in auto-merged files verified intact: #4 (`gh` apt), #13 (NTFS `_` id separator), #15, #16, #21. Marker census after merge: 28 distinct `[PATCH-myia #N]` numbers / 110 occurrences in `src`+`container` (above the ~23 floor — nothing dropped).
+
+- **`processQuery` rewrite (poll-loop.ts) — #18/#25/#26 re-woven.** Upstream rebuilt `processQuery` around a new `onExchangeComplete` / `archivePrompts` / `ProviderExchange` model. Adopted upstream's structure and re-interlaced our three patches: deferred follow-up ack (#18 — `pendingFollowUpAcks` drained to `markCompleted` only after the exchange's `result`, never immediately on push), follow-up serialization (#25 — `queuedFollowUps` guard when `awaitingResult`), stall watchdog (#26 — `stalledAborted` guards + interval cleared in `finally`). Verified post-merge: no immediate `markCompleted` of a follow-up survives (would regress #18).
+- **PATCH #19 KEPT (not subsumed).** Upstream's `dispatchResultText` returns `{ sent, hasUnwrapped }` and fires a `willRetryWrapping` nudge when the agent emits unwrapped text. #19 is still our addition layered on top: when a routing source is resolvable it delivers the bare text immediately and **returns `hasUnwrapped: false` to suppress** the nudge (already delivered); only the no-routing-source path lets `hasUnwrapped: true` flow up to upstream's nudge. The two behaviors are orthogonal and each has its own test (see below). If a future upstream version moves the routing-source fallback into `dispatchResultText` itself, revisit and drop #19.
+- **Egress lockdown adopted, OFF by default.** `container-runner.ts` gained upstream's `ensureEgressNetwork()` / `egressNetworkArgs()`. We kept #33's retry-wrapped OneCLI calls and wired egress as `if (ensureEgressNetwork()) {…} else { hostGatewayArgs() }`. Without `NANOCLAW_EGRESS_LOCKDOWN=true` the fallback runs → runtime behavior unchanged. Exactly one retry-wrapped OneCLI `ensureAgent` call remains (no double-apply).
+- **Migration 016 (`messaging-group-instance`) — additive/data-preserving.** Table recreate to add `instance` (backfilled `= channel_type`) + relax the unique index; copies all rows, idempotency-guarded, `disableForeignKeys` + `foreign_key_check` rollback. No data loss.
+- **Test merge fixes (test-only, no production impact):**
+  - `host-sweep-grace.test.ts` — added `getContainerSpawnedAt: vi.fn().mockReturnValue(null)` to the `container-runner` mock (upstream added this export + a spawnedAt startup grace). `null` is the "tests don't track spawn time" sentinel → startup-grace branch skipped → claim-stuck reached on the later tick, which is what the `justWoke` gate under test asserts.
+  - `integration.test.ts` (nudge test) — dropped the routing fields from the test's `insertMessage` so #19 doesn't engage and upstream's nudge path fires as intended. #19's routable behavior stays covered by its own test (`bare text falls back to the routing-source channel`).
+  - `integration.test.ts` (stale-session) — assertion relaxed from exact `toHaveLength(1)` to `out.some(... 'Transient session error')` + `getContinuation('mock')` undefined. The exact-count was racing #31/#35's retry, which re-emits the throttled notice; **flaky on main too** (pre-existing, not a merge regression).
+  - `upload-trace.test.ts` — passed `signal` into `runPollLoop` (was missing), so the loop stops on abort instead of polluting the module-singleton session DB across later container tests.
 
 ## Sync notes — v2.0.46 → v2.0.70 (165 commits)
 

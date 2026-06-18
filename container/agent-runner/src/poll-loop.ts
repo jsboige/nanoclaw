@@ -29,7 +29,8 @@ import {
 } from './formatter.js';
 // [PATCH-myia #8] mcp-health probe
 import { formatFailures, probeMcpRemoteCached, type RequiredRemote } from './mcp-health.js';
-import type { AgentProvider, AgentQuery, ProviderEvent } from './providers/types.js';
+import { isUploadTraceCommand, uploadTrace } from './upload-trace.js';
+import type { AgentProvider, AgentQuery, ProviderEvent, ProviderExchange } from './providers/types.js';
 
 const POLL_INTERVAL_MS = 1000;
 const ACTIVE_POLL_INTERVAL_MS = 500;
@@ -292,6 +293,12 @@ export interface PollLoopConfig {
    * operation). Cached 60s to avoid hammering the proxy.
    */
   requiredRemotes?: RequiredRemote[];
+  /**
+   * Optional stop signal. In production the loop runs until the container
+   * dies; tests pass a signal so an abandoned loop actually exits instead of
+   * polling forever and stealing messages from the next test's DB.
+   */
+  signal?: AbortSignal;
 }
 
 /**
@@ -358,6 +365,7 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
   const staleRetryCount = new Map<string, number>();
   let isFirstPoll = true;
   while (true) {
+    if (config.signal?.aborted) return;
     // Skip system messages — they're responses for MCP tools (e.g., ask_user_question)
     const messages = getPendingMessages(isFirstPoll).filter((m) => m.kind !== 'system');
     isFirstPoll = false;
@@ -426,6 +434,19 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
           channel_type: routing.channelType,
           thread_id: routing.threadId,
           content: JSON.stringify({ text: 'Session cleared.' }),
+        });
+        commandIds.push(msg.id);
+        continue;
+      }
+      if ((msg.kind === 'chat' || msg.kind === 'chat-sdk') && isUploadTraceCommand(msg)) {
+        log('Uploading session trace to Hugging Face');
+        writeMessageOut({
+          id: generateId(),
+          kind: 'chat',
+          platform_id: routing.platformId,
+          channel_type: routing.channelType,
+          thread_id: routing.threadId,
+          content: JSON.stringify({ text: uploadTrace() }),
         });
         commandIds.push(msg.id);
         continue;
@@ -558,7 +579,15 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
     // can stamp it on outbound rows — needed for a2a return-path routing.
     setCurrentInReplyTo(routing.inReplyTo);
     try {
-      const result = await processQuery(query, routing, processingIds, config.providerName);
+      const result = await processQuery(
+        query,
+        routing,
+        processingIds,
+        config.providerName,
+        config.provider.onExchangeComplete?.bind(config.provider),
+        prompt,
+        continuation,
+      );
       stalledAborted = !!result.stalledAborted; // [PATCH-myia #26]
       if (stalledAborted) {
         // Record the stalled attempt as a failed task run; the retry on the
@@ -792,16 +821,24 @@ interface QueryResult {
   stalledAborted?: boolean;
 }
 
-async function processQuery(
+export async function processQuery(
   query: AgentQuery,
   routing: RoutingContext,
   initialBatchIds: string[],
   providerName: string,
+  onExchangeComplete: ((exchange: ProviderExchange) => void) | undefined,
+  initialPrompt: string,
+  initialContinuation: string | undefined,
 ): Promise<QueryResult> {
   let queryContinuation: string | undefined;
   let mcpRegistryLost: { toolName: string; serverName: string } | undefined;
   let done = false;
   let unwrappedNudged = false;
+  // Prompt queue for the exchange hook — each result event consumes the
+  // oldest unanswered prompt, except a wrapping-retry result, which answers
+  // the same prompt again. Unused (and unmaintained) when the provider
+  // doesn't implement `onExchangeComplete`.
+  const archivePrompts: string[] = [initialPrompt];
 
   // Concurrent polling: push follow-ups into the active query as they arrive.
   // We do NOT force-end the stream on silence — keeping the query open avoids
@@ -885,13 +922,16 @@ async function processQuery(
         // resume id (fixed at sdkQuery() time); admin/passthrough commands
         // (/compact, /cost, …) only dispatch when they're the first input
         // of a query — pushed mid-stream they arrive as plain text and
-        // the SDK never runs them. End the stream and leave the rows
-        // pending; the outer loop handles them on next iteration via the
-        // canonical command path + formatMessagesWithCommands.
+        // the SDK never runs them. Abort the active stream and leave the
+        // rows pending; the outer loop handles them on next iteration via
+        // the canonical command path + formatMessagesWithCommands. Abort,
+        // not end: end() lets an in-flight turn run to completion, which
+        // can block the command (e.g. /clear during a long task) for as
+        // long as the turn takes.
         if (pending.some((m) => isRunnerCommand(m))) {
-          log('Pending slash command — ending stream so outer loop can process');
+          log('Pending slash command — aborting active stream so outer loop can process');
           endedForCommand = true;
-          query.end();
+          query.abort();
           return;
         }
 
@@ -956,6 +996,11 @@ async function processQuery(
         // `processing` state and are either drained on the next result event,
         // or reset+retried by the stall watchdog below.
         pendingFollowUpAcks.push(...keptIds);
+        // Track the follow-up prompt for the exchange-archive hook
+        // (upstream onExchangeComplete); the matching shift() fires when its
+        // result event lands. This replaces upstream's immediate
+        // markCompleted(keptIds) — that ack is deferred by #18 above.
+        archivePrompts.push(prompt);
         awaitingResult = true;
         // [PATCH-myia #26] If the query was idle (no events) for a while
         // before this push, lastSdkEventAt is stale. Reset so the stall
@@ -1229,24 +1274,54 @@ async function processQuery(
         awaitingResult = false;
         lastResultAt = Date.now(); // [PATCH-myia #27]
         if (event.text) {
-          // Upstream nudge (preferred recovery): when the agent omitted
-          // <message to="…"> wrapping, push a <system> message asking it
-          // to re-send properly. [PATCH-myia #19] in dispatchResultText
-          // ALSO delivers the bare text to the routing source — layered
-          // defense, so the user gets *something* this turn even if the
-          // nudge doesn't take. See PATCHES.md#19.
-          const { hasUnwrapped } = dispatchResultText(event.text, routing);
-          if (hasUnwrapped && !unwrappedNudged) {
-            unwrappedNudged = true;
-            const destinations = getAllDestinations();
-            const names = destinations.map((d) => d.name).join(', ');
-            query.push(
-              `<system>Your response was not delivered — it was not wrapped in <message to="name">...</message> blocks. ` +
-                `All output must be wrapped: use <message to="name"> for content to send, or <internal> for scratchpad. ` +
-                `Your destinations: ${names}. ` +
-                `Please re-send your response with the correct wrapping.</system>`,
-            );
+          // Pass isError so dispatchResultText's [PATCH-myia #19] routing-source
+          // fallback stands down for error turns — those flow through upstream's
+          // dedicated deliverErrorResult path below (single delivery, status
+          // 'error' archived). #19 keeps owning normal unwrapped output.
+          const { sent, hasUnwrapped } = dispatchResultText(event.text, routing, event.isError === true);
+          if (sent === 0 && event.isError === true) {
+            // Non-retryable error turn (e.g. a 403 billing_error) with no
+            // <message> envelope: deliver the notice instead of dropping it as
+            // scratchpad, and skip the re-wrap nudge — it would just re-hammer
+            // the failing gateway turn after turn.
+            deliverErrorResult(event.text, routing);
+            notifyExchangeComplete(onExchangeComplete, {
+              prompt: archivePrompts[0] ?? initialPrompt,
+              result: event.text,
+              continuation: queryContinuation ?? initialContinuation,
+              status: 'error',
+            });
+            archivePrompts.shift();
+          } else {
+            // [PATCH-myia #19] The bare-text fallback (deliver unwrapped output
+            // to the routing source so the user still gets *something* this
+            // turn) now lives inside dispatchResultText — see its body. The
+            // re-wrap nudge below is upstream's preferred recovery and subsumes
+            // #19's former nudge here.
+            const willRetryWrapping = hasUnwrapped && !unwrappedNudged;
+            notifyExchangeComplete(onExchangeComplete, {
+              prompt: archivePrompts[0] ?? initialPrompt,
+              result: event.text,
+              continuation: queryContinuation ?? initialContinuation,
+              status: hasUnwrapped ? 'undelivered' : 'completed',
+            });
+            if (willRetryWrapping) {
+              unwrappedNudged = true;
+              const destinations = getAllDestinations();
+              const names = destinations.map((d) => d.name).join(', ');
+              query.push(
+                `<system>Your response was not delivered — it was not wrapped in <message to="name">...</message> blocks. ` +
+                  `All output must be wrapped: use <message to="name"> for content to send, or <internal> for scratchpad. ` +
+                  `Your destinations: ${names}. ` +
+                  `Please re-send your response with the correct wrapping.</system>`,
+              );
+            }
+            // The wrapping-retry result answers the SAME user prompt — keep it
+            // queued so the retry archives against it, not the nudge text.
+            if (!willRetryWrapping) archivePrompts.shift();
           }
+        } else {
+          archivePrompts.shift();
         }
         // [PATCH-myia #25] Drain queued follow-ups into a fresh turn. Any
         // messages that arrived while the previous turn was in flight have
@@ -1294,6 +1369,15 @@ async function processQuery(
         break;
       }
     }
+  } catch (err) {
+    const errMsg = err instanceof Error ? err.message : String(err);
+    notifyExchangeComplete(onExchangeComplete, {
+      prompt: archivePrompts[0] ?? initialPrompt,
+      result: `Error: ${errMsg}`,
+      continuation: queryContinuation ?? initialContinuation,
+      status: 'error',
+    });
+    throw err;
   } finally {
     done = true;
     clearInterval(pollHandle);
@@ -1342,6 +1426,18 @@ async function processQuery(
   return { continuation: queryContinuation, mcpRegistryLost, stalledAborted };
 }
 
+function notifyExchangeComplete(
+  hook: ((exchange: ProviderExchange) => void) | undefined,
+  exchange: ProviderExchange,
+): void {
+  if (!hook) return;
+  try {
+    hook(exchange);
+  } catch (err) {
+    log(`onExchangeComplete failed: ${err instanceof Error ? err.message : String(err)}`);
+  }
+}
+
 function handleEvent(event: ProviderEvent, _routing: RoutingContext): void {
   switch (event.type) {
     case 'init':
@@ -1365,6 +1461,26 @@ function handleEvent(event: ProviderEvent, _routing: RoutingContext): void {
 }
 
 /**
+ * Deliver a turn's text straight to the channel the batch arrived on. Used when
+ * a turn ends in a provider error (e.g. a non-retryable 403 billing_error) with
+ * no <message> envelope: the notice would otherwise be dropped as scratchpad.
+ * This is the same user-facing write the outer catch block does, minus the
+ * `Error:` prefix — the provider's text is already a user-facing message.
+ */
+function deliverErrorResult(text: string, routing: RoutingContext): void {
+  log('Error result with no <message> envelope — delivering to channel');
+  writeMessageOut({
+    id: generateId(),
+    in_reply_to: routing.inReplyTo,
+    kind: 'chat',
+    platform_id: routing.platformId,
+    channel_type: routing.channelType,
+    thread_id: routing.threadId,
+    content: JSON.stringify({ text }),
+  });
+}
+
+/**
  * Parse the agent's final text for <message to="name">...</message> blocks
  * and dispatch each one to its resolved destination. Text outside of blocks
  * is sent verbatim to the routing source as a fallback (PATCH-myia #19).
@@ -1375,7 +1491,11 @@ function handleEvent(event: ProviderEvent, _routing: RoutingContext): void {
  * fallback ensures the user still gets the reply on the channel they
  * messaged from — better than silently dropping it into scratchpad.
  */
-function dispatchResultText(text: string, routing: RoutingContext): { sent: number; hasUnwrapped: boolean } {
+function dispatchResultText(
+  text: string,
+  routing: RoutingContext,
+  isError = false,
+): { sent: number; hasUnwrapped: boolean } {
   const MESSAGE_RE = /<message\s+to="([^"]+)"\s*>([\s\S]*?)<\/message>/g;
   // [PATCH-myia #36] Cap messages per LLM response. Without this, a looping
   // model (observed with GLM: 500+ identical <message> blocks in one response)
@@ -1443,10 +1563,14 @@ function dispatchResultText(text: string, routing: RoutingContext): { sent: numb
   // SDK init that sometimes drops the destination-wrapping discipline.
   //
   // We only fall back when:
+  //   - !isError (error turns flow through the caller's deliverErrorResult
+  //     path instead — single delivery, status 'error' archived; without this
+  //     gate #19 and deliverErrorResult would both write the same notice)
   //   - sent === 0 (no <message> blocks succeeded)
   //   - scratchpad has substantive content (not just whitespace)
   //   - routing has a usable channel (platformId + channelType)
   if (
+    !isError &&
     sent === 0 &&
     scratchpad.trim().length > 0 &&
     routing.platformId &&

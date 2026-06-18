@@ -30,6 +30,7 @@ import { clearStaleProcessingAcks, touchHeartbeat } from './db/connection.js';
 import { writeMessageOut } from './db/messages-out.js';
 import { buildSystemPromptAddendum, getAllDestinations } from './destinations.js';
 import { formatFailures, probeMcpRemoteWithRetry, selectRequiredRemotes, type RequiredRemote } from './mcp-health.js';
+import { ensureMemoryScaffold } from './memory-scaffold.js';
 // Providers barrel — each enabled provider self-registers on import.
 // Provider skills append imports to providers/index.ts.
 import './providers/index.js';
@@ -153,6 +154,12 @@ async function main(): Promise<void> {
     model: config.model,
     effort: config.effort,
   });
+
+  // Providers that lack native memory opt in via `usesMemoryScaffold`; for them
+  // the runner creates a persistent memory/ tree in its host-backed workspace at
+  // boot (idempotent). Default off — the trunk default (Claude) omits the flag
+  // and keeps its native memory untouched.
+  if (provider.usesMemoryScaffold) ensureMemoryScaffold();
 
   await runPollLoop({
     provider,
