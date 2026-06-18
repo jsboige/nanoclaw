@@ -503,6 +503,18 @@ async function buildContainerArgs(
     args.push('-e', `GH_TOKEN=${ghTokenDefault}`);
   }
 
+  // [PATCH-myia #38] Forward the documented auto-compaction override into the
+  // container. The agent-runner reads CLAUDE_CODE_AUTO_COMPACT_WINDOW from its
+  // process.env (container/agent-runner/src/providers/claude.ts) — but the
+  // ENV_PASSTHROUGH_PREFIXES above don't cover CLAUDE_*, so the operator
+  // override the claude.ts comment promises never reached the container. We
+  // wire this one specific var explicitly (not the broad CLAUDE_CODE_ prefix,
+  // which would also forward settings.json-managed flags). Used to cap
+  // condensation at 250k on the 1M-context glm-5.2 without using the full 1M.
+  if (process.env.CLAUDE_CODE_AUTO_COMPACT_WINDOW) {
+    args.push('-e', `CLAUDE_CODE_AUTO_COMPACT_WINDOW=${process.env.CLAUDE_CODE_AUTO_COMPACT_WINDOW}`);
+  }
+
   // Provider-contributed env vars (e.g. XDG_DATA_HOME, OPENCODE_*, NO_PROXY).
   if (providerContribution.env) {
     for (const [key, value] of Object.entries(providerContribution.env)) {
