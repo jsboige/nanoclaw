@@ -16,9 +16,20 @@
  * Bearer is unchanged: MCP_PROXY_BEARER == TBXark authToken (ad28ecc7…), which
  * TBXark accepts directly on :9090 (verified: POST initialize -> HTTP 200).
  *
+ * --allow-http (added 2026-06-24): the MCP servers are stdio bridges spawned via
+ * `npx -y mcp-remote <url> ...`. Current mcp-remote REFUSES plain-http:// URLs for
+ * any host that isn't localhost ("Non-HTTPS URLs are only allowed for localhost or
+ * when --allow-http flag is provided") and exits, so the SDK reports the server
+ * `failed` at init. The original edge URL was https:// (accepted); switching to the
+ * loopback http:// proxy tripped that guard. host.docker.internal is not localhost,
+ * so the DIRECT (http) config MUST carry --allow-http. This is safe: the traffic is
+ * loopback to the host's TBXark proxy and already authenticated by the bearer.
+ * The EDGE (https) config drops the flag (https is always allowed). This script
+ * keeps the flag in sync with the scheme on every run, and is idempotent.
+ *
  * Usage:
- *   pnpm exec tsx scripts/bypass-mcp-edge.ts            # apply bypass
- *   pnpm exec tsx scripts/bypass-mcp-edge.ts --revert   # restore edge URL
+ *   pnpm exec tsx scripts/bypass-mcp-edge.ts            # apply bypass (http + --allow-http)
+ *   pnpm exec tsx scripts/bypass-mcp-edge.ts --revert   # restore edge URL (https, no flag)
  *
  * After running, restart the bot so the container respawns with the new config:
  *   ncl groups restart --id ag-1776992584813-k3oj0w
@@ -32,7 +43,9 @@ const EDGE = 'https://mcp-tools.myia.io';
 const DIRECT = 'http://host.docker.internal:9090';
 
 const revert = process.argv.includes('--revert');
-const [from, to] = revert ? [DIRECT, EDGE] : [EDGE, DIRECT];
+// targetBase = where URLs should point after this run; otherBase = where they might be now.
+const [targetBase, otherBase] = revert ? [EDGE, DIRECT] : [DIRECT, EDGE];
+const needsAllowHttp = targetBase.startsWith('http://'); // mcp-remote refuses non-localhost http without it
 
 const dbPath = path.resolve('data/v2.db');
 const db = new Database(dbPath);
@@ -42,24 +55,43 @@ const row = db
   .get(AG_ID) as { mcp_servers: string } | undefined;
 if (!row) throw new Error(`No container_configs row for ${AG_ID}`);
 
-if (!row.mcp_servers.includes(from)) {
-  console.log(
-    `No-op: "${from}" not present in mcp_servers (already ${revert ? 'reverted' : 'bypassed'}?).`,
-  );
-  console.log('CURRENT:', row.mcp_servers);
-  db.close();
-  process.exit(0);
-}
-
 const cfg = JSON.parse(row.mcp_servers) as Record<
   string,
   { command: string; args: string[]; env?: Record<string, string>; timeout?: number }
 >;
 
+let changed = false;
 for (const name of Object.keys(cfg)) {
-  cfg[name].args = cfg[name].args.map((a) => a.replace(from, to));
+  const args = cfg[name].args;
+  // 1. Rewrite the base URL (otherBase -> targetBase) wherever it appears.
+  for (let i = 0; i < args.length; i++) {
+    if (args[i].includes(otherBase)) {
+      args[i] = args[i].replace(otherBase, targetBase);
+      changed = true;
+    }
+  }
+  // 2. Keep --allow-http in sync with the scheme: present for http://, absent for https://.
+  const hasFlag = args.includes('--allow-http');
+  if (needsAllowHttp && !hasFlag) {
+    const urlIdx = args.findIndex((a) => a.includes('/mcp'));
+    args.splice(urlIdx >= 0 ? urlIdx + 1 : args.length, 0, '--allow-http');
+    changed = true;
+  } else if (!needsAllowHttp && hasFlag) {
+    cfg[name].args = args.filter((a) => a !== '--allow-http');
+    changed = true;
+  }
   const url = cfg[name].args.find((a) => a.includes('/mcp'));
-  console.log(`${revert ? 'reverted' : 'bypassed'} ${name}: ${url}`);
+  const flag = cfg[name].args.includes('--allow-http') ? ' (--allow-http)' : '';
+  console.log(`${revert ? 'edge' : 'direct'} ${name}: ${url}${flag}`);
+}
+
+if (!changed) {
+  console.log(
+    `No-op: already on ${revert ? 'edge (https)' : 'direct (http + --allow-http)'}.`,
+  );
+  console.log('CURRENT:', row.mcp_servers);
+  db.close();
+  process.exit(0);
 }
 
 const newJson = JSON.stringify(cfg);
