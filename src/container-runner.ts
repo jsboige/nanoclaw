@@ -578,6 +578,28 @@ async function buildContainerArgs(
   }
   log.info('OneCLI gateway applied', { containerName });
 
+  // [PATCH-myia #39] Exempt internal hosts from the OneCLI HTTPS proxy.
+  // onecli.applyContainerConfig (above) injects HTTP(S)_PROXY=…@host.docker.internal:10255
+  // + NODE_USE_ENV_PROXY=1 so the agent's *external* API calls are routed
+  // through the vault for credential injection — but it sets no NO_PROXY. So
+  // traffic to the host's *internal* services is also forced through the
+  // credential proxy, which 401s / refuses it. The big casualty is the
+  // roo-state-manager + sk-agent MCP at host.docker.internal:9090 (PATCHES.md#2
+  // bypass): it carries its own MCP_PROXY_BEARER and must NOT be proxied. With
+  // the proxy in front of it, `npx mcp-remote` / the SDK's fetch get
+  // "fetch failed" → "required MCP server(s) unreachable" → bot crash-loop.
+  // Internal traffic never needs OneCLI credentials, so exempt it. Mirrors what
+  // the ollama/opencode providers already contribute for themselves (see
+  // .claude/skills/add-ollama-provider). Pushed AFTER applyContainerConfig so it
+  // wins over any earlier NO_PROXY; both cases set since some clients (and the
+  // lowercase-only `no_proxy` readers) check only one form. Regressed with the
+  // v2.1.17 OneCLI SDK 0.5→2.2 bump, which started injecting the proxy env.
+  {
+    const noProxy = 'host.docker.internal,localhost,127.0.0.1';
+    args.push('-e', `NO_PROXY=${noProxy}`);
+    args.push('-e', `no_proxy=${noProxy}`);
+  }
+
   // Override entrypoint: run v2 entry point directly via Bun (no tsc, no stdin).
   args.push('--entrypoint', 'bash');
 

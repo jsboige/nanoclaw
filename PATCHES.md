@@ -383,6 +383,14 @@ If none works, document the patch here with justification.
 - **Exit condition:** Upstream adds a generic `container.json:env` passthrough field (same exit as patch #1), or wires the compaction host→container override itself.
 - **Lines:** ~5
 
+### 39. Exempt internal hosts from the OneCLI HTTPS proxy (`NO_PROXY`)
+
+- **File:** `src/container-runner.ts` (`buildContainerArgs`, immediately after `onecli.applyContainerConfig` succeeds and before the `--entrypoint` push).
+- **Summary:** Push `-e NO_PROXY=host.docker.internal,localhost,127.0.0.1` (+ lowercase `no_proxy`) so the credential proxy that OneCLI injects (`HTTP(S)_PROXY=…@host.docker.internal:10255` + `NODE_USE_ENV_PROXY=1`) does **not** capture traffic to the host's own internal services. Set after `applyContainerConfig` so it wins over any earlier value; both cases are set because some clients read only the lowercase form.
+- **Why:** v2.1.17 bumped the OneCLI SDK 0.5→2.2, which started injecting `HTTP(S)_PROXY` + `NODE_USE_ENV_PROXY=1` into the agent container so its *external* API calls get vault credential injection. But it sets no `NO_PROXY`, so the agent's *internal* MCP traffic to `host.docker.internal:9090` (the TBXark proxy carrying its own `MCP_PROXY_BEARER` — see patch #2 bypass) was also forced through the credential proxy, which 401s/refuses it. Result: `npx mcp-remote` / the SDK fetch returns `fetch failed` → `FATAL: required MCP server(s) unreachable: roo-state-manager … sk-agent` → the container exits non-zero and the host respawns it every ~60s. Crash-loop hammered the API and (via reset-to-pending review tasks picked up by overlapping respawns) produced byte-identical duplicate PR reviews off the `:15/:45` cadence. Diagnosed 2026-06-23 with an in-container MCP probe: proxy on → `fetch failed`; proxy on **+ NO_PROXY** → HTTP 200, 15 RSM tools + 13 sk-agent tools. After the fix the bot resumed real work (9 PRs at 11:01Z) and the crash-loop stopped. Mirrors the `NO_PROXY: host.docker.internal` the ollama/opencode provider skills already document.
+- **Exit condition:** Upstream sets a sane `NO_PROXY` when it injects the OneCLI proxy env (so internal `host.docker.internal` MCP/loopback traffic bypasses the credential proxy by default), or OneCLI's `applyContainerConfig` grows a no-proxy allowlist parameter.
+- **Lines:** ~6 (+ comment block)
+
 ---
 
 ## Removed / not needed under v2
