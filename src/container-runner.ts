@@ -503,6 +503,18 @@ async function buildContainerArgs(
     args.push('-e', `GH_TOKEN=${ghTokenDefault}`);
   }
 
+  // [PATCH-myia #38] Forward the documented auto-compaction override into the
+  // container. The agent-runner reads CLAUDE_CODE_AUTO_COMPACT_WINDOW from its
+  // process.env (container/agent-runner/src/providers/claude.ts) — but the
+  // ENV_PASSTHROUGH_PREFIXES above don't cover CLAUDE_*, so the operator
+  // override the claude.ts comment promises never reached the container. We
+  // wire this one specific var explicitly (not the broad CLAUDE_CODE_ prefix,
+  // which would also forward settings.json-managed flags). Used to cap
+  // condensation at 250k on the 1M-context glm-5.2 without using the full 1M.
+  if (process.env.CLAUDE_CODE_AUTO_COMPACT_WINDOW) {
+    args.push('-e', `CLAUDE_CODE_AUTO_COMPACT_WINDOW=${process.env.CLAUDE_CODE_AUTO_COMPACT_WINDOW}`);
+  }
+
   // Provider-contributed env vars (e.g. XDG_DATA_HOME, OPENCODE_*, NO_PROXY).
   if (providerContribution.env) {
     for (const [key, value] of Object.entries(providerContribution.env)) {
@@ -565,6 +577,28 @@ async function buildContainerArgs(
     throw new Error('OneCLI gateway not applied — refusing to spawn container without credentials');
   }
   log.info('OneCLI gateway applied', { containerName });
+
+  // [PATCH-myia #39] Exempt internal hosts from the OneCLI HTTPS proxy.
+  // onecli.applyContainerConfig (above) injects HTTP(S)_PROXY=…@host.docker.internal:10255
+  // + NODE_USE_ENV_PROXY=1 so the agent's *external* API calls are routed
+  // through the vault for credential injection — but it sets no NO_PROXY. So
+  // traffic to the host's *internal* services is also forced through the
+  // credential proxy, which 401s / refuses it. The big casualty is the
+  // roo-state-manager + sk-agent MCP at host.docker.internal:9090 (PATCHES.md#2
+  // bypass): it carries its own MCP_PROXY_BEARER and must NOT be proxied. With
+  // the proxy in front of it, `npx mcp-remote` / the SDK's fetch get
+  // "fetch failed" → "required MCP server(s) unreachable" → bot crash-loop.
+  // Internal traffic never needs OneCLI credentials, so exempt it. Mirrors what
+  // the ollama/opencode providers already contribute for themselves (see
+  // .claude/skills/add-ollama-provider). Pushed AFTER applyContainerConfig so it
+  // wins over any earlier NO_PROXY; both cases set since some clients (and the
+  // lowercase-only `no_proxy` readers) check only one form. Regressed with the
+  // v2.1.17 OneCLI SDK 0.5→2.2 bump, which started injecting the proxy env.
+  {
+    const noProxy = 'host.docker.internal,localhost,127.0.0.1';
+    args.push('-e', `NO_PROXY=${noProxy}`);
+    args.push('-e', `no_proxy=${noProxy}`);
+  }
 
   // Override entrypoint: run v2 entry point directly via Bun (no tsc, no stdin).
   args.push('--entrypoint', 'bash');
