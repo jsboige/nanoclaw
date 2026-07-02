@@ -2,7 +2,11 @@
 
 Minimal `src/` and `container/` patches applied on top of upstream v2. Every entry includes its commit hash, reason, and exit condition. Target: ≤ 10 active patches at any time. Monthly review removes those whose exit condition is satisfied.
 
-Baseline: upstream `main` at `ee7f891` (v2.1.17) — sync 2026-06-18. Previous baseline was `2492259` (v2.0.70, 2026-05-27).
+Baseline: upstream `main` at `cb6e3d1` (v2.1.23) — sync 2026-07-02. Previous baseline was `ee7f891` (v2.1.17, 2026-06-18).
+
+## Sync notes — v2.1.17 → v2.1.23 (70 commits)
+
+Zero-conflict merge (`d621ca3`). Patches verified intact post-merge: #38 (`CLAUDE_CODE_AUTO_COMPACT_WINDOW` forward) and #39 (`NO_PROXY` exemption) both present in `src/container-runner.ts` and compiled `dist/`. `versions.json` unchanged — no OneCLI gateway/CLI upgrade required. One `[BREAKING]`: Chat SDK pinned `4.29.0` (was `4.26.0`) — telegram adapter re-pulled via `/add-telegram` to match. 27 vitest failures are 100% pre-existing Windows-environment (spawn -1, symlink EPERM, launchd/systemd tests) — verified identical at backup tag `pre-update-a304b8d-20260702-033503`.
 
 ## Sync notes — v2.0.70 → v2.1.17 (254 files, +13 067 / −5 410)
 
