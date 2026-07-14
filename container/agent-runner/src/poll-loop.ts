@@ -42,10 +42,15 @@ const ACTIVE_POLL_INTERVAL_MS = 500;
 // pushes that the SDK silently fails to address are lost (the messages were
 // being marked `completed` immediately after `query.push()`).
 //
-// 90s chosen as: long enough to cover normal SDK turn latency including tool
-// calls (~10-30s typical, 60s for slow MCP), short enough to recover before
-// the user notices "the bot didn't reply".
-const STALL_TIMEOUT_MS = 90_000;
+// 240s chosen as: long enough to ride out a mid-turn auto-compaction on a
+// large context. The SDK can go fully silent for >90s while it compacts a
+// ~167k-token transcript; the original 90s budget only covered ~10-30s tool
+// calls / 60s slow MCP and false-tripped on heavy cron review turns, aborting
+// the query mid-compaction -> reset-to-pending -> re-fire loop. Still far
+// below the genuine-hang backstops: the heartbeat tickle (PATCH #24), the
+// tool-stuck watchdog (PATCH #28, 5min) and the host absolute-ceiling (30min)
+// all still catch a truly wedged query.
+const STALL_TIMEOUT_MS = 240_000;
 const STALL_CHECK_INTERVAL_MS = 5_000;
 
 // [PATCH-myia #18b] Periodic SDK query refresh. After this much wall-clock
