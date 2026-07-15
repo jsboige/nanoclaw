@@ -396,6 +396,14 @@ If none works, document the patch here with justification.
 - **Exit condition:** Upstream sets a sane `NO_PROXY` when it injects the OneCLI proxy env (so internal `host.docker.internal` MCP/loopback traffic bypasses the credential proxy by default), or OneCLI's `applyContainerConfig` grows a no-proxy allowlist parameter.
 - **Lines:** ~6 (+ comment block)
 
+### 40. Suppress provider auto-compaction telemetry from user channels
+
+- **File:** `container/agent-runner/src/poll-loop.ts` — new `isProviderStatusNoise()` helper + guards at the three fallback delivery sites: `deliverErrorResult()`, the `#19` bare-text routing-source fallback in `dispatchResultText()`, and the reactive catch-path `Error: ${errMsg}` write.
+- **Summary:** A single guard drops known SDK/CLI status telemetry — `Context compacted (N tokens compacted).`, `Autocompact is thrashing…`, `Claude Code returned an error result: …` (with an optional leading `Error: ` stripped) — instead of writing it to the channel. Each site logs the suppressed text and skips the `writeMessageOut`. The `#19` site returns early so no re-wrap nudge fires for pure telemetry.
+- **Why:** When a heavy turn (esp. the review cron) balloons context, Claude Code auto-compacts repeatedly and emits these notices as result text or as an error result/throw with no `<message>` envelope. All three fallback paths — which exist to surface *real* unwrapped replies — then post the raw telemetry to the group. Incident 2026-07-15: **91 of 93** chat deliveries to the Telegram group over ~11h were this noise (`Context compacted…`/`Autocompact is thrashing…`), drowning real replies. Distinct from the underlying poids-par-tour thrash (#2177, unfixed) — this patch stops the *leak*; the review work itself still lands on GitHub/dashboard. Genuine agent text and genuine provider errors (403 billing_error, MCP init failures) do not match and are unaffected.
+- **Exit condition:** Upstream stops routing provider status/telemetry strings through the user-facing fallback delivery paths (e.g. tags result events as internal telemetry vs. agent output), or exposes a hook to filter fallback deliveries.
+- **Lines:** ~30 (helper + 3 guards + comments)
+
 ---
 
 ## Removed / not needed under v2
