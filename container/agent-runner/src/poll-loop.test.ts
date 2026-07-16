@@ -4,8 +4,15 @@ import { initTestSessionDb, closeSessionDb, getInboundDb, getOutboundDb } from '
 import { getPendingMessages, markCompleted } from './db/messages-in.js';
 import { getUndeliveredMessages } from './db/messages-out.js';
 import { formatMessages, extractRouting } from './formatter.js';
-// [PATCH-myia #28] evaluateToolStuckBudget, [PATCH-myia #35] evaluateStaleRetryCap
-import { evaluateStaleRetryCap, evaluateToolStuckBudget, isCorruptionError, processQuery } from './poll-loop.js';
+// [PATCH-myia #28] evaluateToolStuckBudget, [PATCH-myia #35] evaluateStaleRetryCap,
+// [PATCH-myia #41] evaluateMidLifeRotation
+import {
+  evaluateMidLifeRotation,
+  evaluateStaleRetryCap,
+  evaluateToolStuckBudget,
+  isCorruptionError,
+  processQuery,
+} from './poll-loop.js';
 import { MockProvider } from './providers/mock.js';
 import type { AgentQuery, ProviderEvent } from './providers/types.js';
 
@@ -710,5 +717,82 @@ describe('isCorruptionError', () => {
     expect(isCorruptionError('database is locked')).toBe(false);
     expect(isCorruptionError('no such table: messages_in')).toBe(false);
     expect(isCorruptionError('')).toBe(false);
+  });
+});
+
+// [PATCH-myia #41] Mid-life continuation rotation. maybeRotateContinuation
+// (the transcript-size/age cold-resume guard) is evaluated only at container
+// startup; a container up for hours never re-checks, so a transcript that
+// grows past the cap between tours rides into the #2177 cold-resume/thrash
+// wedge (wedge #7 reached 21MB). The idle branch calls evaluateMidLifeRotation
+// to re-probe, throttled. Test the pure policy (probe injected) rather than
+// driving runPollLoop's infinite loop — same approach as #28's watchdog.
+describe('[PATCH-myia #41] evaluateMidLifeRotation', () => {
+  const INTERVAL = 60_000;
+  const base = { nowMs: 1_000_000, lastCheckMs: 0, intervalMs: INTERVAL };
+
+  it('does not check when there is no continuation to rotate', () => {
+    const probe = () => 'transcript 21.0MB > 12MB cap';
+    const r = evaluateMidLifeRotation({ ...base, continuation: undefined, probe });
+    expect(r).toEqual({ checked: false, reason: null });
+  });
+
+  it('does not check when the provider has no rotation guard', () => {
+    const r = evaluateMidLifeRotation({ ...base, continuation: 'sess-a', probe: undefined });
+    expect(r).toEqual({ checked: false, reason: null });
+  });
+
+  it('is throttled — no probe before the interval elapses', () => {
+    let calls = 0;
+    const probe = () => {
+      calls++;
+      return null;
+    };
+    const r = evaluateMidLifeRotation({
+      continuation: 'sess-a',
+      nowMs: 30_000,
+      lastCheckMs: 0,
+      intervalMs: INTERVAL,
+      probe,
+    });
+    expect(r.checked).toBe(false);
+    expect(calls).toBe(0);
+  });
+
+  it('checks exactly at the interval boundary', () => {
+    const probe = () => null;
+    const r = evaluateMidLifeRotation({
+      continuation: 'sess-a',
+      nowMs: INTERVAL,
+      lastCheckMs: 0,
+      intervalMs: INTERVAL,
+      probe,
+    });
+    expect(r.checked).toBe(true);
+    expect(r.reason).toBeNull();
+  });
+
+  it('checks but does not rotate when the transcript is under the cap', () => {
+    const r = evaluateMidLifeRotation({ ...base, continuation: 'sess-a', probe: () => null });
+    expect(r).toEqual({ checked: true, reason: null });
+  });
+
+  it('surfaces the rotate reason when the transcript is over the cap (the wedge case)', () => {
+    const reason = 'transcript 21.0MB > 12MB cap';
+    const r = evaluateMidLifeRotation({ ...base, continuation: 'sess-a', probe: () => reason });
+    expect(r).toEqual({ checked: true, reason });
+  });
+
+  it('passes the live continuation id to the probe', () => {
+    let seen: string | undefined;
+    evaluateMidLifeRotation({
+      ...base,
+      continuation: 'sess-live-123',
+      probe: (c) => {
+        seen = c;
+        return null;
+      },
+    });
+    expect(seen).toBe('sess-live-123');
   });
 });

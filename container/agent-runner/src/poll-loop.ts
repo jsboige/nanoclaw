@@ -151,6 +151,17 @@ const TOOL_STUCK_CHECK_INTERVAL_MS = 30_000;
 // resources the same afternoon.
 const IDLE_KEEPALIVE_MS = 2 * 60 * 60 * 1000;
 
+// [PATCH-myia #41] How often, while idle, to re-evaluate the provider's
+// continuation-rotation guard (transcript size/age cold-resume cap). The guard
+// is otherwise only checked once at container startup; a container that stays
+// up for hours never re-checks, so a transcript that grows past the cap
+// *between* tours rides an ever-growing .jsonl into the cold-resume/thrash
+// wedge (#2177 zombie — wedge #7 reached 21MB before the SDK query died).
+// 60s is far finer than the multi-hour growth that produced the wedge, and the
+// probe (findTranscriptPath + statSync) is cheap, so this adds no meaningful
+// idle cost while closing the mid-life gap.
+const ROTATE_CHECK_INTERVAL_MS = 60_000;
+
 // [PATCH-myia #29] Fail-fast gate softening. The per-turn required-MCP gate
 // (further down) previously, on a probe failure, wrote a 🛑 BLOCKED chat
 // message AND `markCompleted`'d the user's message — permanently dropping it.
@@ -272,6 +283,37 @@ export function isCorruptionError(msg: string): boolean {
   );
 }
 
+/**
+ * [PATCH-myia #41] Mid-life continuation-rotation policy.
+ *
+ * The provider's `maybeRotateContinuation` guard (transcript size/age
+ * cold-resume cap) is evaluated once at startup — see the call just before the
+ * poll loop. A long-lived container never re-checks it, so a transcript that
+ * grows past the cap between tours rides an ever-growing .jsonl into the
+ * cold-resume/thrash wedge (#2177 zombie; wedge #7 reached 21MB before the SDK
+ * query died). The idle branch calls this to decide whether to re-probe now.
+ *
+ * Pure — the probe is injected — so the throttle policy is unit-testable
+ * without driving the loop or touching the filesystem. `checked` reports
+ * whether the probe ran (caller advances its throttle clock on true); `reason`
+ * is the non-null rotate reason when a rotation should fire.
+ *
+ * Only re-checks while genuinely idle: the probe renames the live .jsonl aside
+ * as a side effect, which is only safe when no query holds it.
+ */
+export function evaluateMidLifeRotation(args: {
+  continuation: string | undefined;
+  nowMs: number;
+  lastCheckMs: number;
+  intervalMs: number;
+  probe: ((continuation: string) => string | null) | undefined;
+}): { checked: boolean; reason: string | null } {
+  const { continuation, nowMs, lastCheckMs, intervalMs, probe } = args;
+  if (!continuation || !probe) return { checked: false, reason: null };
+  if (nowMs - lastCheckMs < intervalMs) return { checked: false, reason: null };
+  return { checked: true, reason: probe(continuation) };
+}
+
 function log(msg: string): void {
   console.error(`[poll-loop] ${msg}`);
 }
@@ -359,6 +401,10 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
   // [PATCH-myia #30] Idle keep-alive bookkeeping. Timestamp of when the
   // current uninterrupted idle stretch began (0 = not currently idle).
   let idleSince = 0;
+  // [PATCH-myia #41] Last time the idle branch re-evaluated the continuation
+  // rotation guard (0 = never this container). Throttled by
+  // ROTATE_CHECK_INTERVAL_MS.
+  let lastRotateCheckAt = 0;
   // [PATCH-myia #29] When we last posted a 🛑 BLOCKED notice (0 = never).
   // Throttles the user-visible message while the MCP chain is flapping.
   let lastBlockedNoticeAt = 0;
@@ -391,6 +437,31 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
       const nowIdle = Date.now();
       if (idleSince === 0) idleSince = nowIdle;
       if (nowIdle - idleSince < IDLE_KEEPALIVE_MS) touchHeartbeat();
+
+      // [PATCH-myia #41] Mid-life continuation rotation. Re-evaluate the
+      // provider's transcript-size/age guard here — idle is the only point
+      // with no active query holding the .jsonl, so the probe's rename-aside
+      // is safe. Without this, the guard runs only at startup and a container
+      // up for hours grows its transcript past the cap into a cold-resume/
+      // thrash wedge (#2177; wedge #7 hit 21MB). On a hit, drop the
+      // continuation so the next turn starts a fresh transcript — the same
+      // reset the manual zombie recovery performs, done pre-emptively.
+      const rot = evaluateMidLifeRotation({
+        continuation,
+        nowMs: nowIdle,
+        lastCheckMs: lastRotateCheckAt,
+        intervalMs: ROTATE_CHECK_INTERVAL_MS,
+        probe: config.provider.maybeRotateContinuation
+          ? (c) => config.provider.maybeRotateContinuation!(c, config.cwd)
+          : undefined,
+      });
+      if (rot.checked) lastRotateCheckAt = nowIdle;
+      if (rot.reason) {
+        log(`Rotating session mid-life — ${rot.reason}; next turn starts fresh`);
+        clearContinuation(config.providerName);
+        continuation = undefined;
+      }
+
       await sleep(POLL_INTERVAL_MS);
       continue;
     }

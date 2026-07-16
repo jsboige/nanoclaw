@@ -398,6 +398,17 @@ If none works, document the patch here with justification.
 
 ---
 
+### 41. Re-check the continuation-rotation guard mid-life (idle), not just at startup
+
+- **File:** `container/agent-runner/src/poll-loop.ts` — new exported pure helper `evaluateMidLifeRotation`, a `ROTATE_CHECK_INTERVAL_MS` constant, a `lastRotateCheckAt` bookkeeping var in `runPollLoop`, and a call in the idle branch (`messages.length === 0`). Tests in `poll-loop.test.ts`.
+- **Summary:** The provider's `maybeRotateContinuation` guard (Claude: rotate the session when its transcript `.jsonl` exceeds `CLAUDE_TRANSCRIPT_ROTATE_BYTES`, default 12 MB, or the age cap) is evaluated **once**, just before the poll loop. This patch re-evaluates it while idle — throttled to once per `ROTATE_CHECK_INTERVAL_MS` (60 s) — so a session whose transcript crosses the cap *between* tours is rotated to a fresh transcript before the next tour resumes it. On a hit it drops the continuation (the same reset the manual zombie recovery performs), pre-emptively. Idle is chosen because the probe renames the live `.jsonl` aside, which is only safe when no query holds it.
+- **Why:** The `#2177` "zombie-heartbeat" wedges have two classes. The *bunching* class (two proactive tours claimed in one turn) is addressed by patch #26's 240 s watchdog + host de-bunching. The *accumulation* class is not: a container that stays up for hours (heartbeat keep-alive #30 keeps it alive precisely so it isn't reaped hourly) keeps resuming and appending to one transcript. The SDK only sometimes forks a fresh session on compaction; when it doesn't, the `.jsonl` grows unbounded. Wedge #7 (2026-07-16) reached **21 MB** — well past the 12 MB cap that would have rotated it at startup — but the guard never re-ran mid-life, so the SDK query died mid-thrash and the file-touch heartbeat kept ticking, so the heartbeat reap never fired → silent multi-hour wedge, manual recovery required. This patch closes that gap by making the existing, already-tested guard fire during the container's life, capping transcript growth below the wedge zone automatically.
+- **Scope caveat:** Prevents the *accumulation* wedge (transcript → 21 MB), not the *single-catastrophic-tour* wedge (a turn that crosses the cap and dies before returning to idle) — patch #26's watchdog covers that timing. Does not reduce per-tour compaction thrash itself (the deeper `poids-par-tour` lever); it bounds the cumulative bloat that thrash produces.
+- **Exit condition:** Upstream makes the SDK reliably fork a fresh session on compaction (so no single transcript grows unbounded), or `maybeRotateContinuation` is moved into the loop upstream.
+- **Lines:** ~20 (helper + idle-branch call + constant/var + comments)
+
+---
+
 ## Removed / not needed under v2
 
 ### ~~Mount allowlist env override~~ — SUPERSEDED BY V2 NATIVE (2026-04-24)
