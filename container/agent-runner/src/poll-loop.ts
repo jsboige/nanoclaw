@@ -151,6 +151,17 @@ const TOOL_STUCK_CHECK_INTERVAL_MS = 30_000;
 // resources the same afternoon.
 const IDLE_KEEPALIVE_MS = 2 * 60 * 60 * 1000;
 
+// [PATCH-myia #41] How often, while idle, to re-evaluate the provider's
+// continuation-rotation guard (transcript size/age cold-resume cap). The guard
+// is otherwise only checked once at container startup; a container that stays
+// up for hours never re-checks, so a transcript that grows past the cap
+// *between* tours rides an ever-growing .jsonl into the cold-resume/thrash
+// wedge (#2177 zombie — wedge #7 reached 21MB before the SDK query died).
+// 60s is far finer than the multi-hour growth that produced the wedge, and the
+// probe (findTranscriptPath + statSync) is cheap, so this adds no meaningful
+// idle cost while closing the mid-life gap.
+const ROTATE_CHECK_INTERVAL_MS = 60_000;
+
 // [PATCH-myia #29] Fail-fast gate softening. The per-turn required-MCP gate
 // (further down) previously, on a probe failure, wrote a 🛑 BLOCKED chat
 // message AND `markCompleted`'d the user's message — permanently dropping it.
@@ -173,7 +184,7 @@ const IDLE_KEEPALIVE_MS = 2 * 60 * 60 * 1000;
 const BLOCKED_NOTICE_THROTTLE_MS = 5 * 60 * 1000;
 const BLOCKED_RETRY_BACKOFF_MS = 10_000;
 
-// [PATCH-myia #40] Autocompact-thrash result signature. The SDK emits this as
+// [PATCH-myia #42] Autocompact-thrash result signature. The SDK emits this as
 // a result error when the resumed transcript is too large to compact within
 // the configured window. Matched in processQuery's result path so the
 // continuation can be dropped and the next turn starts fresh — breaking the
@@ -280,6 +291,37 @@ export function isCorruptionError(msg: string): boolean {
   );
 }
 
+/**
+ * [PATCH-myia #41] Mid-life continuation-rotation policy.
+ *
+ * The provider's `maybeRotateContinuation` guard (transcript size/age
+ * cold-resume cap) is evaluated once at startup — see the call just before the
+ * poll loop. A long-lived container never re-checks it, so a transcript that
+ * grows past the cap between tours rides an ever-growing .jsonl into the
+ * cold-resume/thrash wedge (#2177 zombie; wedge #7 reached 21MB before the SDK
+ * query died). The idle branch calls this to decide whether to re-probe now.
+ *
+ * Pure — the probe is injected — so the throttle policy is unit-testable
+ * without driving the loop or touching the filesystem. `checked` reports
+ * whether the probe ran (caller advances its throttle clock on true); `reason`
+ * is the non-null rotate reason when a rotation should fire.
+ *
+ * Only re-checks while genuinely idle: the probe renames the live .jsonl aside
+ * as a side effect, which is only safe when no query holds it.
+ */
+export function evaluateMidLifeRotation(args: {
+  continuation: string | undefined;
+  nowMs: number;
+  lastCheckMs: number;
+  intervalMs: number;
+  probe: ((continuation: string) => string | null) | undefined;
+}): { checked: boolean; reason: string | null } {
+  const { continuation, nowMs, lastCheckMs, intervalMs, probe } = args;
+  if (!continuation || !probe) return { checked: false, reason: null };
+  if (nowMs - lastCheckMs < intervalMs) return { checked: false, reason: null };
+  return { checked: true, reason: probe(continuation) };
+}
+
 function log(msg: string): void {
   console.error(`[poll-loop] ${msg}`);
 }
@@ -367,6 +409,10 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
   // [PATCH-myia #30] Idle keep-alive bookkeeping. Timestamp of when the
   // current uninterrupted idle stretch began (0 = not currently idle).
   let idleSince = 0;
+  // [PATCH-myia #41] Last time the idle branch re-evaluated the continuation
+  // rotation guard (0 = never this container). Throttled by
+  // ROTATE_CHECK_INTERVAL_MS.
+  let lastRotateCheckAt = 0;
   // [PATCH-myia #29] When we last posted a 🛑 BLOCKED notice (0 = never).
   // Throttles the user-visible message while the MCP chain is flapping.
   let lastBlockedNoticeAt = 0;
@@ -399,6 +445,31 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
       const nowIdle = Date.now();
       if (idleSince === 0) idleSince = nowIdle;
       if (nowIdle - idleSince < IDLE_KEEPALIVE_MS) touchHeartbeat();
+
+      // [PATCH-myia #41] Mid-life continuation rotation. Re-evaluate the
+      // provider's transcript-size/age guard here — idle is the only point
+      // with no active query holding the .jsonl, so the probe's rename-aside
+      // is safe. Without this, the guard runs only at startup and a container
+      // up for hours grows its transcript past the cap into a cold-resume/
+      // thrash wedge (#2177; wedge #7 hit 21MB). On a hit, drop the
+      // continuation so the next turn starts a fresh transcript — the same
+      // reset the manual zombie recovery performs, done pre-emptively.
+      const rot = evaluateMidLifeRotation({
+        continuation,
+        nowMs: nowIdle,
+        lastCheckMs: lastRotateCheckAt,
+        intervalMs: ROTATE_CHECK_INTERVAL_MS,
+        probe: config.provider.maybeRotateContinuation
+          ? (c) => config.provider.maybeRotateContinuation!(c, config.cwd)
+          : undefined,
+      });
+      if (rot.checked) lastRotateCheckAt = nowIdle;
+      if (rot.reason) {
+        log(`Rotating session mid-life — ${rot.reason}; next turn starts fresh`);
+        clearContinuation(config.providerName);
+        continuation = undefined;
+      }
+
       await sleep(POLL_INTERVAL_MS);
       continue;
     }
@@ -642,12 +713,12 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
         }
         batchError = `mcp_registry_lost:${serverName}`;
       }
-      // [PATCH-myia #40] Autocompact-thrash self-heal: processQuery detected
+      // [PATCH-myia #42] Autocompact-thrash self-heal: processQuery detected
       // the thrash signature on a result error and asks us to drop the
-      // continuation so the next turn starts a fresh session. The thrash
-      // error text was already delivered this turn inside processQuery, so
-      // no extra user message — just clear + flag so the batch is archived
-      // as an error and the cron/host-sweep advances the recurrence.
+      // continuation so the next turn starts a fresh session. No extra user
+      // message — the thrash text itself is telemetry (#40 suppresses it from
+      // the channel) — just clear + flag so the batch is archived as an error
+      // and the cron/host-sweep advances the recurrence.
       if (result.thrashCleared) {
         log(`Clearing continuation due to autocompact thrash — next turn starts fresh`);
         continuation = undefined;
@@ -738,6 +809,12 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
           stalledAborted = true;
           await sleep(BLOCKED_RETRY_BACKOFF_MS);
         }
+      } else if (isProviderStatusNoise(errMsg)) {
+        // [PATCH-myia #40] Don't leak auto-compaction telemetry ("Autocompact
+        // is thrashing…" / "Claude Code returned an error result: …") to the
+        // channel — log only. Genuine errors still fall through to the write
+        // below (incident 2026-07-15).
+        log(`Suppressed provider status noise from query-error channel write: ${errMsg.slice(0, 80)}`);
       } else {
         writeMessageOut({
           id: generateId(),
@@ -845,7 +922,7 @@ interface QueryResult {
    */
   stalledAborted?: boolean;
   /**
-   * [PATCH-myia #40] Set when a result error carried the autocompact-thrash
+   * [PATCH-myia #42] Set when a result error carried the autocompact-thrash
    * signature — the resumed transcript is too large to compact. Signals the
    * outer loop to clear continuation so the next inbound starts a fresh
    * session instead of resuming the bloated one and re-thrashing forever.
@@ -866,7 +943,7 @@ export async function processQuery(
 ): Promise<QueryResult> {
   let queryContinuation: string | undefined;
   let mcpRegistryLost: { toolName: string; serverName: string } | undefined;
-  let thrashCleared = false; // [PATCH-myia #40]
+  let thrashCleared = false; // [PATCH-myia #42]
   let done = false;
   let unwrappedNudged = false;
   // Prompt queue for the exchange hook — each result event consumes the
@@ -1289,7 +1366,7 @@ export async function processQuery(
         // Claude session with no prior context.
         setContinuation(providerName, event.continuation);
       } else if (event.type === 'result') {
-        // [PATCH-myia #40] Autocompact-thrash self-heal. The SDK surfaces
+        // [PATCH-myia #42] Autocompact-thrash self-heal. The SDK surfaces
         // "Autocompact is thrashing" as a result error (isError=true) when
         // the resumed transcript is too large to compact within the
         // configured window — small-window models (glm-5.2 @ 250k) hit this
@@ -1301,9 +1378,9 @@ export async function processQuery(
         // continuation itself (not in scope, and it has no provider ref to
         // call isSessionInvalid), so it signals via the thrashCleared flag
         // on QueryResult — runPollLoop then drops the continuation, same
-        // shape as the mcpRegistryLost signal. The error text is still
-        // delivered below by deliverErrorResult, so the turn isn't silent;
-        // the NEXT turn starts a fresh session.
+        // shape as the mcpRegistryLost signal. The error text still flows to
+        // deliverErrorResult below, where #40's telemetry guard suppresses
+        // it from the channel; the NEXT turn starts a fresh session.
         if (event.isError === true && THRASH_RE.test(event.text ?? '')) {
           log(`Autocompact thrash detected — dropping continuation so the next turn starts a fresh session`);
           queryContinuation = undefined;
@@ -1516,6 +1593,29 @@ function handleEvent(event: ProviderEvent, _routing: RoutingContext): void {
 }
 
 /**
+ * [PATCH-myia #40] SDK/CLI status telemetry that must never reach a user
+ * channel. When a heavy turn auto-compacts, the provider emits notices like
+ * `Context compacted (N tokens compacted).` as result text, or returns/throws
+ * `Autocompact is thrashing…` / `Claude Code returned an error result: …`.
+ * All three of poll-loop's fallback delivery paths (deliverErrorResult, the
+ * #19 bare-text routing-source fallback, and the reactive catch-path `Error:`
+ * write) would otherwise post these to the group. Incident 2026-07-15: 91 of
+ * 93 chat deliveries to the Telegram group over ~11h were this noise, drowning
+ * real replies. These are internal telemetry — log them, never deliver. A
+ * leading `Error: ` prefix (added by the catch path) is stripped before match.
+ * Genuine agent text and genuine provider errors (403 billing_error, MCP init
+ * failures, etc.) do NOT match and are delivered as before.
+ */
+export function isProviderStatusNoise(text: string): boolean {
+  const t = text.trim().replace(/^Error:\s*/, '');
+  return (
+    /^Context compacted \(/.test(t) ||
+    /^Autocompact is thrashing\b/.test(t) ||
+    /^Claude Code returned an error result\b/.test(t)
+  );
+}
+
+/**
  * Deliver a turn's text straight to the channel the batch arrived on. Used when
  * a turn ends in a provider error (e.g. a non-retryable 403 billing_error) with
  * no <message> envelope: the notice would otherwise be dropped as scratchpad.
@@ -1523,6 +1623,11 @@ function handleEvent(event: ProviderEvent, _routing: RoutingContext): void {
  * `Error:` prefix — the provider's text is already a user-facing message.
  */
 function deliverErrorResult(text: string, routing: RoutingContext): void {
+  if (isProviderStatusNoise(text)) {
+    // [PATCH-myia #40] Log, don't deliver — auto-compaction telemetry.
+    log(`Suppressed provider status noise from error-result channel delivery: ${text.trim().slice(0, 80)}`);
+    return;
+  }
   log('Error result with no <message> envelope — delivering to channel');
   writeMessageOut({
     id: generateId(),
@@ -1617,6 +1722,19 @@ function dispatchResultText(
   // recurs especially after MCP registry loss → continuation cleared → fresh
   // SDK init that sometimes drops the destination-wrapping discipline.
   //
+  // [PATCH-myia #40] Drop provider status telemetry before any fallback
+  // delivery. A heavy turn that only auto-compacted emits e.g. "Context
+  // compacted (N tokens compacted)." as its sole text with no <message>
+  // envelope; without this it reaches the user's channel via the #19 fallback
+  // below (incident 2026-07-15: 91/93 group deliveries were this noise). Return
+  // early so no channel write AND no re-wrap nudge fires for pure telemetry.
+  if (!isError && sent === 0 && isProviderStatusNoise(scratchpad)) {
+    log(
+      `Suppressed provider status noise from routing-source fallback (${scratchpad.trim().length} chars): ${scratchpad.trim().slice(0, 80)}`,
+    );
+    return { sent: 0, hasUnwrapped: false };
+  }
+
   // We only fall back when:
   //   - !isError (error turns flow through the caller's deliverErrorResult
   //     path instead — single delivery, status 'error' archived; without this

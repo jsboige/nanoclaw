@@ -351,7 +351,7 @@ const CLAUDE_CODE_AUTO_COMPACT_WINDOW = process.env.CLAUDE_CODE_AUTO_COMPACT_WIN
  * for the same reason — the broken registry is bound to this resumed
  * transcript, only a fresh session restores tool visibility.
  */
-// [PATCH-myia #40] "autocompact is thrashing" is surfaced by the SDK as a
+// [PATCH-myia #42] "autocompact is thrashing" is surfaced by the SDK as a
 // result error (not a thrown error) when the resumed transcript is too large
 // to compact within the configured window — small-window models (glm-5.2
 // @ 250k) reach this at ~5-6MB, below the 12MB cold-start rotate cap. Adding

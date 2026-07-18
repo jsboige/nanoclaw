@@ -88,7 +88,7 @@ describe('ClaudeProvider.maybeRotateContinuation', () => {
   });
 });
 
-// [PATCH-myia #40] isSessionInvalid must match the autocompact-thrash result
+// [PATCH-myia #42] isSessionInvalid must match the autocompact-thrash result
 // text so the poll-loop's result path can clear the continuation and let the
 // next turn start fresh — the self-heal that breaks the infinite thrash loop.
 // The SDK surfaces it as a result error string (not a thrown Error), so both
