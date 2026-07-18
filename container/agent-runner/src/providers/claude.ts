@@ -351,7 +351,14 @@ const CLAUDE_CODE_AUTO_COMPACT_WINDOW = process.env.CLAUDE_CODE_AUTO_COMPACT_WIN
  * for the same reason — the broken registry is bound to this resumed
  * transcript, only a fresh session restores tool visibility.
  */
-const STALE_SESSION_RE = /no conversation found|ENOENT.*\.jsonl|session.*not found|MCP servers not connected at init|MCP registry lost mid-session/i;
+// [PATCH-myia #40] "autocompact is thrashing" is surfaced by the SDK as a
+// result error (not a thrown error) when the resumed transcript is too large
+// to compact within the configured window — small-window models (glm-5.2
+// @ 250k) reach this at ~5-6MB, below the 12MB cold-start rotate cap. Adding
+// it here lets the poll-loop's result path (which already clears the
+// continuation on isSessionInvalid) recover a thrashing session in one turn
+// instead of looping forever. See poll-loop.ts result-path handler.
+const STALE_SESSION_RE = /no conversation found|ENOENT.*\.jsonl|session.*not found|MCP servers not connected at init|MCP registry lost mid-session|autocompact is thrashing/i;
 
 /**
  * Match the synthetic tool_result text the SDK injects when the model

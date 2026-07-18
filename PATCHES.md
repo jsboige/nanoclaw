@@ -396,6 +396,15 @@ If none works, document the patch here with justification.
 - **Exit condition:** Upstream sets a sane `NO_PROXY` when it injects the OneCLI proxy env (so internal `host.docker.internal` MCP/loopback traffic bypasses the credential proxy by default), or OneCLI's `applyContainerConfig` grows a no-proxy allowlist parameter.
 - **Lines:** ~6 (+ comment block)
 
+### 40. Autocompact-thrash self-heal (drop continuation on thrash result error)
+
+- **Files:** `container/agent-runner/src/poll-loop.ts` (new `THRASH_RE` const; `processQuery` result path; `QueryResult.thrashCleared` field + return; `runPollLoop` handler after `mcpRegistryLost`), `container/agent-runner/src/providers/claude.ts` (`STALE_SESSION_RE`).
+- **Summary:** The SDK emits "Autocompact is thrashing" as a *result error* (`isError=true`) when the resumed transcript is too large to compact within the configured window. The result path previously kept the continuation, so every subsequent turn resumed the same bloated session and re-thrashed — an infinite loop (bot "alive but producing no work"). Now `processQuery` matches the thrash signature (`THRASH_RE = /autocompact is thrashing/i`) on a result error, signals via the new `QueryResult.thrashCleared` flag (dropping `queryContinuation`), and `runPollLoop` clears the continuation so the next turn starts a fresh session — same shape as the existing `mcpRegistryLost` signal. The thrash error text is still delivered this turn (no silent drop). The signature is also added to `STALE_SESSION_RE` so the catch path (thrown variant) recovers too.
+- **Why:** 2026-07-17 incident — the bot's review-PR cron (`15,45 * * * *`) reused one persistent SDK session, accumulating ~100k tokens of `gh pr diff` tool_results per cycle until the transcript hit 5.8 MB (~400k tokens), past the 250k compaction window (`CLAUDE_CODE_AUTO_COMPACT_WINDOW`). Auto-compact couldn't keep up → thrash loop for hours. The cold-start rotation guard (`maybeRotateContinuation`, default 12 MB) didn't fire (5.8 MB < 12 MB cap, and rotation is only evaluated at cold-start, not mid-run on a persistent container). This patch is the reactive safety net that self-heals in one turn regardless of threshold tuning or container persistence. The proactive layer is config-only: `.env CLAUDE_TRANSCRIPT_ROTATE_BYTES=4194304` (rotate at ~270k tokens, before thrash, at the next cold-start) — not a code patch, per the config-first discipline.
+- **Exit condition:** Upstream grows mid-session transcript rotation (re-evaluates `maybeRotateContinuation` per turn, not just cold-start) AND/OR derives the rotate threshold from the compaction window, making both the reactive self-heal and the `.env` threshold tuning unnecessary. Re-evaluate at the next sync.
+- **Test:** `container/agent-runner/src/providers/claude.rotate.test.ts` — `ClaudeProvider.isSessionInvalid (thrash detection)` (string + Error forms match; billing error does not).
+- **Lines:** ~30 (incl. comment blocks)
+
 ---
 
 ## Removed / not needed under v2

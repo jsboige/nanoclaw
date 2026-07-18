@@ -87,3 +87,29 @@ describe('ClaudeProvider.maybeRotateContinuation', () => {
     expect(provider.maybeRotateContinuation('does-not-exist', CWD)).toBeNull();
   });
 });
+
+// [PATCH-myia #40] isSessionInvalid must match the autocompact-thrash result
+// text so the poll-loop's result path can clear the continuation and let the
+// next turn start fresh — the self-heal that breaks the infinite thrash loop.
+// The SDK surfaces it as a result error string (not a thrown Error), so both
+// the string and Error-message shapes must match.
+describe('ClaudeProvider.isSessionInvalid (thrash detection)', () => {
+  it('matches the autocompact-thrash result text (string form, from result path)', () => {
+    const provider = new ClaudeProvider();
+    expect(
+      provider.isSessionInvalid(
+        'Error: Autocompact is thrashing: the context refilled to the limit within 3 turns of the previous compact, 3 times in a row.',
+      ),
+    ).toBe(true);
+  });
+
+  it('matches an Error carrying the thrash message (thrown-error form, catch path)', () => {
+    const provider = new ClaudeProvider();
+    expect(provider.isSessionInvalid(new Error('Autocompact is thrashing: refill loop'))).toBe(true);
+  });
+
+  it('does not match a non-session error (e.g. billing) — regression guard', () => {
+    const provider = new ClaudeProvider();
+    expect(provider.isSessionInvalid('Error: 403 billing_error: usage limit reached')).toBe(false);
+  });
+});

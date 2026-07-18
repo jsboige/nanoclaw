@@ -173,6 +173,14 @@ const IDLE_KEEPALIVE_MS = 2 * 60 * 60 * 1000;
 const BLOCKED_NOTICE_THROTTLE_MS = 5 * 60 * 1000;
 const BLOCKED_RETRY_BACKOFF_MS = 10_000;
 
+// [PATCH-myia #40] Autocompact-thrash result signature. The SDK emits this as
+// a result error when the resumed transcript is too large to compact within
+// the configured window. Matched in processQuery's result path so the
+// continuation can be dropped and the next turn starts fresh — breaking the
+// infinite thrash loop. Mirrored in providers/claude.ts STALE_SESSION_RE so
+// the catch path (thrown variant) recovers too.
+const THRASH_RE = /autocompact is thrashing/i;
+
 // [PATCH-myia #35] Cap consecutive isSessionInvalid retries on the same
 // processingIds set so the reactive PATCH #31 path can't loop forever when
 // the failure is persistent (not transient). PATCH #31 was designed for a
@@ -634,6 +642,18 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
         }
         batchError = `mcp_registry_lost:${serverName}`;
       }
+      // [PATCH-myia #40] Autocompact-thrash self-heal: processQuery detected
+      // the thrash signature on a result error and asks us to drop the
+      // continuation so the next turn starts a fresh session. The thrash
+      // error text was already delivered this turn inside processQuery, so
+      // no extra user message — just clear + flag so the batch is archived
+      // as an error and the cron/host-sweep advances the recurrence.
+      if (result.thrashCleared) {
+        log(`Clearing continuation due to autocompact thrash — next turn starts fresh`);
+        continuation = undefined;
+        clearContinuation(config.providerName);
+        batchError = 'autocompact_thrash';
+      }
     } catch (err) {
       const errMsg = err instanceof Error ? err.message : String(err);
       log(`Query error: ${errMsg}`);
@@ -824,6 +844,15 @@ interface QueryResult {
    * next iteration re-picks those messages with a fresh query.
    */
   stalledAborted?: boolean;
+  /**
+   * [PATCH-myia #40] Set when a result error carried the autocompact-thrash
+   * signature — the resumed transcript is too large to compact. Signals the
+   * outer loop to clear continuation so the next inbound starts a fresh
+   * session instead of resuming the bloated one and re-thrashing forever.
+   * The thrash error text is still delivered to the user this turn, so no
+   * extra message is needed (unlike mcpRegistryLost).
+   */
+  thrashCleared?: boolean;
 }
 
 export async function processQuery(
@@ -837,6 +866,7 @@ export async function processQuery(
 ): Promise<QueryResult> {
   let queryContinuation: string | undefined;
   let mcpRegistryLost: { toolName: string; serverName: string } | undefined;
+  let thrashCleared = false; // [PATCH-myia #40]
   let done = false;
   let unwrappedNudged = false;
   // Prompt queue for the exchange hook — each result event consumes the
@@ -1259,6 +1289,26 @@ export async function processQuery(
         // Claude session with no prior context.
         setContinuation(providerName, event.continuation);
       } else if (event.type === 'result') {
+        // [PATCH-myia #40] Autocompact-thrash self-heal. The SDK surfaces
+        // "Autocompact is thrashing" as a result error (isError=true) when
+        // the resumed transcript is too large to compact within the
+        // configured window — small-window models (glm-5.2 @ 250k) hit this
+        // at ~5-6MB, below the 12MB cold-start rotate cap. The result path
+        // previously preserved the continuation, so every subsequent turn
+        // resumed the same bloated session and re-thrashed — an infinite
+        // loop leaving the bot "alive but producing no work" for hours
+        // (2026-07-17 incident). processQuery can't clear the outer-loop
+        // continuation itself (not in scope, and it has no provider ref to
+        // call isSessionInvalid), so it signals via the thrashCleared flag
+        // on QueryResult — runPollLoop then drops the continuation, same
+        // shape as the mcpRegistryLost signal. The error text is still
+        // delivered below by deliverErrorResult, so the turn isn't silent;
+        // the NEXT turn starts a fresh session.
+        if (event.isError === true && THRASH_RE.test(event.text ?? '')) {
+          log(`Autocompact thrash detected — dropping continuation so the next turn starts a fresh session`);
+          queryContinuation = undefined;
+          thrashCleared = true;
+        }
         // A result — with or without text — means the turn is done. Mark
         // the initial batch completed now so the host sweep doesn't see
         // stale 'processing' claims while the query stays open for
@@ -1428,7 +1478,7 @@ export async function processQuery(
     }
   }
 
-  return { continuation: queryContinuation, mcpRegistryLost, stalledAborted };
+  return { continuation: queryContinuation, mcpRegistryLost, stalledAborted, thrashCleared };
 }
 
 function notifyExchangeComplete(
