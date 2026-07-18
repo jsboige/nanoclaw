@@ -5,12 +5,13 @@ import { getPendingMessages, markCompleted } from './db/messages-in.js';
 import { getUndeliveredMessages } from './db/messages-out.js';
 import { formatMessages, extractRouting } from './formatter.js';
 // [PATCH-myia #28] evaluateToolStuckBudget, [PATCH-myia #35] evaluateStaleRetryCap,
-// [PATCH-myia #41] evaluateMidLifeRotation
+// [PATCH-myia #40] isProviderStatusNoise, [PATCH-myia #41] evaluateMidLifeRotation
 import {
   evaluateMidLifeRotation,
   evaluateStaleRetryCap,
   evaluateToolStuckBudget,
   isCorruptionError,
+  isProviderStatusNoise,
   processQuery,
 } from './poll-loop.js';
 import { MockProvider } from './providers/mock.js';
@@ -794,5 +795,96 @@ describe('[PATCH-myia #41] evaluateMidLifeRotation', () => {
       },
     });
     expect(seen).toBe('sess-live-123');
+  });
+});
+
+// [PATCH-myia #40] Provider status telemetry must never reach a user channel.
+// Incident 2026-07-15: 91 of 93 chat deliveries to the Telegram group over ~11h
+// were auto-compaction notices ("Context compacted (N tokens compacted)." /
+// "Autocompact is thrashing…") that a heavy turn emitted with no <message>
+// envelope, leaking through poll-loop's three fallback delivery paths. The
+// narrow predicate below drops exactly those families while leaving genuine
+// agent text and genuine provider errors untouched. See PATCHES.md#40.
+describe('[PATCH-myia #40] isProviderStatusNoise', () => {
+  it('matches the "Context compacted (N tokens compacted)." notice', () => {
+    expect(isProviderStatusNoise('Context compacted (169,252 tokens compacted).')).toBe(true);
+  });
+
+  it('matches "Autocompact is thrashing…"', () => {
+    expect(
+      isProviderStatusNoise('Autocompact is thrashing: context refilled to the limit within 3 turns'),
+    ).toBe(true);
+  });
+
+  it('matches "Claude Code returned an error result: …"', () => {
+    expect(isProviderStatusNoise('Claude Code returned an error result: Autocompact is thrashing')).toBe(true);
+  });
+
+  it('strips a leading "Error: " prefix before matching (catch-path shape)', () => {
+    // The reactive catch path wraps the throw as `Error: ${errMsg}` before the
+    // channel write — the guard must see through that prefix.
+    expect(isProviderStatusNoise('Error: Autocompact is thrashing')).toBe(true);
+    expect(isProviderStatusNoise('Error: Claude Code returned an error result: x')).toBe(true);
+  });
+
+  it('tolerates surrounding whitespace', () => {
+    expect(isProviderStatusNoise('  Context compacted (5 tokens compacted).\n')).toBe(true);
+  });
+
+  it('does NOT match genuine agent text', () => {
+    expect(isProviderStatusNoise('The answer is 4')).toBe(false);
+    expect(isProviderStatusNoise('bare text, no envelope')).toBe(false);
+    // A message that merely mentions compaction mid-sentence is not a notice.
+    expect(isProviderStatusNoise('I compacted the context, here is the summary')).toBe(false);
+  });
+
+  it('does NOT match genuine provider errors (403 billing, MCP init)', () => {
+    expect(
+      isProviderStatusNoise('Spending limit reached. Add your own key at https://example.com/keys'),
+    ).toBe(false);
+    expect(isProviderStatusNoise('Error: MCP servers not connected at init')).toBe(false);
+    expect(isProviderStatusNoise('')).toBe(false);
+  });
+});
+
+describe('[PATCH-myia #40] provider status noise is not delivered to channels', () => {
+  it('suppresses a "Context compacted" non-error result with no <message> envelope (Site A)', async () => {
+    const { query, pushes } = makeResultQuery({
+      type: 'result',
+      text: 'Context compacted (169,252 tokens compacted).',
+    });
+
+    await processQuery(query, ERR_ROUTING, ['m1'], 'claude', undefined, 'prompt', undefined);
+
+    // Without the guard this would fall through the #19 routing-source fallback
+    // and post to the channel. Nothing delivered, and no re-wrap nudge fired.
+    expect(getUndeliveredMessages()).toHaveLength(0);
+    expect(pushes).toHaveLength(0);
+  });
+
+  it('suppresses an "Autocompact is thrashing" error result with no envelope (Site B)', async () => {
+    const { query, pushes } = makeResultQuery({
+      type: 'result',
+      text: 'Autocompact is thrashing: context refilled to the limit within 3 turns',
+      isError: true,
+    });
+
+    await processQuery(query, ERR_ROUTING, ['m1'], 'claude', undefined, 'prompt', undefined);
+
+    // Error turns with no envelope route through deliverErrorResult, which now
+    // drops known telemetry. No delivery, no nudge.
+    expect(getUndeliveredMessages()).toHaveLength(0);
+    expect(pushes).toHaveLength(0);
+  });
+
+  it('still delivers a genuine billing error (regression guard — filter is narrow)', async () => {
+    const budgetText = 'Spending limit reached. Add your own key at https://example.com/keys';
+    const { query } = makeResultQuery({ type: 'result', text: budgetText, isError: true });
+
+    await processQuery(query, ERR_ROUTING, ['m1'], 'claude', undefined, 'prompt', undefined);
+
+    const out = getUndeliveredMessages();
+    expect(out).toHaveLength(1);
+    expect(JSON.parse(out[0].content).text).toBe(budgetText);
   });
 });

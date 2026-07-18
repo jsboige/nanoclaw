@@ -789,6 +789,12 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
           stalledAborted = true;
           await sleep(BLOCKED_RETRY_BACKOFF_MS);
         }
+      } else if (isProviderStatusNoise(errMsg)) {
+        // [PATCH-myia #40] Don't leak auto-compaction telemetry ("Autocompact
+        // is thrashing…" / "Claude Code returned an error result: …") to the
+        // channel — log only. Genuine errors still fall through to the write
+        // below (incident 2026-07-15).
+        log(`Suppressed provider status noise from query-error channel write: ${errMsg.slice(0, 80)}`);
       } else {
         writeMessageOut({
           id: generateId(),
@@ -1537,6 +1543,29 @@ function handleEvent(event: ProviderEvent, _routing: RoutingContext): void {
 }
 
 /**
+ * [PATCH-myia #40] SDK/CLI status telemetry that must never reach a user
+ * channel. When a heavy turn auto-compacts, the provider emits notices like
+ * `Context compacted (N tokens compacted).` as result text, or returns/throws
+ * `Autocompact is thrashing…` / `Claude Code returned an error result: …`.
+ * All three of poll-loop's fallback delivery paths (deliverErrorResult, the
+ * #19 bare-text routing-source fallback, and the reactive catch-path `Error:`
+ * write) would otherwise post these to the group. Incident 2026-07-15: 91 of
+ * 93 chat deliveries to the Telegram group over ~11h were this noise, drowning
+ * real replies. These are internal telemetry — log them, never deliver. A
+ * leading `Error: ` prefix (added by the catch path) is stripped before match.
+ * Genuine agent text and genuine provider errors (403 billing_error, MCP init
+ * failures, etc.) do NOT match and are delivered as before.
+ */
+export function isProviderStatusNoise(text: string): boolean {
+  const t = text.trim().replace(/^Error:\s*/, '');
+  return (
+    /^Context compacted \(/.test(t) ||
+    /^Autocompact is thrashing\b/.test(t) ||
+    /^Claude Code returned an error result\b/.test(t)
+  );
+}
+
+/**
  * Deliver a turn's text straight to the channel the batch arrived on. Used when
  * a turn ends in a provider error (e.g. a non-retryable 403 billing_error) with
  * no <message> envelope: the notice would otherwise be dropped as scratchpad.
@@ -1544,6 +1573,11 @@ function handleEvent(event: ProviderEvent, _routing: RoutingContext): void {
  * `Error:` prefix — the provider's text is already a user-facing message.
  */
 function deliverErrorResult(text: string, routing: RoutingContext): void {
+  if (isProviderStatusNoise(text)) {
+    // [PATCH-myia #40] Log, don't deliver — auto-compaction telemetry.
+    log(`Suppressed provider status noise from error-result channel delivery: ${text.trim().slice(0, 80)}`);
+    return;
+  }
   log('Error result with no <message> envelope — delivering to channel');
   writeMessageOut({
     id: generateId(),
@@ -1638,6 +1672,19 @@ function dispatchResultText(
   // recurs especially after MCP registry loss → continuation cleared → fresh
   // SDK init that sometimes drops the destination-wrapping discipline.
   //
+  // [PATCH-myia #40] Drop provider status telemetry before any fallback
+  // delivery. A heavy turn that only auto-compacted emits e.g. "Context
+  // compacted (N tokens compacted)." as its sole text with no <message>
+  // envelope; without this it reaches the user's channel via the #19 fallback
+  // below (incident 2026-07-15: 91/93 group deliveries were this noise). Return
+  // early so no channel write AND no re-wrap nudge fires for pure telemetry.
+  if (!isError && sent === 0 && isProviderStatusNoise(scratchpad)) {
+    log(
+      `Suppressed provider status noise from routing-source fallback (${scratchpad.trim().length} chars): ${scratchpad.trim().slice(0, 80)}`,
+    );
+    return { sent: 0, hasUnwrapped: false };
+  }
+
   // We only fall back when:
   //   - !isError (error turns flow through the caller's deliverErrorResult
   //     path instead — single delivery, status 'error' archived; without this
