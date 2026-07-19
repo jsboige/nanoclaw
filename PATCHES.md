@@ -426,6 +426,15 @@ If none works, document the patch here with justification.
 - **Test:** `container/agent-runner/src/providers/claude.rotate.test.ts` — `ClaudeProvider.isSessionInvalid (thrash detection)` (string + Error forms match; billing error does not).
 - **Lines:** ~30 (incl. comment blocks)
 
+### 43. Autocompact-thrash detection at the assistant-message layer (the shape #42 missed)
+
+- **Files:** `container/agent-runner/src/providers/claude.ts` (new exported `detectAutocompactThrash()` helper; `translateEvents` throws on assistant-level thrash).
+- **Summary:** #42 assumed "Autocompact is thrashing" arrives as a `result` event with `isError=true` (or a thrown error). Firsthand transcript forensics on 2026-07-19 (session `6b55129b`, the one that ate the owner's 13:57 question) proved otherwise: the SDK surfaces it as an **assistant text message** (`type=assistant`, `message.content[].type=text`) with **no** trailing `result` error. `translateEvents` (claude.ts) has no `assistant` branch, so the thrash became only a `{type:'activity'}` event — #42's result-branch check never fired, the continuation was never cleared, and the bloated session re-thrashed every turn, silently `markCompleted`-ing each inbound message. This is the "nanoclaw alive but eats every message for a week" failure the owner reported. #43 detects the thrash on the assistant message (`detectAutocompactThrash`, colon-anchored `/autocompact is thrashing:/i` to avoid false positives on casual mentions) and **throws** — routing into the existing #31/#35 stale-recovery catch path, which (a) clears the continuation (`STALE_SESSION_RE` already matches the phrase) so the next turn starts fresh, and (b) resets the batch to *pending* so the user's message survives into the fresh session instead of being lost.
+- **Why:** #42 (result/throw shapes) + #40 (telemetry suppression) + #41 (size rotation) all left the **actual observed shape** — assistant-message thrash — undetected. Because #40 makes the thrash silent on the channel, this dead-code gap was invisible: surveillance saw a quiet channel and completing crons and concluded "healthy" while every real user question was being consumed and dropped. #43 is the piece that makes the self-heal actually fire for the shape that occurs in production, and — critically — routes it into the message-*preserving* path rather than the message-*losing* `thrashCleared` path.
+- **Exit condition:** Upstream treats compaction thrash as a session-reset signal (same as #42's exit), or emits it as a typed result error the poll-loop already handles. Re-evaluate at next sync; if #42's result-branch path is confirmed dead across a full sync window, fold it into #43.
+- **Test:** `container/agent-runner/src/providers/claude.rotate.test.ts` — `detectAutocompactThrash (assistant-message shape)` (real SDK shape; mixed blocks; false-positive guard on casual mention; normal reply; malformed content).
+- **Lines:** ~30 (incl. comment blocks)
+
 ---
 
 ## Removed / not needed under v2

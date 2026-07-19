@@ -415,6 +415,37 @@ export function detectMissingMcpTool(
   return null;
 }
 
+/**
+ * [PATCH-myia #43] Detect the SDK's autocompact-thrash notice inside an
+ * ASSISTANT message. The SDK surfaces "Autocompact is thrashing: the context
+ * refilled to the limit within 3 turns of the previous compact, 3 times in a
+ * row..." as an assistant text block (verified firsthand in transcript
+ * 6b55129b, 2026-07-19) — NOT as a `result` event with is_error=true. PATCH
+ * #42's self-heal only checked the result branch, so it never fired for the
+ * real event shape: the bloated session re-thrashed every turn, silently
+ * eating every inbound message (the owner's week-long "nanoclaw is basically
+ * broken" complaint).
+ *
+ * The signature is matched with the trailing colon ("thrashing:") so an agent
+ * casually discussing this very bug in its own reply doesn't trip a false
+ * session reset — the SDK always formats the notice with the colon.
+ *
+ * Exported for testability, mirroring detectMissingMcpTool.
+ */
+export function detectAutocompactThrash(assistantMessage: {
+  message?: { content?: unknown };
+}): string | null {
+  const content = assistantMessage?.message?.content;
+  if (!Array.isArray(content)) return null;
+  for (const block of content) {
+    if (!block || typeof block !== 'object') continue;
+    const b = block as { type?: string; text?: unknown };
+    if (b.type !== 'text' || typeof b.text !== 'string') continue;
+    if (/autocompact is thrashing:/i.test(b.text)) return b.text;
+  }
+  return null;
+}
+
 export class ClaudeProvider implements AgentProvider {
   readonly supportsNativeSlashCommands = true;
 
@@ -561,6 +592,24 @@ export class ClaudeProvider implements AgentProvider {
             log(`MCP registry lost mid-session: ${missing.toolName} not in SDK registry — aborting turn for fresh respawn`);
             yield { type: 'mcp_tool_missing', toolName: missing.toolName, serverName: missing.serverName };
             return;
+          }
+        }
+
+        // [PATCH-myia #43] Autocompact-thrash self-heal at the correct layer.
+        // The thrash notice arrives as an ASSISTANT text message (not a result
+        // error), so #42's result-branch check never fired. Throw here so the
+        // outer loop's #31/#35 stale-recovery path runs: isSessionInvalid()
+        // already matches "autocompact is thrashing" (STALE_SESSION_RE), which
+        // (a) clears the continuation so the next turn starts a FRESH session,
+        // and (b) resets the batch to pending so the user's message survives
+        // into that fresh session instead of being silently markCompleted by
+        // the result path. Mirrors the mcp_tool_missing abort above, but via
+        // throw (not yield+return) to reach the message-preserving path.
+        if (message.type === 'assistant') {
+          const thrash = detectAutocompactThrash(message as { message?: { content?: unknown } });
+          if (thrash) {
+            log('Autocompact thrash detected in assistant message — aborting turn so the outer loop clears the continuation and preserves the batch for a fresh session');
+            throw new Error(`autocompact is thrashing (session too large to compact — resetting): ${thrash.slice(0, 160)}`);
           }
         }
 

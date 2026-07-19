@@ -3,7 +3,7 @@ import fs from 'fs';
 import os from 'os';
 import path from 'path';
 
-import { ClaudeProvider } from './claude.js';
+import { ClaudeProvider, detectAutocompactThrash } from './claude.js';
 
 // maybeRotateContinuation guards the cold-resume failure mode: a long-lived
 // session whose on-disk transcript has grown so large (or old) that the SDK
@@ -111,5 +111,60 @@ describe('ClaudeProvider.isSessionInvalid (thrash detection)', () => {
   it('does not match a non-session error (e.g. billing) — regression guard', () => {
     const provider = new ClaudeProvider();
     expect(provider.isSessionInvalid('Error: 403 billing_error: usage limit reached')).toBe(false);
+  });
+});
+
+// [PATCH-myia #43] The thrash notice arrives as an ASSISTANT text message, not
+// a result error — verified firsthand in transcript 6b55129b (2026-07-19),
+// where the final assistant block was "Autocompact is thrashing: the context
+// refilled...". detectAutocompactThrash must find it in that shape so
+// translateEvents can throw and route into the message-preserving recovery.
+describe('detectAutocompactThrash (assistant-message shape)', () => {
+  it('detects the thrash notice in an assistant text block (real SDK shape)', () => {
+    const msg = {
+      message: {
+        role: 'assistant',
+        content: [
+          {
+            type: 'text',
+            text: 'Autocompact is thrashing: the context refilled to the limit within 3 turns of the previous compact, 3 times in a row. Use /clear to start fresh.',
+          },
+        ],
+      },
+    };
+    expect(detectAutocompactThrash(msg)).toContain('thrashing');
+  });
+
+  it('detects the thrash even when mixed with other blocks', () => {
+    const msg = {
+      message: {
+        content: [
+          { type: 'text', text: 'Working on the review...' },
+          { type: 'tool_use', name: 'Bash', input: {} },
+          { type: 'text', text: 'Autocompact is thrashing: refill loop, 3x in a row.' },
+        ],
+      },
+    };
+    expect(detectAutocompactThrash(msg)).toContain('thrashing');
+  });
+
+  it('does not fire on a casual mention without the SDK colon format — false-positive guard', () => {
+    const msg = {
+      message: {
+        content: [{ type: 'text', text: 'I noticed the autocompact is thrashing again on that session, investigating.' }],
+      },
+    };
+    expect(detectAutocompactThrash(msg)).toBeNull();
+  });
+
+  it('returns null for a normal assistant reply', () => {
+    const msg = { message: { content: [{ type: 'text', text: 'Here is the PR review summary.' }] } };
+    expect(detectAutocompactThrash(msg)).toBeNull();
+  });
+
+  it('returns null when content is missing or malformed', () => {
+    expect(detectAutocompactThrash({})).toBeNull();
+    expect(detectAutocompactThrash({ message: {} })).toBeNull();
+    expect(detectAutocompactThrash({ message: { content: 'not-an-array' } })).toBeNull();
   });
 });
