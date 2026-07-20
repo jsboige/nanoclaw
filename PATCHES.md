@@ -435,6 +435,14 @@ If none works, document the patch here with justification.
 - **Test:** `container/agent-runner/src/providers/claude.rotate.test.ts` — `detectAutocompactThrash (assistant-message shape)` (real SDK shape; mixed blocks; false-positive guard on casual mention; normal reply; malformed content).
 - **Lines:** ~30 (incl. comment blocks)
 
+### 44. Forward `CLAUDE_TRANSCRIPT_ROTATE_BYTES` into the container (the passthrough #38 missed, one var later)
+
+- **Files:** `src/container-runner.ts` (one explicit `-e` forward, mirroring the #38 block for `CLAUDE_CODE_AUTO_COMPACT_WINDOW`).
+- **Summary:** The mid-life rotation guard (#41 / `evaluateMidLifeRotation`, upstream PR #60) reads `CLAUDE_TRANSCRIPT_ROTATE_BYTES` from the container's `process.env` and falls back to a **12 MB** default when absent. The operator override (`.env` = 4 MB, set 2026-07-17) never reached the container: exactly like #38, `CLAUDE_*` is not covered by `ENV_PASSTHROUGH_PREFIXES`, and only `CLAUDE_CODE_AUTO_COMPACT_WINDOW` was wired explicitly. So the proactive 4 MB rotation was **dead code in production** — sessions climbed to the 12 MB default, straight through the ~5–6 MB glm-5.2 thrash zone (the 2026-07-17 incident thrashed at 5.81 MB). Discovered 2026-07-20 by a 6h surveillance run: active session at 5.12 MB, `docker exec … printenv CLAUDE_TRANSCRIPT_ROTATE_BYTES` → `<not set>`, churn=1 (no fork despite >4 MB). Fix wires the one var explicitly.
+- **Why:** #41 (the proactive-rotation layer named in #40/#42/#43's "Why" sections) was silently inert — the whole reason those reactive patches kept being the *only* thing catching thrash. This closes the config→container gap so the intended 4 MB rotation actually fires, making #41 real rather than aspirational. Verified post-deploy: fresh container reports `CLAUDE_TRANSCRIPT_ROTATE_BYTES=4194304`.
+- **Exit condition:** Upstream forwards operator `CLAUDE_*` overrides to the container generically (or documents a supported passthrough), making the explicit per-var wiring unnecessary. Re-evaluate at next sync; fold into #38 if a shared helper emerges.
+- **Lines:** ~11 (incl. comment block)
+
 ---
 
 ## Removed / not needed under v2
