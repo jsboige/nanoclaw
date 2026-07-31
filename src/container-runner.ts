@@ -524,6 +524,18 @@ async function buildContainerArgs(
     args.push('-e', `CLAUDE_CODE_AUTO_COMPACT_WINDOW=${process.env.CLAUDE_CODE_AUTO_COMPACT_WINDOW}`);
   }
 
+  // [PATCH-myia #44] Same gap as #38, one var later. The mid-life rotation guard
+  // (evaluateMidLifeRotation, PR #60) reads CLAUDE_TRANSCRIPT_ROTATE_BYTES from
+  // the container's process.env and falls back to a 12MB default when it is
+  // absent. The operator override was set in .env (4MB) on 2026-07-17 but, like
+  // #38, CLAUDE_* is not covered by ENV_PASSTHROUGH_PREFIXES, so it never reached
+  // the container — the proactive 4MB rotation was dead and sessions climbed to
+  // the 12MB default, straight through the ~5-6MB glm-5.2 thrash zone. Wire this
+  // one specific var explicitly, mirroring the block above.
+  if (process.env.CLAUDE_TRANSCRIPT_ROTATE_BYTES) {
+    args.push('-e', `CLAUDE_TRANSCRIPT_ROTATE_BYTES=${process.env.CLAUDE_TRANSCRIPT_ROTATE_BYTES}`);
+  }
+
   // Provider-contributed env vars (e.g. XDG_DATA_HOME, OPENCODE_*, NO_PROXY).
   if (providerContribution.env) {
     for (const [key, value] of Object.entries(providerContribution.env)) {
