@@ -164,6 +164,56 @@ export function isReactionTargetGoneError(err: unknown): boolean {
 }
 
 /**
+ * [PATCH-myia #46] Telegram rejected the emoji itself. Unlike a transient
+ * network error this is deterministic — the same emoji will be rejected on
+ * every retry — so retrying three times and then logging a permanent delivery
+ * failure is pure noise. Measured on this install: 11 permanent failures,
+ * 33 wasted API calls, and 11 "Message delivery failed permanently" ERROR
+ * lines that were all benign. That last part is the real cost: an error log
+ * salted with known-benign entries stops being worth reading.
+ */
+export function isReactionInvalidError(err: unknown): boolean {
+  if (!err || typeof err !== 'object') return false;
+  const msg = (err as { message?: unknown }).message;
+  return typeof msg === 'string' && /REACTION_INVALID/i.test(msg);
+}
+
+/**
+ * [PATCH-myia #46] Telegram accepts reactions only from a fixed allowlist
+ * (👍 👎 ❤ 🔥 👀 🤔 …). The agent-facing contract is a shortcode name, by
+ * design — `mcp-tools/core.instructions.md` documents `emoji` as "the
+ * shortcode name … not the raw character" and offers `white_check_mark` as
+ * an example. The adapter resolves that to ✅, which Telegram does not accept
+ * as a reaction, so the documented happy path fails on Telegram while working
+ * fine on Slack.
+ *
+ * Substitute only where the replacement preserves the SPEECH ACT: an
+ * acknowledgment stays an acknowledgment, a rejection stays a rejection.
+ * Anything else (⚠️ has no honest equivalent in Telegram's set) is left
+ * alone and swallowed by isReactionInvalidError below — silently dropping a
+ * cue is better than inventing one the agent did not mean. Raw characters are
+ * emitted rather than shortcodes so this does not depend on the adapter's
+ * shortcode vocabulary: its EMOJI_NAME_PATTERN (/^[a-z0-9_+-]+$/i) does not
+ * match a raw emoji, which then passes through untranslated.
+ */
+const TELEGRAM_REACTION_SUBSTITUTES: Record<string, string> = {
+  white_check_mark: '👍',
+  heavy_check_mark: '👍',
+  ballot_box_with_check: '👍',
+  check: '👍',
+  check_mark: '👍',
+  x: '👎',
+  negative_squared_cross_mark: '👎',
+  cross_mark: '👎',
+  thought_balloon: '🤔',
+};
+
+export function substituteReaction(channelType: string, emoji: string): string {
+  if (channelType !== 'telegram') return emoji;
+  return TELEGRAM_REACTION_SUBSTITUTES[emoji.trim().toLowerCase()] ?? emoji;
+}
+
+/**
  * [PATCH-myia] Post a markdown message, falling back to raw text if the
  * platform rejects the markdown parse. Used by the Telegram path mostly,
  * but generic enough to apply to any adapter that surfaces parse-entity
@@ -510,8 +560,12 @@ export function createChatSdkBridge(config: ChatSdkBridgeConfig): ChannelAdapter
       }
 
       if (content.operation === 'reaction' && content.messageId && content.emoji) {
+        // [PATCH-myia #46] Map the requested cue onto one this platform will
+        // actually accept before spending an API call on it.
+        const wanted = content.emoji as string;
+        const emoji = substituteReaction(adapter.name, wanted);
         try {
-          await adapter.addReaction(tid, content.messageId as string, content.emoji as string);
+          await adapter.addReaction(tid, content.messageId as string, emoji);
         } catch (err) {
           // [PATCH-myia] Telegram returns "message to react not found" when the
           // target was deleted (or beyond the bot's visibility window). The
@@ -522,6 +576,21 @@ export function createChatSdkBridge(config: ChatSdkBridgeConfig): ChannelAdapter
               adapter: adapter.name,
               threadId: tid,
               messageId: content.messageId as string,
+            });
+            return;
+          }
+          // [PATCH-myia #46] The platform refused the emoji. Deterministic —
+          // retrying cannot change the answer — and the reaction is cosmetic,
+          // so swallow instead of burning the retry budget and logging a
+          // permanent failure. Logged at info with the emoji so a cue worth
+          // adding to the substitution table above is still discoverable.
+          if (isReactionInvalidError(err)) {
+            log.info('Reaction emoji rejected by platform, skipping', {
+              adapter: adapter.name,
+              threadId: tid,
+              messageId: content.messageId as string,
+              requested: wanted,
+              sent: emoji,
             });
             return;
           }

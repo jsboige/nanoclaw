@@ -5,9 +5,11 @@ import type { Adapter, AdapterPostableMessage, RawMessage } from 'chat';
 import {
   createChatSdkBridge,
   isParseEntitiesError,
+  isReactionInvalidError,
   isReactionTargetGoneError,
   postWithMarkdownFallback,
   splitForLimit,
+  substituteReaction,
 } from './chat-sdk-bridge.js';
 
 vi.mock('../webhook-server.js', () => ({
@@ -481,9 +483,15 @@ describe('createChatSdkBridge.deliver — reaction error handling (PATCH-myia)',
     expect(reactionCalls).toBe(1);
   });
 
-  it('still throws on other reaction errors so they bubble to the retry path', async () => {
+  // [PATCH-myia #46] This case used to assert REACTION_INVALID bubbled to the
+  // retry path. It shouldn't: the rejection is deterministic, so the retries
+  // produce two more identical rejections and then a permanent-failure ERROR
+  // for a cosmetic cue. Measured here: 11 such abandons, 33 wasted calls.
+  it('swallows REACTION_INVALID instead of burning the retry budget', async () => {
+    let reactionCalls = 0;
     const adapter = stubAdapter({
       addReaction: async () => {
+        reactionCalls += 1;
         throw new Error('Bad Request: REACTION_INVALID');
       },
     });
@@ -493,6 +501,72 @@ describe('createChatSdkBridge.deliver — reaction error handling (PATCH-myia)',
         kind: 'chat-sdk',
         content: { operation: 'reaction', messageId: '999', emoji: 'bogus' },
       }),
-    ).rejects.toThrow(/REACTION_INVALID/);
+    ).resolves.toBeUndefined();
+    expect(reactionCalls).toBe(1);
+  });
+
+  it('still throws on other reaction errors so they bubble to the retry path', async () => {
+    const adapter = stubAdapter({
+      addReaction: async () => {
+        throw new Error('Bad Gateway: upstream timed out');
+      },
+    });
+    const bridge = createChatSdkBridge({ adapter, supportsThreads: false });
+    await expect(
+      bridge.deliver('telegram:42', null, {
+        kind: 'chat-sdk',
+        content: { operation: 'reaction', messageId: '999', emoji: '👀' },
+      }),
+    ).rejects.toThrow(/upstream timed out/);
+  });
+
+  it('sends a Telegram-accepted equivalent for the documented shortcode', async () => {
+    // core.instructions.md tells the agent to use `white_check_mark` for "done".
+    // The adapter resolves it to ✅, which Telegram refuses as a reaction, so
+    // the documented happy path failed on every use until this substitution.
+    const sent: string[] = [];
+    const adapter = stubAdapter({
+      name: 'telegram',
+      addReaction: async (_t: string, _m: string, emoji: string) => {
+        sent.push(emoji);
+      },
+    } as Partial<Adapter>);
+    const bridge = createChatSdkBridge({ adapter, supportsThreads: false });
+    await bridge.deliver('telegram:42', null, {
+      kind: 'chat-sdk',
+      content: { operation: 'reaction', messageId: '999', emoji: 'white_check_mark' },
+    });
+    expect(sent).toEqual(['👍']);
+  });
+});
+
+describe('isReactionInvalidError (PATCH-myia #46)', () => {
+  it('recognizes the Telegram rejection observed in production', () => {
+    expect(isReactionInvalidError(new Error('Bad Request: REACTION_INVALID'))).toBe(true);
+  });
+
+  it('does not swallow unrelated failures', () => {
+    expect(isReactionInvalidError(new Error('Bad Request: chat not found'))).toBe(false);
+    expect(isReactionInvalidError(undefined)).toBe(false);
+  });
+});
+
+describe('substituteReaction (PATCH-myia #46)', () => {
+  it('preserves the speech act for cues Telegram refuses', () => {
+    expect(substituteReaction('telegram', 'white_check_mark')).toBe('👍'); // ack stays ack
+    expect(substituteReaction('telegram', 'x')).toBe('👎'); // rejection stays rejection
+  });
+
+  it('leaves cues Telegram already accepts untouched', () => {
+    expect(substituteReaction('telegram', 'eyes')).toBe('eyes');
+    expect(substituteReaction('telegram', 'thumbs_up')).toBe('thumbs_up');
+  });
+
+  it('leaves a cue with no honest equivalent alone, to be swallowed rather than distorted', () => {
+    expect(substituteReaction('telegram', 'warning')).toBe('warning');
+  });
+
+  it('does not touch other platforms, which accept the emoji as-is', () => {
+    expect(substituteReaction('slack', 'white_check_mark')).toBe('white_check_mark');
   });
 });
