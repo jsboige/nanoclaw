@@ -23,7 +23,7 @@ import {
 } from './db/session-db.js';
 import { log } from './log.js';
 import { normalizeOptions } from './channels/ask-question.js';
-import { isReactionTargetGoneError } from './channels/chat-sdk-bridge.js';
+import { isReactionInvalidError, isReactionTargetGoneError } from './channels/chat-sdk-bridge.js';
 import { clearOutbox, openInboundDb, openOutboundDb, readOutboxFiles } from './session-manager.js';
 import { pauseTypingRefreshAfterDelivery, setTypingAdapter } from './modules/typing/index.js';
 import type { OutboundFile } from './channels/adapter.js';
@@ -228,6 +228,18 @@ async function drainSession(session: Session): Promise<void> {
         // permanently-failed log. See PATCHES.md#21.
         if (isReactionTargetGoneError(err)) {
           log.info('Reaction target gone (delivery layer swallow), marking delivered', {
+            messageId: msg.id,
+            sessionId: session.id,
+          });
+          markDelivered(inDb, msg.id, null);
+          deliveryAttempts.delete(msg.id);
+          continue;
+        }
+        // [PATCH-myia #46] Same net, for the platform refusing the emoji itself.
+        // Deterministic: three attempts produce three identical rejections and
+        // then a permanent-failure ERROR, all of it benign. See PATCHES.md#46.
+        if (isReactionInvalidError(err)) {
+          log.info('Reaction emoji rejected (delivery layer swallow), marking delivered', {
             messageId: msg.id,
             sessionId: session.id,
           });
