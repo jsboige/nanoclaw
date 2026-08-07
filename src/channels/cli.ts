@@ -37,14 +37,42 @@
  */
 import fs from 'fs';
 import net from 'net';
+import path from 'path';
 
-import { getCliSocketPath } from '../config.js';
+import { DATA_DIR, getCliSocketPath } from '../config.js';
 import { log } from '../log.js';
-import type { ChannelAdapter, ChannelSetup, DeliveryAddress, InboundEvent, OutboundMessage } from './adapter.js';
+import type {
+  ChannelAdapter,
+  ChannelDefaults,
+  ChannelSetup,
+  DeliveryAddress,
+  InboundEvent,
+  OutboundMessage,
+} from './adapter.js';
 import { registerChannelAdapter } from './channel-registry.js';
 
 const PLATFORM_ID = 'local';
 const IS_WINDOWS = process.platform === 'win32';
+
+/**
+ * Terminal transport: every line the operator types is for the agent
+ * (pattern '.'), the socket is owner-only so senders are trusted ('public'),
+ * there is no thread or mention concept. Matches what
+ * scripts/init-cli-agent.ts has always created.
+ */
+const CLI_DEFAULTS: ChannelDefaults = {
+  dm: { engageMode: 'pattern', engagePattern: '.', threads: false, unknownSenderPolicy: 'public' },
+  group: { engageMode: 'pattern', engagePattern: '.', threads: false, unknownSenderPolicy: 'public' },
+  mentions: 'never',
+};
+
+// [PATCH-myia #29] Windows NSSM services can't bind a Unix socket file. We use
+// the shared getCliSocketPath() seam (\\.\pipe\… on win32) at the call sites
+// below; this local socketPath() is upstream's Unix default, retained to
+// minimize divergence though it's unused on this fork.
+function socketPath(): string {
+  return path.join(DATA_DIR, 'cli.sock');
+}
 
 function createAdapter(): ChannelAdapter {
   let server: net.Server | null = null;
@@ -54,6 +82,7 @@ function createAdapter(): ChannelAdapter {
     name: 'cli',
     channelType: 'cli',
     supportsThreads: false,
+    defaults: CLI_DEFAULTS,
 
     async setup(config: ChannelSetup): Promise<void> {
       const sock = getCliSocketPath();
@@ -277,4 +306,4 @@ function extractText(message: OutboundMessage): string | null {
   return null;
 }
 
-registerChannelAdapter('cli', { factory: createAdapter });
+registerChannelAdapter('cli', { factory: createAdapter, defaults: CLI_DEFAULTS });
