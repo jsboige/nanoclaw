@@ -9,7 +9,6 @@ import path from 'path';
 import { backfillContainerConfigs } from './backfill-container-configs.js';
 import { DATA_DIR, assertLocalOnecli } from './config.js';
 import { enforceStartupBackoff, resetCircuitBreaker } from './circuit-breaker.js';
-import { migrateGroupsToClaudeLocal } from './claude-md-compose.js';
 import { initDb } from './db/connection.js';
 import { runMigrations } from './db/migrations/index.js';
 import { ensureContainerRuntimeRunning, cleanupOrphans } from './container-runtime.js';
@@ -25,16 +24,7 @@ import { enforceUpgradeTripwire } from './upgrade-state.js';
 // effects, and the modules call registerResponseHandler/onShutdown at top
 // level — which would hit a TDZ error if the arrays lived here. Re-exported
 // here so existing callers see the same surface.
-import {
-  registerResponseHandler,
-  getResponseHandlers,
-  onShutdown,
-  getShutdownCallbacks,
-  type ResponsePayload,
-  type ResponseHandler,
-} from './response-registry.js';
-export { registerResponseHandler, onShutdown };
-export type { ResponsePayload, ResponseHandler };
+import { getResponseHandlers, getShutdownCallbacks, type ResponsePayload } from './response-registry.js';
 
 async function dispatchResponse(payload: ResponsePayload): Promise<void> {
   for (const handler of getResponseHandlers()) {
@@ -94,12 +84,12 @@ async function main(): Promise<void> {
   // Idempotent — skips groups that already have a config row.
   backfillContainerConfigs();
 
-  // 1c. One-time filesystem cutover — idempotent, no-op after first run.
-  migrateGroupsToClaudeLocal();
-
   // 2. Container runtime — async retry loop absorbs transient Docker pipe
   //    failures on Windows so a brief Docker Desktop hiccup doesn't crash
   //    the host into circuit-breaker backoff. See PATCH #22.
+  //    (await is required: ensureContainerRuntimeRunning() is async with the
+  //    retry loop; upstream's un-awaited call would proceed before the runtime
+  //    is reachable.)
   await ensureContainerRuntimeRunning();
   cleanupOrphans();
 

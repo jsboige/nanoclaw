@@ -204,17 +204,16 @@ describe('channel registry — instance keying', () => {
     expect(reg.getChannelAdapter('slack')).toBe(tester);
 
     // The delivery bridge dispatches by exact key: a default-instance
-    // message (instance === channelType after backfill) is dropped, not
-    // delivered through the sibling's identity.
-    //
-    // [PATCH-myia #45] It must REJECT, not resolve. A resolved promise reaches
-    // delivery.ts as success — it logs "Message delivered", clearOutbox()es the
-    // attachments and markDelivered()s the row, destroying the message. Only a
-    // rejection puts it on the retry path this test's comment above has always
-    // described ("drop into the retry path").
+    // message (instance === channelType after backfill) throws the typed
+    // missing-adapter error (→ retry path), and is never delivered through the
+    // sibling's identity. [PATCH-myia #45] the throw — not a silent resolve —
+    // is what routes the dropped message into the retry path instead of being
+    // marked delivered; upstream's MissingChannelAdapterError is the typed
+    // carrier for that intent.
     const bridge = reg.createChannelDeliveryAdapter();
-    await expect(
-      bridge.deliver(
+    let caught: unknown;
+    try {
+      await bridge.deliver(
         'slack',
         'slack:C1',
         null,
@@ -222,8 +221,12 @@ describe('channel registry — instance keying', () => {
         JSON.stringify({ text: 'to the default bot' }),
         undefined,
         'slack',
-      ),
-    ).rejects.toThrow(/No active channel adapter for instance "slack"/);
+      );
+    } catch (err) {
+      caught = err;
+    }
+    expect(caught).toBeInstanceOf(reg.MissingChannelAdapterError);
+    expect((caught as InstanceType<typeof reg.MissingChannelAdapterError>).channelType).toBe('slack');
     expect(tester.delivered).toHaveLength(0);
 
     // Sanity: the same bridge DOES deliver when the exact instance is live.

@@ -24,7 +24,7 @@ import { registerWebhookAdapter } from '../webhook-server.js';
 import { getAskQuestionRender } from '../db/sessions.js';
 import { isTranscriptionEnabled, transcribeAudioBuffer } from '../transcription.js';
 import { normalizeOptions, type NormalizedOption } from './ask-question.js';
-import type { ChannelAdapter, ChannelSetup, InboundMessage } from './adapter.js';
+import type { ChannelAdapter, ChannelDefaults, ChannelSetup, InboundMessage } from './adapter.js';
 
 /** Adapter with optional gateway support (e.g., Discord). */
 interface GatewayAdapter extends Adapter {
@@ -69,6 +69,12 @@ export interface ChatSdkBridgeConfig {
    * way and the default depends on installation style.
    */
   supportsThreads: boolean;
+  /**
+   * Declared wiring-time defaults for this channel. Copied verbatim onto the
+   * returned ChannelAdapter, exactly like supportsThreads. See
+   * `ChannelAdapter.defaults`.
+   */
+  defaults?: ChannelDefaults;
   /**
    * Optional transform applied to outbound text/markdown before it reaches the
    * adapter. Used by channels that need to sanitize for a platform-specific
@@ -118,6 +124,31 @@ function resolveSelectedOption(
     if (render.options[idx]) return render.options[idx].value;
   }
   return candidate;
+}
+
+interface TerminalApprovalCard {
+  title: string;
+  question: string;
+  resolution: string;
+}
+
+/**
+ * Keep an approval's full context after it resolves. The muted resolution
+ * replaces the actions row, making the card visibly inactive without
+ * discarding the request an admin decided on.
+ */
+export function buildTerminalApprovalCard({ title, question, resolution }: TerminalApprovalCard) {
+  const children: CardChild[] = [];
+  if (question) children.push(CardText(question));
+  children.push(CardText(resolution, { style: 'muted' }));
+  return Card({ title, children });
+}
+
+function terminalApprovalMessage(spec: TerminalApprovalCard) {
+  return {
+    card: buildTerminalApprovalCard(spec),
+    fallbackText: [spec.title, spec.question, spec.resolution].filter(Boolean).join('\n\n'),
+  };
 }
 
 export function splitForLimit(text: string, limit: number): string[] {
@@ -362,6 +393,7 @@ export function createChatSdkBridge(config: ChatSdkBridgeConfig): ChannelAdapter
     instance: config.instance, // undefined ⇒ default instance
 
     supportsThreads: config.supportsThreads,
+    defaults: config.defaults,
 
     async setup(hostConfig: ChannelSetup) {
       setupConfig = hostConfig;
@@ -407,9 +439,11 @@ export function createChatSdkBridge(config: ChatSdkBridgeConfig): ChannelAdapter
       });
 
       // DMs — by definition addressed to the bot. Thread id flows through
-      // so sub-thread context reaches delivery (Slack users can open threads
-      // inside a DM). Router collapses DM sub-threads to one session via
-      // is_group=0 short-circuit.
+      // unmodified (Slack users can open sub-threads inside a DM); whether it
+      // is honored is policy, not transport: the channel's declared
+      // dm.threads default (ChannelDefaults) or a per-wiring threads override
+      // decides at router fanout whether replies land in-thread or all DM
+      // sub-threads collapse into the one DM session.
       chat.onDirectMessage(async (thread, message) => {
         const channelId = adapter.channelIdFromThreadId(thread.id);
         log.info('Inbound DM received', {
@@ -461,12 +495,16 @@ export function createChatSdkBridge(config: ChatSdkBridgeConfig): ChannelAdapter
 
         // Update the card to show the selected answer, who acted, and remove buttons
         const actorName = event.user?.userName || event.user?.fullName || '';
-        const byLine = actorName ? ` — ${actorName}` : '';
+        const resolution = actorName ? `${selectedLabel} by ${actorName}` : selectedLabel;
         try {
           const tid = event.threadId;
-          await adapter.editMessage(tid, event.messageId, {
-            markdown: `${title}\n\n${selectedLabel}${byLine}`,
-          });
+          await adapter.editMessage(
+            tid,
+            event.messageId,
+            render?.question
+              ? terminalApprovalMessage({ title, question: render.question, resolution })
+              : { markdown: `${title}\n\n${resolution}` },
+          );
         } catch (err) {
           log.warn('Failed to update card after action', { err });
         }
@@ -553,9 +591,23 @@ export function createChatSdkBridge(config: ChatSdkBridgeConfig): ChannelAdapter
       const content = message.content as Record<string, unknown>;
 
       if (content.operation === 'edit' && content.messageId) {
-        await adapter.editMessage(tid, content.messageId as string, {
-          markdown: transformText((content.text as string) || (content.markdown as string) || ''),
-        });
+        const terminalCard = content.terminalCard as Partial<TerminalApprovalCard> | undefined;
+        if (
+          terminalCard &&
+          typeof terminalCard.title === 'string' &&
+          typeof terminalCard.question === 'string' &&
+          typeof terminalCard.resolution === 'string'
+        ) {
+          await adapter.editMessage(
+            tid,
+            content.messageId as string,
+            terminalApprovalMessage(terminalCard as TerminalApprovalCard),
+          );
+        } else {
+          await adapter.editMessage(tid, content.messageId as string, {
+            markdown: transformText((content.text as string) || (content.markdown as string) || ''),
+          });
+        }
         return;
       }
 
@@ -620,7 +672,7 @@ export function createChatSdkBridge(config: ChatSdkBridgeConfig): ChannelAdapter
               // well past that. The onAction handlers resolve the index back
               // to the real value via getAskQuestionRender(questionId).
               options.map((opt, idx) =>
-                Button({ id: `ncq:${questionId}:${idx}`, label: opt.label, value: String(idx) }),
+                Button({ id: `ncq:${questionId}:${idx}`, label: opt.label, value: String(idx), style: opt.style }),
               ),
             ),
           ],
@@ -861,6 +913,8 @@ async function handleForwardedEvent(
       const cardTitle = render?.title ?? ((originalEmbeds[0]?.title as string) || '❓ Question');
       const matchedOpt = render?.options.find((o) => o.value === selectedOption);
       const selectedLabel = matchedOpt?.selectedLabel ?? selectedOption ?? customId;
+      const actorName = user?.global_name || user?.username || '';
+      const resolution = actorName ? `${selectedLabel} by ${actorName}` : selectedLabel;
       try {
         await fetch(`https://discord.com/api/v10/interactions/${interactionId}/${interactionToken}/callback`, {
           method: 'POST',
@@ -871,7 +925,8 @@ async function handleForwardedEvent(
               embeds: [
                 {
                   title: cardTitle,
-                  description: `${originalDescription}\n\n${selectedLabel}`,
+                  description: originalDescription || render?.question || '',
+                  footer: { text: resolution },
                 },
               ],
               components: [], // remove buttons
