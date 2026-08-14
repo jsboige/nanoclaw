@@ -45,13 +45,9 @@ describe('readonlyMountArgs', () => {
 describe('stopContainer', () => {
   it('calls docker stop for valid container names', () => {
     stopContainer('nanoclaw-test-123');
-    expect(mockExecFileSync).toHaveBeenCalledWith(
-      CONTAINER_RUNTIME_BIN,
-      ['stop', '-t', '1', 'nanoclaw-test-123'],
-      {
-        stdio: 'pipe',
-      },
-    );
+    expect(mockExecFileSync).toHaveBeenCalledWith(CONTAINER_RUNTIME_BIN, ['stop', '-t', '1', 'nanoclaw-test-123'], {
+      stdio: 'pipe',
+    });
   });
 
   it('rejects names with shell metacharacters', () => {
