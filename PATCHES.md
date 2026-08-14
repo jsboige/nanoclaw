@@ -2,7 +2,15 @@
 
 Minimal `src/` and `container/` patches applied on top of upstream v2. Every entry includes its commit hash, reason, and exit condition. Target: ≤ 10 active patches at any time. Monthly review removes those whose exit condition is satisfied.
 
-Baseline: upstream `main` at `743e32df` (v2.1.54) — sync 2026-08-08. Previous baseline was `cb6e3d1` (v2.1.23, 2026-07-02); before that `ee7f891` (v2.1.17, 2026-06-18).
+Baseline: upstream `main` at `48347e11` (v2.2.0) — sync 2026-08-14. Previous baseline was `743e32df` (v2.1.54, 2026-08-08); before that `cb6e3d1` (v2.1.23, 2026-07-02); before that `ee7f891` (v2.1.17, 2026-06-18).
+
+## Sync notes — v2.1.54 → v2.2.0 (58 commits, 3 conflicted files / 4 hunks, all import-level)
+
+Easy sync after the heavy v2.1.54 one. 87 files (+7000/−501). Conflicts resolved by keeping both sides' imports: `src/index.ts` (our `ipc-watcher` alongside upstream's new `host-lifecycle`), `src/channels/chat-sdk-bridge.ts` (our `transcription`/`askQuestion` imports), `scripts/init-first-agent.ts` (our `getCliSocketPath` + upstream's `getAgentGroup`). Host `tsc` clean; vitest failures identical to pre-merge baseline (Windows `C:\tmp` EPERM test-dir artifact). Headline upstream changes: Agent Plugins 1.0.0 templates stack, host module lifecycle registry (`onHostStart`/`onHostShutdown`), module migration registry, remote Streamable HTTP MCP, privacy-safe DM logs.
+
+- **Upstream extension points that absorb our patterns:** `src/host-lifecycle.ts` (module registry) is the right home for our `ipc-watcher`/`roosync-inbox-standalone` starts — future refactor candidate to drop the `index.ts` conflict permanently. `registerMigration` supports module-owned migrations.
+- **PATCH `#34` is now REDUNDANT** (discovered during this sync): upstream's `getCompletedRecurring` selects `status IN ('completed','failed')` and `trailingFailedRuns` explicitly counts host-sweep MAX_TRIES failures — a failed recurring row re-arms with progressive backoff and auto-pauses at 8 consecutive failures (resumable via `ncl tasks resume`). Our `advanceRecurringTaskAfterFailure` re-arms immediately with NO backoff, pre-empting upstream's throttling. Retirement decision pending post-deploy (removing it = one less patch + restores the backoff breathing room).
+- **Upstream contributions opened (2026-08-14):** [nanocoai/nanoclaw#3246](https://github.com/nanocoai/nanoclaw/pull/3246) — orphan-cleanup Windows quoting (our `#23`, `execSync`→`execFileSync` arg-array); [nanocoai/nanoclaw#3247](https://github.com/nanocoai/nanoclaw/pull/3247) — malformed-cron clear-on-parse-failure (the `handleRecurrence` catch improvement we've carried since June). When merged upstream, `#23` retires at the next sync and the recurrence catch is no longer ours to maintain.
 
 ## Sync notes — v2.1.23 → v2.1.54 (~400 commits, 22 conflicted files / 0 markers)
 
