@@ -46,6 +46,8 @@ switcher-open.png
 # Fork-specific (pre-v2)
 deploy/.env
 .claude/local/
+# Ops-only slash commands (machine-specific: hostnames, chat ids, local paths)
+.claude/commands/
 
 # roo-state-manager Linux build artifacts
 deploy/roo-state-manager/
