@@ -858,6 +858,19 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
       log(`Stall-aborted batch — skipping markCompleted so reset-to-pending sticks`);
     }
 
+    // [PATCH-myia #47] Orphan-claim sweep after every query death. #26's
+    // stall-abort resets the claims it captured at abort time, but the
+    // 500ms follow-up poller can re-claim a just-reset message in the ~2s
+    // between that reset and the query's actual end (observed 2026-08-16
+    // 11:20:45.7Z reset → 11:20:46.3Z re-claim → 11:20:47.9Z query end).
+    // The re-claimed ack matches no live query yet is never drained,
+    // which excludes the message from getPendingMessages forever — the
+    // review recurrence chain froze for 17.5h on exactly this. At this
+    // point the query is dead and this batch's ids are finalized or
+    // reset, so any remaining 'processing' row belongs to no one: purge
+    // it exactly like container boot does.
+    clearStaleProcessingAcks();
+
     // Log task runs for any task messages that went through the agent.
     // Duration is the batch processing time — when several tasks ride
     // along in one prompt, they share that time, which is a faithful

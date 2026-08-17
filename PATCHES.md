@@ -475,6 +475,14 @@ If none works, document the patch here with justification.
 - **Exit condition:** Upstream teaches the shortcode contract about per-platform reaction allowlists (or the Telegram adapter substitutes/rejects locally), and treats a platform-level emoji rejection as non-retryable. Then both halves drop. Raise upstream at the next sync — the instructions file and the adapter are both upstream-owned, so this is a genuine upstream bug, not a local preference.
 - **Lines:** ~75 (incl. comment blocks and the substitution table)
 
+### 47. Orphan-claim sweep after every query death in container poll-loop
+
+- **Files:** `container/agent-runner/src/poll-loop.ts` (one call to the existing `clearStaleProcessingAcks()` after the batch bookkeeping block), `container/agent-runner/src/db/connection.ts` (unchanged — the purge function already exists, boot-only until now).
+- **Summary:** #26's stall-abort resets the claims it captured at abort time (`initialBatchIds` + `pendingFollowUpAcks` + `queuedFollowUps`), but the 500 ms follow-up poller can re-claim a just-reset message in the ~2 s between that reset and the query's actual end. Timestamped twice (2026-08-16): 09:32:52 abort → 09:32:54 re-claim, and 11:20:45.7Z reset → 11:20:46.3Z re-claim → 11:20:47.9Z query end. The re-claimed `processing` ack matches no live query yet is never drained, which excludes the message from `getPendingMessages` (it filters acked ids) **forever** — and because recurring series generate their next occurrence just-in-time after completion, a single orphan claim freezes the whole chain. Observed damage: the review-cycle recurrence frozen 17.5 h (11:15Z 08-16 → 04:41Z 08-17, main production lane); #27's idle-with-pending watchdog is structurally blind to it (it counts via `getPendingMessages`, which excludes the acked message). Fix: after every `processQuery` return (normal, aborted, or error), when the batch's ids are finalized or reset and the query is definitively dead, run the same unconditional `DELETE FROM processing_ack WHERE status = 'processing'` the container already runs at boot — no query alive means no legitimate `processing` row can exist (single query at a time, single writer).
+- **Why:** The boot-only purge made container restart the only recovery, which the surveillance layer has to notice first. With the sweep, the window where a racing re-claim can strand a message shrinks from "until someone restarts" to "until the next loop iteration" (~500 ms) — and even that is covered because the purge runs *after* the query death that invalidates all claims.
+- **Exit condition:** Upstream restructures the abort path so claims are only reset after the query is fully dead (or adopts an equivalent between-query sweep). Raise at the next sync — the race is in upstream-owned code (`#26`'s reset ordering vs the follow-up poller).
+- **Lines:** ~18 (one call + comment)
+
 ---
 
 ## Removed / not needed under v2
