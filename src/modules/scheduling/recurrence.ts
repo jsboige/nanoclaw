@@ -151,6 +151,8 @@ export async function advanceRecurringTaskAfterFailure(
     .prepare("SELECT * FROM messages_in WHERE id = ? AND kind = 'task' AND recurrence IS NOT NULL AND recurrence != ''")
     .get(messageId) as RecurringMessage | undefined;
 
+  if (!msg) return false;
+
   try {
     const { CronExpressionParser } = await import('cron-parser');
     // [PATCH-myia #34] use the group's configured timezone (upstream replaced
