@@ -176,7 +176,6 @@ async function main(): Promise<void> {
   //    from out-of-process producers like roosync-inbox-standalone).
   startIpcWatcher();
 
-
   // 8. Start the `ncl` CLI socket server (data/ncl.sock).
   await startCliServer();
 
