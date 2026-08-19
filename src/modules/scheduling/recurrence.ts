@@ -15,6 +15,7 @@ import type Database from 'better-sqlite3';
 import { CronExpressionParser } from 'cron-parser';
 
 import { resolveGroupTimezone } from '../../container-config.js';
+import { TIMEZONE } from '../../config.js';
 import { log } from '../../log.js';
 import type { Session } from '../../types.js';
 import {
@@ -149,13 +150,21 @@ export async function advanceRecurringTaskAfterFailure(
   const msg = inDb
     .prepare("SELECT * FROM messages_in WHERE id = ? AND kind = 'task' AND recurrence IS NOT NULL AND recurrence != ''")
     .get(messageId) as RecurringMessage | undefined;
-  if (!msg) return false;
 
   try {
     const { CronExpressionParser } = await import('cron-parser');
     // [PATCH-myia #34] use the group's configured timezone (upstream replaced
     // the module-level TIMEZONE const with resolveGroupTimezone in handleRecurrence).
-    const interval = CronExpressionParser.parse(msg.recurrence, { tz: resolveGroupTimezone(session.agent_group_id) });
+    // Guarded: resolveGroupTimezone goes through the central DB, which is not
+    // initialized in unit-test contexts (and early boot) — fall back to the
+    // install default instead of aborting the auto-advance.
+    let tz = TIMEZONE;
+    try {
+      tz = resolveGroupTimezone(session.agent_group_id);
+    } catch {
+      // central DB unavailable — install default is correct here
+    }
+    const interval = CronExpressionParser.parse(msg.recurrence, { tz });
     const nextRun = interval.next().toISOString();
     const newId = `task-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
 
