@@ -9,10 +9,19 @@
 #   dead backend. A bare `initialize` 200 check is blind to this — bots then see
 #   "roo-state-manager down" every cron cycle while the watchdog logs "OK".
 #
-#   So this probe drives the real MCP handshake (initialize -> Mcp-Session-Id ->
-#   tools/list) and requires tools/list to return > 0 tools. If TBXark answers
-#   but RSM serves no tools, the upstream session is stale -> restart TBXark
-#   (which re-pairs all upstream sessions). Same remedy if TBXark itself is dead.
+#   2026-08-20 lesson: tools/list is ALSO blind. TBXark serves it statelessly
+#   from the registry layer — it executes nothing against GDrive. During a
+#   6.5h GDrive-stall incident every dashboard WRITE hung (40 `[undelivered]`
+#   bot messages) and later reads hung too, while this watchdog logged
+#   "healthy (15 tools)" every 2 minutes. Only a real tools/call reaches the
+#   execution layer. The probe now drives initialize -> tools/list (diagnostic)
+#   -> tools/call roosync_dashboard list (deciding) and requires the call to
+#   answer with a result body.
+#
+#   Repair is likewise two-layer, matching the proven manual remedy: restart
+#   the MCP-Proxy-RSM scheduled task (fresh sparfenyuk on :9091; run-proxy.cmd
+#   kills the old port-holder) THEN restart TBXark (clears its stale upstream
+#   sessions). Restarting TBXark alone does not fix a hung sparfenyuk.
 #
 # A cooldown ($CooldownMinutes) prevents restart storms when the backend is
 # genuinely down (vs. merely stale): one restart fixes the stale case; if it's
@@ -30,8 +39,8 @@ $CooldownMinutes = 20
 $ProbeServer = 'roo-state-manager'
 
 # Auth token: TBXark's mcpProxy.options.authTokens[0]. It rotates, so read it
-# from the live config and fall back to the last-known value if unreadable.
-$AuthToken = 'ad28ecc74e0963765de2e69d2f75bb542b3b65e378c9b306e8eeeeb98b15906b'
+# from the live config. Never hardcode a fallback here — this file is tracked.
+$AuthToken = $null
 $cfgPath = 'D:\roo-extensions\docker\mcp-proxy\config.json'
 if (Test-Path $cfgPath) {
     try {
@@ -39,6 +48,10 @@ if (Test-Path $cfgPath) {
         $t = $cfg.mcpProxy.options.authTokens[0]
         if ($t) { $AuthToken = $t }
     } catch { }
+}
+if (-not $AuthToken) {
+    Write-Log "ERROR: auth token unreadable ($cfgPath) — cannot probe, refusing to guess."
+    exit 1
 }
 
 function Write-Log($msg) {
@@ -49,10 +62,11 @@ function Write-Log($msg) {
 }
 
 # Full MCP handshake against one server through TBXark.
-# Returns @{ httpOk = <bool>; toolsOk = <bool>; tools = <int>; detail = <str> }
+# Returns @{ httpOk = <bool>; toolsOk = <bool>; callOk = <bool>; tools = <int>; detail = <str> }
 #   httpOk  : TBXark's HTTP layer answered initialize (front door alive)
-#   toolsOk : tools/list returned > 0 tools (backend actually serving)
-function Test-McpBackend($server) {
+#   toolsOk : tools/list returned > 0 tools (registry layer — diagnostic only)
+#   callOk  : a real tools/call returned a result body (execution layer — deciding)
+function Test-McpBackend($server, $callTimeoutSec = 40) {
     $uri = "http://127.0.0.1:${ProxyPort}/$server/mcp"
     $accept = 'application/json, text/event-stream'
     $initBody = '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-03-26","capabilities":{},"clientInfo":{"name":"watchdog","version":"2.0"}}}'
@@ -100,10 +114,30 @@ function Test-McpBackend($server) {
     }
 
     $tools = @($obj.result.tools).Count
-    return @{ httpOk = $true; toolsOk = ($tools -gt 0); tools = $tools; detail = "$tools tools" }
+
+    # 3) REAL tool call — the only step that executes against GDrive. A warm
+    #    healthy backend answers in well under a second; a stalled one hangs
+    #    until timeout. toolsOk above stays diagnostic-only.
+    $callTimeout = $callTimeoutSec
+    try {
+        $h3 = @{ 'Authorization' = "Bearer $AuthToken"; 'Content-Type' = 'application/json'; 'Accept' = $accept }
+        if ($sid) { $h3['Mcp-Session-Id'] = $sid }
+        $callBody = '{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"roosync_dashboard","arguments":{"action":"list"}}}'
+        $r3 = Invoke-WebRequest -Uri $uri -Method POST -Headers $h3 -Body $callBody -TimeoutSec $callTimeout -UseBasicParsing
+    }
+    catch {
+        $status = $_.Exception.Response.StatusCode.value__
+        return @{ httpOk = $true; toolsOk = ($tools -gt 0); callOk = $false; tools = $tools; detail = "$tools tools; tools/call failed (HTTP $status / $($_.Exception.Message))" }
+    }
+    $callContent = "$($r3.Content)"
+    # roosync_dashboard list answers with a "dashboards" array; a dead RSM
+    # instance answers isError:true with an empty text payload instead.
+    $callOk = $callContent -match 'dashboards' -and $callContent -notmatch '"isError"\s*:\s*true'
+    $callDetail = if ($callOk) { 'tools/call ok' } else { 'tools/call returned no result body (isError/empty)' }
+    return @{ httpOk = $true; toolsOk = ($tools -gt 0); callOk = $callOk; tools = $tools; detail = "$tools tools; $callDetail" }
 }
 
-function Restart-Tbxark($reason) {
+function Restart-McpStack($reason) {
     # Cooldown guard — avoid restart storms when the backend is genuinely down.
     if (Test-Path $CooldownFile) {
         try {
@@ -116,19 +150,29 @@ function Restart-Tbxark($reason) {
         } catch { }
     }
 
-    Write-Log "WARN: $reason — force-restarting $ContainerName"
+    # Proven 2026-08-15 + 2026-08-20 remedy, in order: fresh sparfenyuk on
+    # :9091 (its run-proxy.cmd kills the hung port-holder before binding),
+    # THEN restart TBXark so it drops stale upstream sessions. Reversed or
+    # partial sequences leave the hang in place.
+    Write-Log "WARN: $reason — restarting MCP stack (MCP-Proxy-RSM task + $ContainerName)"
+    Stop-ScheduledTask MCP-Proxy-RSM -ErrorAction SilentlyContinue
+    Start-Sleep -Seconds 2
+    Start-ScheduledTask MCP-Proxy-RSM
+    Start-Sleep -Seconds 10
     docker kill $ContainerName 2>$null | Out-Null
     Start-Sleep -Seconds 3
     docker start $ContainerName 2>$null
     if ($LASTEXITCODE -eq 0) {
         (Get-Date).ToString('o') | Set-Content -Path $CooldownFile -Encoding UTF8 -NoNewline
-        Write-Log "OK: Restarted $ContainerName. Waiting 8s for upstreams to re-pair..."
-        Start-Sleep -Seconds 8
-        $verify = Test-McpBackend $ProbeServer
-        if ($verify.toolsOk) {
-            Write-Log "OK: Post-restart RSM healthy ($($verify.tools) tools)."
+        # A freshly spawned sparfenyuk needs a real tools/call to warm up —
+        # the first one can take over 40s while RSM initializes from GDrive
+        # (observed 2026-08-20), so give the verify probe a long budget.
+        Write-Log "OK: Stack restarted. Verifying with a long-timeout tools/call (cold start can take minutes)..."
+        $verify = Test-McpBackend $ProbeServer 120
+        if ($verify.callOk) {
+            Write-Log "OK: Post-restart RSM healthy ($($verify.detail))."
         } else {
-            Write-Log "ERROR: Post-restart RSM still unhealthy ($($verify.detail)). Backend may be genuinely down."
+            Write-Log "ERROR: Post-restart tools/call still failing ($($verify.detail)). Cold start may need a few more minutes; cooldown prevents a second immediate restart."
         }
     } else {
         Write-Log "ERROR: Failed to restart $ContainerName."
@@ -145,18 +189,19 @@ try {
         exit 0
     }
 
-    # End-to-end RSM probe.
+    # End-to-end RSM probe — decided by the real tools/call, not tools/list.
     $probe = Test-McpBackend $ProbeServer
-    if ($probe.toolsOk) {
+    if ($probe.callOk) {
         Write-Log "OK: RSM healthy via TBXark ($($probe.detail))"
         exit 0
     }
 
     if (-not $probe.httpOk) {
-        Restart-Tbxark "TBXark front door down ($($probe.detail))"
+        Restart-McpStack "TBXark front door down ($($probe.detail))"
     } else {
-        # The exact silent-failure mode the old watchdog missed.
-        Restart-Tbxark "TBXark up but RSM backend stale/dead ($($probe.detail))"
+        # Backend serving handshakes but not executing (stale session, hung
+        # sparfenyuk, GDrive stall) — the silent-failure modes.
+        Restart-McpStack "TBXark up but RSM not executing tools/call ($($probe.detail))"
     }
 }
 catch {
