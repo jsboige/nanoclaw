@@ -158,7 +158,20 @@ function Restart-McpStack($reason) {
     Stop-ScheduledTask MCP-Proxy-RSM -ErrorAction SilentlyContinue
     Start-Sleep -Seconds 2
     Start-ScheduledTask MCP-Proxy-RSM
-    Start-Sleep -Seconds 10
+    # Wait for sparfenyuk (:9091) to accept TCP before restarting TBXark.
+    # A fixed 10s was not enough (observed 2026-08-20 18:35): TBXark booted
+    # while its upstream was still starting, the route never mounted, and the
+    # bus served a persistent ~2.6ms 404 until a manual restart — the repair
+    # "succeeded" while leaving the bus down for the whole cooldown window.
+    $upstreamReady = $false
+    foreach ($i in 1..30) {
+        $t = Test-NetConnection -ComputerName 127.0.0.1 -Port 9091 -WarningAction SilentlyContinue
+        if ($t.TcpTestSucceeded) { $upstreamReady = $true; break }
+        Start-Sleep -Seconds 2
+    }
+    if (-not $upstreamReady) {
+        Write-Log "WARN: sparfenyuk :9091 still not accepting TCP after 60s — restarting $ContainerName anyway."
+    }
     docker kill $ContainerName 2>$null | Out-Null
     Start-Sleep -Seconds 3
     docker start $ContainerName 2>$null
@@ -169,6 +182,17 @@ function Restart-McpStack($reason) {
         # (observed 2026-08-20), so give the verify probe a long budget.
         Write-Log "OK: Stack restarted. Verifying with a long-timeout tools/call (cold start can take minutes)..."
         $verify = Test-McpBackend $ProbeServer 120
+        if (-not $verify.callOk -and $verify.httpOk) {
+            # Front door answered but the call failed — route-drop / stale-
+            # upstream residue. One extra TBXark-only restart (upstream is
+            # warm now) fixes it without re-touching the scheduled task.
+            Write-Log "WARN: Verify failed ($($verify.detail)) — retrying $ContainerName restart once (upstream now warm)."
+            docker kill $ContainerName 2>$null | Out-Null
+            Start-Sleep -Seconds 3
+            docker start $ContainerName 2>$null
+            Start-Sleep -Seconds 5
+            $verify = Test-McpBackend $ProbeServer 120
+        }
         if ($verify.callOk) {
             Write-Log "OK: Post-restart RSM healthy ($($verify.detail))."
         } else {
