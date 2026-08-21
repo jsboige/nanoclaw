@@ -57,7 +57,11 @@ if (-not $AuthToken) {
 function Write-Log($msg) {
     $ts = Get-Date -Format 'yyyy-MM-dd HH:mm:ss'
     $line = "[$ts] $msg"
-    Add-Content -Path $LogFile -Value $line -Encoding UTF8
+    # Never let a log-write failure abort a repair: on 2026-08-21 an orphaned
+    # `tail -f` held the log open, Add-Content threw under
+    # $ErrorActionPreference='Stop', and the script died mid-repair — leaving
+    # the bus down for the whole cooldown window with no verdict logged.
+    try { Add-Content -Path $LogFile -Value $line -Encoding UTF8 } catch { }
     Write-Output $line
 }
 
@@ -158,19 +162,24 @@ function Restart-McpStack($reason) {
     Stop-ScheduledTask MCP-Proxy-RSM -ErrorAction SilentlyContinue
     Start-Sleep -Seconds 2
     Start-ScheduledTask MCP-Proxy-RSM
-    # Wait for sparfenyuk (:9091) to accept TCP before restarting TBXark.
-    # A fixed 10s was not enough (observed 2026-08-20 18:35): TBXark booted
-    # while its upstream was still starting, the route never mounted, and the
-    # bus served a persistent ~2.6ms 404 until a manual restart — the repair
-    # "succeeded" while leaving the bus down for the whole cooldown window.
+    # Wait for sparfenyuk (:9091) to answer an MCP initialize at the exact
+    # URL TBXark dials before restarting TBXark. A fixed 10s was not enough
+    # (2026-08-20 18:35), and neither was raw TCP-accept (2026-08-21 06:41:
+    # the poll passed while the upstream HTTP layer was still cold — a hung
+    # process also keeps its listening socket). Both left the route unmounted
+    # and the bus serving a persistent 404 until a manual restart.
     $upstreamReady = $false
-    foreach ($i in 1..30) {
-        $t = Test-NetConnection -ComputerName 127.0.0.1 -Port 9091 -WarningAction SilentlyContinue
-        if ($t.TcpTestSucceeded) { $upstreamReady = $true; break }
-        Start-Sleep -Seconds 2
+    $upstreamUri = 'http://127.0.0.1:9091/servers/roo-state-manager/mcp'
+    $initBodyUp = '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-03-26","capabilities":{},"clientInfo":{"name":"watchdog","version":"2.1"}}}'
+    foreach ($i in 1..20) {
+        try {
+            $r = Invoke-WebRequest -Uri $upstreamUri -Method POST -Headers @{ 'Content-Type' = 'application/json'; 'Accept' = 'application/json, text/event-stream' } -Body $initBodyUp -TimeoutSec 5 -UseBasicParsing
+            if ($r.StatusCode -eq 200) { $upstreamReady = $true; break }
+        } catch { }
+        Start-Sleep -Seconds 3
     }
     if (-not $upstreamReady) {
-        Write-Log "WARN: sparfenyuk :9091 still not accepting TCP after 60s — restarting $ContainerName anyway."
+        Write-Log "WARN: sparfenyuk :9091 still not answering MCP initialize after ~60-100s — restarting $ContainerName anyway."
     }
     docker kill $ContainerName 2>$null | Out-Null
     Start-Sleep -Seconds 3
@@ -184,9 +193,12 @@ function Restart-McpStack($reason) {
         $verify = Test-McpBackend $ProbeServer 120
         if (-not $verify.callOk -and $verify.httpOk) {
             # Front door answered but the call failed — route-drop / stale-
-            # upstream residue. One extra TBXark-only restart (upstream is
-            # warm now) fixes it without re-touching the scheduled task.
-            Write-Log "WARN: Verify failed ($($verify.detail)) — retrying $ContainerName restart once (upstream now warm)."
+            # upstream residue. Let the upstream settle, then one extra
+            # TBXark-only restart fixes it without re-touching the scheduled
+            # task (both manual recoveries worked once sparfenyuk had been
+            # stable for minutes, never right after its restart).
+            Write-Log "WARN: Verify failed ($($verify.detail)) — settling 20s, then retrying $ContainerName restart once."
+            Start-Sleep -Seconds 20
             docker kill $ContainerName 2>$null | Out-Null
             Start-Sleep -Seconds 3
             docker start $ContainerName 2>$null
