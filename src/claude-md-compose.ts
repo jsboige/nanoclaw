@@ -20,6 +20,7 @@ import { GROUPS_DIR } from './config.js';
 import type { McpServerConfig } from './container-config.js';
 import { getContainerConfig } from './db/container-configs.js';
 import { readGroupPersona } from './group-persona.js';
+import { log } from './log.js';
 import type { AgentGroup } from './types.js';
 
 // Fragment holding a template's persona prepend. Imported FIRST (before the
@@ -35,6 +36,26 @@ const SHARED_MCP_TOOLS_CONTAINER_BASE = '/app/src/mcp-tools';
 // Host-side source paths used to discover fragment sources at compose time.
 // Resolved at call time (process.cwd() = project root) so tests can swap cwd.
 const MCP_TOOLS_HOST_SUBPATH = path.join('container', 'agent-runner', 'src', 'mcp-tools');
+
+// `CLAUDE.local.md` is the agent-owned half of the injected instruction
+// surface: Claude Code auto-loads it from the group directory into the system
+// prompt on every turn. Nothing bounds its growth. Its own prose guard ("KEEP
+// THIS SECTION SMALL") is addressed to the agent that must not violate it, and
+// has been violated twice — 2026-07-19 (~280KB of DONE cycle-logs) and
+// 2026-08-26 (388KB, six days of silent autocompact-thrash before anyone
+// looked). A rule enforced only by the layer it constrains does not bound; it
+// defers.
+//
+// Two stages, because composition cannot tell a live rule from a dead log:
+//   WARN   — names the cause in the spawn logs instead of leaving the operator
+//            to discover a week of thrash after the fact. Non-mutating.
+//   ROTATE — past this size the session cannot survive its own system prompt,
+//            so the agent is already producing nothing. Archiving the file
+//            whole and leaving a pointer loses nothing, and is strictly better
+//            than the outage it replaces.
+const CLAUDE_LOCAL_FILE = 'CLAUDE.local.md';
+const CLAUDE_LOCAL_WARN_BYTES = Number(process.env.CLAUDE_LOCAL_WARN_BYTES) || 64 * 1024;
+const CLAUDE_LOCAL_ROTATE_BYTES = Number(process.env.CLAUDE_LOCAL_ROTATE_BYTES) || 256 * 1024;
 
 const COMPOSED_HEADER =
   '<!-- Composed at spawn - do not edit. Standing instructions: instructions.prepend.md. Memory: memory/. -->';
@@ -149,6 +170,57 @@ export function composeGroupClaudeMd(group: AgentGroup): void {
   }
   const body = [COMPOSED_HEADER, ...imports, ''].join('\n');
   writeAtomic(path.join(groupDir, 'CLAUDE.md'), body);
+
+  enforceClaudeLocalBound(groupDir, group.folder);
+}
+
+/**
+ * Bound the agent-owned `CLAUDE.local.md` at spawn. Warns past
+ * `CLAUDE_LOCAL_WARN_BYTES`; past `CLAUDE_LOCAL_ROTATE_BYTES` archives the file
+ * under a timestamped name and leaves a stub naming the archive. Never deletes.
+ */
+export function enforceClaudeLocalBound(groupDir: string, folder: string): void {
+  const target = path.join(groupDir, CLAUDE_LOCAL_FILE);
+  // Absent means nothing is injected, so there is nothing to bound.
+  const stat = fs.statSync(target, { throwIfNoEntry: false });
+  if (!stat) return;
+  const size = stat.size;
+  if (size < CLAUDE_LOCAL_WARN_BYTES) return;
+
+  if (size < CLAUDE_LOCAL_ROTATE_BYTES) {
+    log.warn('CLAUDE.local.md is oversized — injected into the system prompt every turn', {
+      folder,
+      bytes: size,
+      warnBytes: CLAUDE_LOCAL_WARN_BYTES,
+      rotateBytes: CLAUDE_LOCAL_ROTATE_BYTES,
+    });
+    return;
+  }
+
+  const stamp = new Date().toISOString().replace(/[:.]/g, '-');
+  const archive = `CLAUDE.local.overflow-${stamp}.md`;
+  fs.renameSync(target, path.join(groupDir, archive));
+  writeAtomic(
+    target,
+    [
+      `# CLAUDE.local.md — rotated at spawn (${size} bytes > ${CLAUDE_LOCAL_ROTATE_BYTES})`,
+      '',
+      `Previous contents preserved verbatim in \`${archive}\`. Nothing was deleted.`,
+      '',
+      'This file is injected into the system prompt on EVERY turn. At the size it',
+      'reached, the session could not survive its own prompt (autocompact thrash).',
+      '',
+      `Re-read \`${archive}\` and restore ONLY live rules and genuinely in-flight`,
+      'state. Completed cycle-logs belong in the append-only logs, never here.',
+      '',
+    ].join('\n'),
+  );
+  log.warn('CLAUDE.local.md rotated — exceeded the injection bound', {
+    folder,
+    bytes: size,
+    rotateBytes: CLAUDE_LOCAL_ROTATE_BYTES,
+    archive,
+  });
 }
 
 function syncFragment(linkPath: string, containerTarget: string, hostSource: string | undefined): void {

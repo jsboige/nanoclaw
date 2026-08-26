@@ -15,6 +15,7 @@ vi.mock('./log.js', () => ({
 }));
 
 import { composeGroupClaudeMd } from './claude-md-compose.js';
+import { log } from './log.js';
 import { ensureContainerConfig, updateContainerConfigScalars } from './db/container-configs.js';
 import { closeDb, createAgentGroup, initTestDb, runMigrations } from './db/index.js';
 import { PERSONA_PREPEND_FILE } from './group-persona.js';
@@ -114,5 +115,75 @@ describe('composeGroupClaudeMd scheduling instructions (ncl tasks reach-in)', ()
     const imports = importsOf(ag.folder);
     expect(imports).not.toContain('@./.claude-fragments/module-scheduling.md');
     expect(imports).not.toContain('@./.claude-fragments/module-cli.md');
+  });
+});
+
+// The bound exercises the REAL production thresholds (64KB / 256KB) rather
+// than injected ones: the defect these guard against is a file that grew past
+// the shipped limits, so a test that moves the limits proves nothing.
+describe('CLAUDE.local.md injection bound', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+  });
+
+  function localPath(folder: string): string {
+    return path.join(GROUPS_DIR, folder, 'CLAUDE.local.md');
+  }
+  function overflowFiles(folder: string): string[] {
+    return fs.readdirSync(path.join(GROUPS_DIR, folder)).filter((f) => f.startsWith('CLAUDE.local.overflow-'));
+  }
+
+  it('leaves a file under the warn threshold untouched and silent', () => {
+    const ag = group('ag-small', 'bound-small');
+    seed(ag);
+    composeGroupClaudeMd(ag);
+    const body = 'rule\n'.repeat(200);
+    fs.writeFileSync(localPath(ag.folder), body);
+
+    composeGroupClaudeMd(ag);
+
+    expect(fs.readFileSync(localPath(ag.folder), 'utf-8')).toBe(body);
+    expect(overflowFiles(ag.folder)).toHaveLength(0);
+    expect(log.warn).not.toHaveBeenCalled();
+  });
+
+  it('warns past the warn threshold WITHOUT mutating the file', () => {
+    const ag = group('ag-warn', 'bound-warn');
+    seed(ag);
+    composeGroupClaudeMd(ag);
+    const body = 'x'.repeat(100 * 1024);
+    fs.writeFileSync(localPath(ag.folder), body);
+
+    composeGroupClaudeMd(ag);
+
+    expect(fs.readFileSync(localPath(ag.folder), 'utf-8')).toBe(body);
+    expect(overflowFiles(ag.folder)).toHaveLength(0);
+    expect(log.warn).toHaveBeenCalledWith(
+      expect.stringContaining('oversized'),
+      expect.objectContaining({ folder: ag.folder, bytes: body.length }),
+    );
+  });
+
+  it('rotates past the bound, preserving the previous contents verbatim', () => {
+    const ag = group('ag-rotate', 'bound-rotate');
+    seed(ag);
+    composeGroupClaudeMd(ag);
+    const body = 'y'.repeat(300 * 1024);
+    fs.writeFileSync(localPath(ag.folder), body);
+
+    composeGroupClaudeMd(ag);
+
+    const archives = overflowFiles(ag.folder);
+    expect(archives).toHaveLength(1);
+    // Nothing deleted: the archive is byte-identical to what was rotated out.
+    expect(fs.readFileSync(path.join(GROUPS_DIR, ag.folder, archives[0]), 'utf-8')).toBe(body);
+    // And the injected surface is now a stub that names the archive.
+    const stub = fs.readFileSync(localPath(ag.folder), 'utf-8');
+    expect(stub.length).toBeLessThan(2048);
+    expect(stub).toContain(archives[0]);
+    expect(log.warn).toHaveBeenCalledWith(
+      expect.stringContaining('rotated'),
+      expect.objectContaining({ archive: archives[0] }),
+    );
   });
 });
