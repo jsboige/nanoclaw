@@ -128,7 +128,7 @@ async function processIpcMessage(folder: string, data: unknown): Promise<boolean
   if (obj.type !== 'inject_synthetic_message' || !obj.inboxMsg) return false;
   const inboxMsg = obj.inboxMsg;
 
-  const ag = getAgentGroupByFolder(folder);
+  const ag = await getAgentGroupByFolder(folder);
   if (!ag) {
     log.warn('IPC inject: no agent group for folder', { folder, msgId: inboxMsg.id });
     return true; // consume — no point retrying when wiring is absent
@@ -139,12 +139,12 @@ async function processIpcMessage(folder: string, data: unknown): Promise<boolean
   // install). Fall back to creating one against the first wired messaging
   // group so the synthetic message reaches the right container even on a
   // cold install that hasn't seen any traffic yet.
-  let session = findSessionByAgentGroup(ag.id);
+  let session = await findSessionByAgentGroup(ag.id);
   let mgChannelType: string | null = null;
   let mgPlatformId: string | null = null;
 
   if (!session) {
-    const mgs = getMessagingGroupsByAgentGroup(ag.id);
+    const mgs = await getMessagingGroupsByAgentGroup(ag.id);
     if (mgs.length === 0) {
       log.warn('IPC inject: no messaging group wired and no active session', {
         folder,
@@ -154,7 +154,7 @@ async function processIpcMessage(folder: string, data: unknown): Promise<boolean
       return true;
     }
     const mg = mgs[0];
-    const resolved = resolveSession(ag.id, mg.id, null, 'shared');
+    const resolved = await resolveSession(ag.id, mg.id, null, 'shared');
     session = resolved.session;
     mgChannelType = mg.channel_type;
     mgPlatformId = mg.platform_id;
@@ -162,7 +162,7 @@ async function processIpcMessage(folder: string, data: unknown): Promise<boolean
     // Look up the messaging group attached to this session for routing
     // metadata. Fall back to the first wired one when the session predates
     // a messaging group rename / re-wire.
-    const mgs = getMessagingGroupsByAgentGroup(ag.id);
+    const mgs = await getMessagingGroupsByAgentGroup(ag.id);
     const sessionMg = mgs.find((m) => m.id === session!.messaging_group_id) ?? mgs[0];
     if (sessionMg) {
       mgChannelType = sessionMg.channel_type;
@@ -201,7 +201,7 @@ async function processIpcMessage(folder: string, data: unknown): Promise<boolean
   };
 
   try {
-    writeSessionMessage(ag.id, session.id, {
+    await writeSessionMessage(ag.id, session.id, {
       id: syntheticId,
       kind: 'chat-sdk',
       timestamp: nowIso,
@@ -209,7 +209,7 @@ async function processIpcMessage(folder: string, data: unknown): Promise<boolean
       channelType: mgChannelType,
       threadId: null,
       content: JSON.stringify(chatMsg),
-      trigger: 1,
+      trigger: true,
     });
   } catch (err) {
     log.error('IPC: writeSessionMessage failed', {

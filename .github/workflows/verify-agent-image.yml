@@ -50,6 +50,11 @@ jobs:
         run: |
           set -euo pipefail
           read_pin() {
+            # Older long-lived branches may predate versions.json. Treat that
+            # as an empty old pin so the new pin still gets fully verified.
+            if ! git cat-file -e "$1:versions.json" 2>/dev/null; then
+              return 0
+            fi
             # Single-reference form only. A per-platform object is deliberately
             # not auto-bumped: the entries must move together, and a bot that
             # bumps them independently can leave the architectures on bytes
@@ -239,13 +244,23 @@ jobs:
           # attach per architecture, so verifying the index alone would pass
           # without ever having looked at an SBOM.
 
+      # Arming auto-merge is a convenience, NOT a verification result, so it
+      # cannot be allowed to decide this job's conclusion. It is the last step,
+      # and without continue-on-error its failure turns the whole job red — on a
+      # draft pull request, whenever allow_auto_merge is off, or on a transient
+      # API error. Now that `verify` is a required check that is a self-inflicted
+      # block, and worse: approve-agent-image only triggers on this workflow
+      # concluding success, so one flaky call here silently breaks the approval
+      # chain behind it. A red job must mean the IMAGE failed a check.
       - name: Enable auto-merge
+        continue-on-error: true
         if: steps.pin.outputs.changed == 'true' && steps.sig.outcome == 'success'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           echo "Signature verified against the configured publisher identity."
-          gh pr merge --squash --auto '${{ github.event.pull_request.number }}'
+          gh pr merge --squash --auto '${{ github.event.pull_request.number }}' \
+            || echo "::notice::Could not arm auto-merge (draft, disabled, or transient). Verification stands; a human merges."
 
       - name: Explain why a human is still needed
         if: steps.pin.outputs.changed == 'true' && steps.sig.outcome != 'success'

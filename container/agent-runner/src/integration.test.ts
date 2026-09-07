@@ -1,12 +1,18 @@
 import { describe, it, expect, beforeEach, afterEach } from 'bun:test';
 
-import { initTestSessionDb, closeSessionDb, getInboundDb, getOutboundDb } from './db/connection.js';
+import { initTestSessionDb, closeSessionDb, getInboundDb, getOutboundDb } from './mailbox/sqlite/connection.js';
 import { getUndeliveredMessages } from './db/messages-out.js';
 import { getPendingMessages } from './db/messages-in.js';
 import { getContinuation, setContinuation } from './db/session-state.js';
+import { getSessionRouting } from './db/session-routing.js';
 import { MockProvider } from './providers/mock.js';
 import type { ProviderExchange } from './providers/types.js';
 import { runPollLoop } from './poll-loop.js';
+
+const MOCK_PROVIDER_CONTRACT = {
+  textDelivery: 'mid-turn-complete',
+  commands: { formatting: 'xml' },
+} as const;
 
 beforeEach(() => {
   initTestSessionDb();
@@ -24,15 +30,26 @@ afterEach(() => {
 });
 
 function insertMessage(id: string, content: object, opts?: { platformId?: string; channelType?: string; threadId?: string }) {
+  // trigger=1: real user inbound is wake-eligible. A later follow-up poll only
+  // pushes rows the two-phase selection treats as a true trigger (upstream
+  // semantics) — trigger=0 columns ride along at the initial batch but are
+  // never pushed into a live query on their own.
   getInboundDb()
     .prepare(
-      `INSERT INTO messages_in (id, kind, timestamp, status, platform_id, channel_type, thread_id, content)
-       VALUES (?, 'chat', datetime('now'), 'pending', ?, ?, ?, ?)`,
+      `INSERT INTO messages_in (id, kind, timestamp, status, trigger, platform_id, channel_type, thread_id, content)
+       VALUES (?, 'chat', datetime('now'), 'pending', 1, ?, ?, ?, ?)`,
     )
     .run(id, opts?.platformId ?? null, opts?.channelType ?? null, opts?.threadId ?? null, JSON.stringify(content));
 }
 
 describe('poll loop integration', () => {
+  it('defaults only when the legacy session routing table is absent', () => {
+    expect(getSessionRouting()).toEqual({ channel_type: null, platform_id: null, thread_id: null });
+
+    getInboundDb().exec('CREATE VIEW session_routing AS SELECT * FROM missing_routing');
+    expect(() => getSessionRouting()).toThrow(/missing_routing/);
+  });
+
   it('should pick up a message, process it, and write a response', async () => {
     insertMessage('m1', { sender: 'Alice', text: 'What is the meaning of life?' }, { platformId: 'chan-1', channelType: 'discord', threadId: 'thread-1' });
 
@@ -114,25 +131,27 @@ describe('poll loop integration', () => {
     await loopPromise.catch(() => {});
   });
 
-  it('bare text falls back to the routing-source channel (PATCH-myia #19)', async () => {
+  it('bare agent text is not written to the channel under mid-turn delivery', async () => {
+    // [PATCH-myia #19] The routing-source fallback stands down for mid-turn-
+    // complete providers: their scratchpad is diagnostic and the wrap-nudge
+    // owns recovery (upstream's "result door never sends" model). The mock is
+    // mid-turn, so bare text with no <message> envelope must NOT write a
+    // channel row — the old #19 fallback wrote one, which double-delivered
+    // content the streaming door already handled. Covered upstream by the
+    // result-door nudge tests.
     insertMessage('m1', { sender: 'Alice', text: 'hello' }, { platformId: 'chan-1', channelType: 'discord' });
 
-    // Agent responds with bare text — no <message to="..."> wrapping. Pre-#19
-    // this produced no outbound (silent drop into the scratchpad log). Post-#19
-    // the cleaned scratchpad is sent back to the source channel so the user
-    // gets the reply even when the agent forgot the wrapping discipline.
     const provider = new MockProvider({}, () => 'I am thinking about this...');
     const controller = new AbortController();
     const loopPromise = runPollLoopWithTimeout(provider, controller.signal, 2000);
 
-    await waitFor(() => getUndeliveredMessages().length > 0, 2000);
+    // Give the loop time to run a full turn, then assert nothing hit the
+    // channel. The wrap-nudge path is not observable here (it pushes into the
+    // SDK query, which the runPollLoop harness does not expose).
+    await sleep(500);
     controller.abort();
 
-    const out = getUndeliveredMessages();
-    expect(out).toHaveLength(1);
-    expect(out[0].platform_id).toBe('chan-1');
-    expect(out[0].channel_type).toBe('discord');
-    expect(JSON.parse(out[0].content).text).toBe('I am thinking about this...');
+    expect(getUndeliveredMessages()).toHaveLength(0);
 
     await loopPromise.catch(() => {});
   });
@@ -308,6 +327,7 @@ async function runPollLoopWithTimeout(provider: MockProvider, signal: AbortSigna
   return Promise.race([
     runPollLoop({
       provider,
+      providerContract: MOCK_PROVIDER_CONTRACT,
       providerName: 'mock',
       cwd: '/tmp',
       signal,
@@ -515,7 +535,6 @@ describe('poll loop — /clear command', () => {
  * Provider that throws on every query, simulating API failures.
  */
 class ThrowingProvider {
-  readonly supportsNativeSlashCommands = false;
   private errorMessage: string;
 
   constructor(errorMessage: string) {
@@ -544,8 +563,6 @@ class ThrowingProvider {
  * First emits an init event (setting continuation), then throws.
  */
 class InvalidSessionProvider {
-  readonly supportsNativeSlashCommands = false;
-
   isSessionInvalid(): boolean {
     return true;
   }
@@ -567,7 +584,11 @@ describe('PATCH #36 — dispatchResultText cap and dedup', () => {
   it('should cap outbound messages at 10 per poll iteration', async () => {
     insertMessage('m1', { sender: 'Alice', text: 'trigger' }, { platformId: 'chan-1', channelType: 'discord' });
 
-    // Provider returns 15 identical <message> blocks — only 10 should be written
+    // Provider returns 15 blocks — the mid-turn cap (MAX_MESSAGES_PER_POLL=10,
+    // [PATCH-myia #36] re-homed) writes at most 10. Identical blocks are NOT
+    // collapsed: upstream's s09 shape treats an identical-in-scan repeat as a
+    // deliberate double-send (both deliver), so the cap — not a dedup — is the
+    // flood bound under the mid-turn contract.
     const blocks = Array.from({ length: 15 }, () => '<message to="discord-test">spam</message>').join('\n');
     const provider = new MockProvider({}, () => blocks);
 
@@ -578,29 +599,7 @@ describe('PATCH #36 — dispatchResultText cap and dedup', () => {
     controller.abort();
 
     const out = getUndeliveredMessages();
-    // With dedup, only 1 unique message should survive (all 15 are identical)
-    // But the cap at 10 means at most 10 are even considered
-    expect(out.length).toBeLessThanOrEqual(10);
-
-    await loopPromise.catch(() => {});
-  });
-
-  it('should deduplicate identical <message> blocks in a single response', async () => {
-    insertMessage('m1', { sender: 'Alice', text: 'trigger' }, { platformId: 'chan-1', channelType: 'discord' });
-
-    // 5 identical messages — only 1 should be written
-    const blocks = Array.from({ length: 5 }, () => '<message to="discord-test">duplicate content</message>').join('\n');
-    const provider = new MockProvider({}, () => blocks);
-
-    const controller = new AbortController();
-    const loopPromise = runPollLoopWithTimeout(provider, controller.signal, 2000);
-
-    await waitFor(() => getUndeliveredMessages().length > 0, 2000);
-    controller.abort();
-
-    const out = getUndeliveredMessages();
-    expect(out).toHaveLength(1);
-    expect(JSON.parse(out[0].content).text).toBe('duplicate content');
+    expect(out.length).toBe(10);
 
     await loopPromise.catch(() => {});
   });
@@ -679,7 +678,6 @@ describe('poll loop — slash command during active query', () => {
  * the loop interrupts an active stream.
  */
 class BlockingProvider {
-  readonly supportsNativeSlashCommands = false;
   queries = 0;
   aborts = 0;
   ends = 0;
