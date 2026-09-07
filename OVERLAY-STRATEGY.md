@@ -1,6 +1,6 @@
 # Overlay Strategy — minimizing drift from upstream
 
-**Status:** active since 2026-05-01 sync (upstream `8c962d3` / v2.0.23).
+**Status:** active since 2026-05-01 sync; most recent baseline upstream `6656b326` / v2.3.0 (2026-09-08).
 
 ## Goal
 
@@ -62,8 +62,9 @@ Six categories that are NOT going away soon. Future-syncs should expect to re-re
 - `${VAR}` expansion in container.json (PATCHES #2) — until upstream adopts vault-based MCP credentials.
 - `container/CLAUDE.md` non-negotiable rules (PATCHES #3) — until upstream provides a per-install rule slot.
 - `gh` CLI in Dockerfile (PATCHES #4) — until cluster-manager moves to a sibling image.
-- Windows fragment-copy in `claude-md-compose.ts` (PATCHES #5) — until Node/Windows fixes the symlink target translation.
+- Windows fragment-copy in `claude-md-compose.ts` (PATCHES #5) — **RETIRED at v2.3.0**: upstream's `project-doc-compose.ts` now writes composed content directly instead of symlinks, satisfying its exit condition. The fork's separate `CLAUDE_LOCAL_WARN_BYTES` injection bound lives in `project-doc-compose.ts` (`[PATCH-myia]`).
 - Concurrency cap in container wake (PATCHES #7) — until upstream grows queue-aware backpressure.
+- OneCLI CA-bundle preamble in `composeSessionSpec` (unnumbered `[PATCH-myia]`, `src/container-runner.ts`) — upstream doesn't build the gateway-CA/system-roots bundle for the dynamic spawn that bypasses `entrypoint.sh`; Windows native binaries (gh/curl/git/python) need it.
 
 The other 5 entries (#8–#12: mcp-health, task-run-logs, roosync-inbox-standalone, ipc-watcher, transcription) are **migration debt** — they're features we restored from v1 because v2 dropped them. Each has a credible path off (skill, or cluster reorg) and should shrink over time.
 
