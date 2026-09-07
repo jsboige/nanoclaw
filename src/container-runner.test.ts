@@ -252,7 +252,12 @@ describe('composeSessionSpec', () => {
   it('splits PID 1 so a driver can preserve the image init', () => {
     const agent = compose().containers[0];
     expect(agent.command).toEqual(['bash', '-c']);
-    expect(agent.args).toEqual(['exec bun run /app/src/index.ts']);
+    // [PATCH-myia] The fork prepends the OneCLI CA-bundle setup to the
+    // entrypoint command (the dynamic spawn bypasses entrypoint.sh, and the
+    // OneCLI SDK's host-side CA bundler bails on Windows). The PID-1 contract
+    // is preserved: args is still a single string that execs the entrypoint.
+    expect(agent.args).toHaveLength(1);
+    expect(agent.args[0]).toContain('exec bun run /app/src/index.ts');
   });
 
   it('asks for a shared-private network and the standard posture', () => {

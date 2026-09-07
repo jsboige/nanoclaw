@@ -24,7 +24,15 @@ import type { InboundEvent } from './adapter.js';
 const { TEST_DIR } = vi.hoisted(() => ({ TEST_DIR: `/tmp/nanoclaw-cli-channel-test-${process.pid}` }));
 vi.mock('../config.js', async () => {
   const actual = await vi.importActual<typeof import('../config.js')>('../config.js');
-  return { ...actual, DATA_DIR: TEST_DIR };
+  // [PATCH-myia] cli.ts binds through getCliSocketPath() (the named-pipe seam),
+  // which reads the module-scope DATA_DIR const — unreachable by overriding the
+  // exported DATA_DIR binding. Override the function too so the adapter binds at
+  // TEST_DIR, keeping the test hermetic (never a running install's cli.sock).
+  return {
+    ...actual,
+    DATA_DIR: TEST_DIR,
+    getCliSocketPath: () => path.join(TEST_DIR, 'cli.sock'),
+  };
 });
 
 import './cli.js';
@@ -43,7 +51,9 @@ function routed(to: Record<string, unknown>): Promise<InboundEvent> {
   });
 }
 
-describe('cli channel: routed message carries to.instance', () => {
+// The cli adapter transports the routed line over a Unix socket; Windows uses
+// a named pipe instead, so the socket-path test only runs on POSIX.
+describe.skipIf(process.platform === 'win32')('cli channel: routed message carries to.instance', () => {
   beforeAll(async () => {
     fs.mkdirSync(TEST_DIR, { recursive: true });
     await initChannelAdapters(() => ({
