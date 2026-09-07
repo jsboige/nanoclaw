@@ -309,9 +309,7 @@ async function drainSession(session: Session): Promise<void> {
           messageId: msg.id,
           sessionId: session.id,
         });
-        await withExistingMailboxSession(agentGroup.id, session.id, (mailbox) =>
-          mailbox.markDelivered(msg.id, null),
-        );
+        await withExistingMailboxSession(agentGroup.id, session.id, (mailbox) => mailbox.markDelivered(msg.id, null));
         delivered.add(msg.id);
         await clearAttemptRow(msg.id);
         continue;
@@ -324,9 +322,7 @@ async function drainSession(session: Session): Promise<void> {
           messageId: msg.id,
           sessionId: session.id,
         });
-        await withExistingMailboxSession(agentGroup.id, session.id, (mailbox) =>
-          mailbox.markDelivered(msg.id, null),
-        );
+        await withExistingMailboxSession(agentGroup.id, session.id, (mailbox) => mailbox.markDelivered(msg.id, null));
         delivered.add(msg.id);
         await clearAttemptRow(msg.id);
         continue;
