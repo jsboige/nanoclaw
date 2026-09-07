@@ -2,7 +2,27 @@
 
 Minimal `src/` and `container/` patches applied on top of upstream v2. Every entry includes its commit hash, reason, and exit condition. Target: ≤ 10 active patches at any time. Monthly review removes those whose exit condition is satisfied.
 
-Baseline: upstream `main` at `48347e11` (v2.2.0) — sync 2026-08-14. Previous baseline was `743e32df` (v2.1.54, 2026-08-08); before that `cb6e3d1` (v2.1.23, 2026-07-02); before that `ee7f891` (v2.1.17, 2026-06-18).
+Baseline: upstream `main` at `6656b326` (v2.3.0) — sync 2026-09-08. Previous baseline was `48347e11` (v2.2.0, 2026-08-14); before that `743e32df` (v2.1.54, 2026-08-08); before that `cb6e3d1` (v2.1.23, 2026-07-02); before that `ee7f891` (v2.1.17, 2026-06-18). Fork-main rollback tag for the deploy: `pre-sync-v230-0b87f966`.
+
+## Sync notes — v2.2.0 → v2.3.0 (~120 commits, async central-DB refactor)
+
+The heaviest sync since v2.1.54. Upstream refactored the central database to a **pluggable async driver seam** (`src/db/drivers/`, `src/mailbox/`), introduced **gateway providers** (`getGatewayProvider().contribute()`), **session claims** (`claimSessionRun`/`tryClaimSession`, `adoptRunningSessions`), a **mailbox abstraction** (`getAgentMailbox().operations`), and a **mid-turn-complete provider contract** (`deliverMidTurnBlocks(turnStartSeq, carry)` → `MidTurnScanResult`). Big structural churn: `src/claude-md-compose.ts` deleted (→ `src/project-doc-compose.ts`); `buildContainerArgs` replaced by `composeSessionSpec`; the old container-runtime helpers (`getContainerSpawnedAt`, `expireStalePendingApprovals`) are gone.
+
+Re-homes and retirements (fork intent preserved, upstream seams adopted):
+
+- **Retired `#34`** (auto-advance recurring tasks past MAX_TRIES) — upstream's `handleRecurrence` now re-arms `status IN ('completed','failed')` rows (getCompletedRecurring includes failed). Confirmed as predicted in the v2.2.0 sync notes; `advanceRecurringTaskAfterFailure` is gone from `recurrence.ts`/`host-sweep.ts`. Kept only the `host-sweep.test.ts` regression test asserting a MAX_TRIES row seals as `failed` *with* its recurrence retained so the series re-arms.
+- **Retired `#25`** (serialize follow-up pushes, queue-and-drain) — upstream's mid-turn-complete contract structurally fixes the merged-turn loss (#25 was a workaround for push-mode merging). The `queuedFollowUps`/drain machinery is gone; `awaitingResult` survives for #26/#27.
+- **Retired `#22`** (host `docker info` startup retry) — the upstream async-DB refactor found a different home for runtime bootstrap; on the fork the *runtime* OneCLI transient retry **`#33` survives, relocated** from `src/container-runtime.ts` to `src/gateway-providers/onecli.ts` (wraps `ensureAgent` + `applyContainerConfig`).
+- **Retired `#5`** (copy CLAUDE.md fragments instead of symlinking on Windows) — `claude-md-compose.ts` was deleted upstream; the replacement `src/project-doc-compose.ts` writes composed content **directly** (`writeAtomic`/`readFileSync`, no symlinks), which is precisely #5's exit condition. The fork's *separate* `CLAUDE_LOCAL_WARN_BYTES`/`enforceClaudeLocalBound` injection bound was **re-homed into `src/project-doc-compose.ts`** ([PATCH-myia], 6 refs confirmed) — it is not part of #5.
+- **Re-homed `#18`/`#9`** (raw SQL out of `src/db/`) — `messages-in.ts` `resetProcessingAcks` now delegates to `getAgentMailbox().operations.resetProcessingAcks(ids)` (new `MailboxOperations` method, sqlite driver impl); `task-run-logs.ts` became a pure facade, SQL moved to `mailbox/sqlite/index.ts`. Satisfies the architecture test that greps `src/db/` for direct DB access.
+- **`#36` reverted to cap-only** — upstream's per-response contract deliberately delivers *identical blocks in one segment* as a double-send; the fork's dedup broke that test. Kept the `MAX_MESSAGES_PER_POLL = 10` cap (ported into `deliverMidTurnBlocks`), removed the `Set` dedup.
+- **`#19` gated** on `!options?.suppressDelivery` so the mid-turn no-write path doesn't double-deliver the bare-text fallback.
+- **`#1`/`#6`/`#38`/`#39`/`#44` home moved** — `buildContainerArgs` is now the env-`tail` of `composeSessionSpec` (`src/container-runner.ts`); all five patches' behavior lives under the new function. The fork's **OneCLI CA-bundle preamble** (combining the gateway CA with system roots so `gh`/`curl`/`git`/`python` don't 401 on Windows) is injected into `composeSessionSpec`'s entrypoint arg — kept, marked `[PATCH-myia]` (unnumbered), since upstream doesn't build that bundle for the dynamic spawn.
+- **Fork no-credentials invariant vs `validateSpec.isSecretShaped`** — the fork's `MountPolicy.passthroughEnvKeys` seam survives the upstream credential-shape check.
+
+CI reconcilations (host tests): `container-runner.test.ts` "splits PID 1 so a driver can preserve the image init" — upstream asserts the plain `exec bun run /app/src/index.ts` arg, but the fork's `composeSessionSpec` prepends the CA preamble; the test now asserts the single-string arg *contains* the exec. `channels/cli.test.ts` — upstream v2.3.0's `cli.ts` binds through `getCliSocketPath()` (module-scope `DATA_DIR` const, unreachable by the test's `DATA_DIR` mock); the mock now overrides `getCliSocketPath`, and the Unix-socket test is skipped on win32 (named-pipe transport).
+
+Host `tsc` + container `tsc` clean. Host vitest: the only failures are the known Windows-environment set (symlink EPERM on syncSkillSymlinks; `\tmp` unix-socket on cli.test.ts) — green on Linux CI. Container tests green apart from env-only cases.
 
 ## Sync notes — v2.1.54 → v2.2.0 (58 commits, 3 conflicted files / 4 hunks, all import-level)
 
@@ -113,7 +133,7 @@ If none works, document the patch here with justification.
 
 ### 5. Copy CLAUDE.md fragments instead of symlinking on Windows
 
-- **File:** `src/claude-md-compose.ts` (`syncSymlink` → `syncFragment`, plus `hostSource` on the desired-fragment map)
+- **Status:** RETIRED (v2.3.0, 2026-09-08) — upstream replaced `src/claude-md-compose.ts` with `src/project-doc-compose.ts`, which writes composed content directly instead of symlinks, satisfying this patch's exit condition. Entry kept for audit.
 - **Summary:** On `win32` hosts, inline the host file content (`fs.readFileSync` + `writeAtomic`) instead of `fs.symlinkSync`. Composition runs per-spawn so the inlined copy is never stale.
 - **Why:** The upstream design uses symlinks whose targets are container-side absolute paths (`/app/CLAUDE.md`, `/app/src/mcp-tools/<x>.instructions.md`), valid inside the container via RO mounts, dangling on the POSIX host. On Windows, MSYS2/Git-Bash (NSSM service env, or any Node-via-Bash spawn) rewrites these POSIX-absolute targets at symlink-creation time to `/d/app/...`, which Docker then exposes as `/mnt/host/d/app/...` inside the container — permanently broken. Impact: without this patch the composed `groups/<folder>/CLAUDE.md` imports 1 broken `.claude-shared.md` + 5 broken `.claude-fragments/module-*.md` links, meaning the agent never sees the shared `container/CLAUDE.md` (non-negotiable rules, skills overview) nor the MCP tool instructions (agents, core, interactive, scheduling, self-mod).
 - **Exit condition:** Upstream changes the composition to write content directly (not symlinks), or Node/Windows stops translating POSIX-absolute symlink targets.
@@ -270,6 +290,8 @@ If none works, document the patch here with justification.
 
 ### 34. Auto-advance recurring tasks past MAX_TRIES failure (sweep safety net)
 
+- **Status:** RETIRED (v2.3.0, 2026-09-08) — superseded by upstream's `handleRecurrence`, which now re-arms `status IN ('completed','failed')` rows. See v2.3.0 sync notes. Entry kept for audit.
+
 - **File:** `src/host-sweep.ts` (`resetStuckProcessingRows` — call new helper inside the `tries >= MAX_TRIES` branch before `markMessageFailed`; functions and test helper made `async` to allow the dynamic import in the same style as `handleRecurrence`); `src/modules/scheduling/recurrence.ts` (new `advanceRecurringTaskAfterFailure` exported alongside `handleRecurrence`).
 - **Summary:** When a `messages_in` row carrying a cron `recurrence` is about to be sealed as `failed` after MAX_TRIES (transient stall / session-invalid / OneCLI cascade), enqueue the next series instance via the same `cron-parser + insertRecurrence + clearRecurrence` flow used by `handleRecurrence`. The failed row keeps `status='failed'` (with `recurrence` cleared) for audit; the new pending row carries the series forward with the same `series_id`. Pre-fix path: `handleRecurrence` only ever picks up `status='completed' AND recurrence IS NOT NULL`, so once a row was marked failed the cron series was silently dead — no operator alert, no next instance. Post-fix: a single chain-flap cascade no longer kills the series.
 - **Why:** Reproduced 2026-05-28 with the ClusterManager `15 8-22 * * *` and `30 8-22 * * *` review crons on the `main` agent group. Stall retries (PATCH #26 `stalledAborted` flagging) exhausted MAX_TRIES around 10:00Z, both rows were marked `failed`, then `handleRecurrence` skipped them forever. The bot went silent on its review schedule for ~3h before the user noticed. Manual recovery had to flip the rows back to `completed` so the recurrence engine would re-pick them up — not scalable. The safety net moves recovery into the sweep itself.
@@ -309,6 +331,8 @@ If none works, document the patch here with justification.
 - **Lines:** ~50 host (helper + constant + isTransient check + 2 call-site wraps) + ~40 tests (5 vitest cases: noop, fetch-failed recovery, pipe-error recovery, non-transient bypass, exhaustion).
 
 ### 25. Serialize follow-up pushes in container poll-loop
+
+- **Status:** RETIRED (v2.3.0, 2026-09-08) — the upstream mid-turn-complete provider contract (`deliverMidTurnBlocks`) structurally fixes the merged-turn loss #25 was a workaround for, so the queue-and-drain machinery was dropped. Entry kept for audit.
 
 - **File:** `container/agent-runner/src/poll-loop.ts` (`processQuery` — new `awaitingResult` + `queuedFollowUps` state; queue branch in the inner poll handler before the existing push branch; drain branch in the `result` event handler after `dispatchResultText`; reset blocks added to the stall watchdog and the finally cleanup).
 - **Summary:** When a turn is already in flight (initial prompt or a prior follow-up batch awaiting its result), do not call `query.push()` immediately. Instead, mark the new messages as `processing` (so the host sweep leaves them alone) and accumulate them in a local `queuedFollowUps` array. On the next `result` event, drain the queue as a single consolidated push so each batch gets its own SDK turn — and therefore its own user-visible reply. If the stream ends before queued items are pushed (slash command, refresh, MCP loss, stall), reset them back to `pending` so the outer loop re-picks them in a fresh query. `awaitingResult` starts `true` (initial prompt is already awaiting), flips `false` on each `result`, flips `true` again after every push.
