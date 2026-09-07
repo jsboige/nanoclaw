@@ -256,8 +256,7 @@ describe('composeSessionSpec', () => {
     // entrypoint command (the dynamic spawn bypasses entrypoint.sh, and the
     // OneCLI SDK's host-side CA bundler bails on Windows). The PID-1 contract
     // is preserved: args is still a single string that execs the entrypoint.
-    expect(agent.args).toHaveLength(1);
-    expect(agent.args[0]).toContain('exec bun run /app/src/index.ts');
+    expect(agent.args).toEqual([expect.stringContaining('exec bun run /app/src/index.ts')]);
   });
 
   it('asks for a shared-private network and the standard posture', () => {
