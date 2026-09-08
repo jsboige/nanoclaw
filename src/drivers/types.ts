@@ -513,9 +513,23 @@ export function validateSpec(spec: SessionSpec, policy: MountPolicy, capabilitie
  * path the runtime mounts, and a trusted root cannot be escaped lexically.
  */
 function hostPathCanonical(hostPath: string): boolean {
-  if (!hostPath.startsWith('/')) return false;
-  const segments = hostPath.split('/').slice(1);
-  return segments.every((segment) => segment !== '' && segment !== '.' && segment !== '..');
+  // Canonical absolute — rooted and free of '.', '..', empty (double- or
+  // trailing-separator) segments — for POSIX ('/a/b'), Windows drive
+  // ('D:\a\b') and UNC ('\\server\share\a') root forms. The old startsWith('/')
+  // gate denied every Windows host path, stopping the spawn before a docker
+  // run could be issued.
+  let rest: string;
+  if (hostPath.startsWith('/')) {
+    rest = hostPath.slice(1);
+  } else if (/^[A-Za-z]:[\\/]/.test(hostPath)) {
+    rest = hostPath.slice(3);
+  } else if (/^\\\\[^\\/]+[\\/]/.test(hostPath)) {
+    rest = hostPath.slice(2);
+  } else {
+    return false;
+  }
+  if (rest === '') return false;
+  return rest.split(/[\\/]/).every((segment) => segment !== '' && segment !== '.' && segment !== '..');
 }
 
 /**
@@ -648,5 +662,11 @@ function mountAllowed(mount: MountSpec, spec: SessionSpec, policy: MountPolicy):
 }
 
 function underRoot(hostPath: string, root: string): boolean {
-  return hostPath === root || hostPath.startsWith(`${root}/`);
+  // Separator-agnostic: roots are sometimes assembled with '/' even on a
+  // Windows host (e.g. `${dataRoot}/v2-sessions/${scope}`) while the mount
+  // source uses '\', so a literal `root + '/'` prefix probe would miss it.
+  const norm = (p: string) => p.replace(/[\\/]+/g, '/').replace(/\/+$/, '');
+  const h = norm(hostPath);
+  const r = norm(root);
+  return h === r || h.startsWith(`${r}/`);
 }

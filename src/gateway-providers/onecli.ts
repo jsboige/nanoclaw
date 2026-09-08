@@ -113,16 +113,35 @@ export function contributionFromArgs(args: readonly string[], groupScope: string
     }
     if (flag === '-v' && value) {
       const parts = value.split(':');
-      if (parts.length >= 2 && parts.length <= 3 && (parts[2] === undefined || parts[2] === 'ro')) {
-        mounts.push({
-          class: 'allowlisted-extra',
-          hostPath: parts[0],
-          containerPath: parts[1],
-          mode: parts[2] === 'ro' ? 'ro' : 'rw',
-          groupScope,
-        });
-        continue;
+      let mode: 'rw' | 'ro' = 'rw';
+      let rest = parts;
+      const last = parts[parts.length - 1];
+      if (last === 'ro' || last === 'rw') {
+        mode = last;
+        rest = parts.slice(0, -1);
       }
+      // The container path is the last segment that reads as a POSIX path. The
+      // host may be a Windows drive path (`C:\...`) whose own colon would break
+      // a naive split, so both halves are re-formed from the segment list
+      // rather than hardcoding `parts[0]`/`parts[1]`.
+      let containerIndex = -1;
+      for (let j = rest.length - 1; j >= 0; j--) {
+        if (rest[j].startsWith('/')) {
+          containerIndex = j;
+          break;
+        }
+      }
+      if (containerIndex <= 0 || containerIndex !== rest.length - 1) {
+        throw new Error(`OneCLI gateway emitted argv this seam cannot type: '${flag} ${value ?? ''}'`);
+      }
+      mounts.push({
+        class: 'allowlisted-extra',
+        hostPath: rest.slice(0, containerIndex).join(':'),
+        containerPath: rest[containerIndex],
+        mode,
+        groupScope,
+      });
+      continue;
     }
     // Fail-closed on grammar drift: an SDK that starts emitting a flag this
     // parser cannot type must break the spawn loudly, not smuggle argv.

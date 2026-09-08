@@ -45,6 +45,27 @@ describe('contributionFromArgs', () => {
     ]);
   });
 
+  it('types a Windows drive-path host mount without tripping on the drive colon', () => {
+    // [PATCH-myia] On Windows the gateway contributes the OneCLI CA bundle as a
+    // `-v C:\...\onecli-proxy-ca.pem:/tmp/onecli-gateway-ca.pem:ro` mount. The
+    // drive-letter colon must not be mistaken for the host/container separator
+    // (a naive `split(':')` yields 4 segments and refuses the spawn).
+    const contribution = contributionFromArgs(
+      ['-v', 'C:\\Users\\MYIA\\AppData\\Local\\Temp\\onecli-proxy-ca.pem:/tmp/onecli-gateway-ca.pem:ro'],
+      'g1',
+    );
+
+    expect(contribution.mounts).toEqual([
+      {
+        class: 'allowlisted-extra',
+        hostPath: 'C:\\Users\\MYIA\\AppData\\Local\\Temp\\onecli-proxy-ca.pem',
+        containerPath: '/tmp/onecli-gateway-ca.pem',
+        mode: 'ro',
+        groupScope: 'g1',
+      },
+    ]);
+  });
+
   it('refuses argv outside the grammar — nothing rides raw around the spec again', () => {
     // Grammar drift in the SDK must break the spawn loudly, not smuggle flags.
     expect(() => contributionFromArgs(['--network', 'something'], 'g1')).toThrow(/cannot type/);
