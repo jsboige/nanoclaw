@@ -10,7 +10,11 @@
  *
  *   If the container isn't running and there are 'processing' rows left over
  *   (e.g. it crashed mid-turn) → reset them to pending with backoff +
- *   tries++. Existing retry machinery does the rest.
+ *   tries++. Existing retry machinery does the rest. Gated since #3350: the
+ *   reset only runs after two consecutive negative container probes AND once
+ *   every claim is older than CONTAINER_DOWN_GRACE_MS — a single registry
+ *   false negative must not replay a live turn envelope (see
+ *   decideContainerDownReset).
  *
  *   If the container IS running:
  *     1. Absolute ceiling: heartbeat age > max(30 min, current_bash_timeout)
@@ -48,6 +52,17 @@ export const ABSOLUTE_CEILING_MS = 30 * 60 * 1000;
 // Stuck tolerance window applied per 'processing' claim — "did we see any
 // signs of life since this message was claimed?"
 export const CLAIM_STUCK_MS = 60 * 1000;
+// Grace applied to the container-not-running reset path (the `!alive` branch
+// of maintainSessionMailbox). A false negative from the running-container
+// registry (host restart while the container survived, adoption race) used to
+// reset 'processing' rows on the FIRST miss, replaying a live turn envelope
+// into a second container — the #3350 twin episodes. The reset now requires
+// the claim age to exceed this AND two consecutive negative probes (see
+// decideContainerDownReset). Chosen strictly above CLAIM_STUCK_MS and above
+// the 60s sweep floor: voie B can never reset a claim earlier than voie A
+// would judge the same claim on a running-but-silent container, and a claim
+// inside its normal first-sweep working window is never replayed.
+export const CONTAINER_DOWN_GRACE_MS = 90 * 1000;
 const MAX_TRIES = 5;
 const BACKOFF_BASE_MS = 5000;
 
@@ -55,6 +70,14 @@ export type StuckDecision =
   | { action: 'ok' }
   | { action: 'kill-ceiling'; heartbeatAgeMs: number; ceilingMs: number }
   | { action: 'kill-claim'; messageId: string; claimAgeMs: number; toleranceMs: number };
+
+export type ContainerDownDecision =
+  /** First negative probe of the current streak — record it, reset deferred. */
+  | { action: 'arm' }
+  /** Container down on consecutive probes, but claims are still within grace. */
+  | { action: 'wait' }
+  /** Consecutive negative probes AND every claim past the grace — reset now. */
+  | { action: 'reset' };
 
 /**
  * Pure decision for whether a running container should be killed this sweep
@@ -109,6 +132,42 @@ export function decideStuckAction(args: {
   return { action: 'ok' };
 }
 
+/**
+ * Pure decision for whether the container-not-running stuck-reset may run
+ * this pass. The old behavior reset 'processing' rows on the FIRST negative
+ * probe, so a single registry false negative replayed a live turn envelope
+ * into a second container (#3350 twins: two TOUR posts on the same slot).
+ * The reset now requires BOTH:
+ *
+ *   1. two consecutive probes concluded "not running" — the first negative
+ *      probe only arms, a later one confirms, and a positive probe in
+ *      between disarms (the caller clears the streak when the container is
+ *      seen running), and
+ *   2. every 'processing' claim is older than CONTAINER_DOWN_GRACE_MS, so a
+ *      claim still inside its normal working window is never replayed and
+ *      no reset can fire before voie A would have judged the same claim.
+ *
+ * Inputs are deterministic; the streak map and mailbox reads stay in the
+ * caller. Claims with unparseable timestamps block the reset (unknown age
+ * is not evidence of an orphan) — same posture as decideStuckAction.
+ */
+export function decideContainerDownReset(args: {
+  now: number;
+  /** Timestamp of the previous negative probe in the current streak, null when the previous probe was positive or none ran. */
+  firstNegativeAtMs: number | null;
+  claims: Array<{ messageId: string; statusChanged: string }>;
+}): ContainerDownDecision {
+  const { now, firstNegativeAtMs, claims } = args;
+  if (firstNegativeAtMs === null) return { action: 'arm' };
+  if (claims.length === 0) return { action: 'wait' };
+  for (const claim of claims) {
+    const claimedAt = Date.parse(claim.statusChanged);
+    if (Number.isNaN(claimedAt)) return { action: 'wait' };
+    if (now - claimedAt <= CONTAINER_DOWN_GRACE_MS) return { action: 'wait' };
+  }
+  return { action: 'reset' };
+}
+
 /** A per-task session with no live tasks and no running container is spent → close it. */
 export function shouldCloseTaskSession(
   threadId: string | null,
@@ -121,7 +180,11 @@ export function shouldCloseTaskSession(
 /** Reconcile one session against current state. Missing/closed sessions no-op. */
 export async function reconcileSession(sessionId: string): Promise<void> {
   const session = await getSession(sessionId);
-  if (!session || session.status !== 'active') return;
+  if (!session || session.status !== 'active') {
+    // A gone session must not keep a probe streak alive.
+    containerDownSince.delete(sessionId);
+    return;
+  }
   await reconcileActiveSession(session);
 }
 
@@ -163,6 +226,65 @@ async function reconcileActiveSession(session: Session): Promise<void> {
   }
 }
 
+/**
+ * SessionId → timestamp of the first "container not running" probe in the
+ * current streak. Written by the first negative probe, cleared by any
+ * positive probe (or when the session goes away) — so a lone registry false
+ * negative can never reach the reset on its own.
+ */
+const containerDownSince = new Map<string, number>();
+
+/** Test seam: clear the container-down probe streak between tests. */
+export function _resetContainerDownTrackingForTesting(): void {
+  containerDownSince.clear();
+}
+
+/**
+ * The container-not-running reset (voie B), gated by the #3350 grace: the
+ * first negative probe only arms, a later consecutive one confirms, and the
+ * claims must all be past CONTAINER_DOWN_GRACE_MS before anything resets.
+ * `now` is a parameter so tests can drive the streak deterministically.
+ */
+function probeContainerDownAndMaybeReset(
+  inDb: InboundMailbox,
+  outDb: OutboundMailbox,
+  session: Session,
+  now: number,
+): void {
+  const decision = decideContainerDownReset({
+    now,
+    firstNegativeAtMs: containerDownSince.get(session.id) ?? null,
+    claims: outDb.getProcessingClaims(),
+  });
+  if (decision.action === 'arm') {
+    containerDownSince.set(session.id, now);
+    log.info('Container probe negative — grace armed, stuck reset deferred', {
+      sessionId: session.id,
+      graceMs: CONTAINER_DOWN_GRACE_MS,
+    });
+    return;
+  }
+  if (decision.action === 'wait') {
+    log.info('Container down on consecutive probes — claims still within grace, reset deferred', {
+      sessionId: session.id,
+      graceMs: CONTAINER_DOWN_GRACE_MS,
+    });
+    return;
+  }
+  containerDownSince.delete(session.id);
+  resetStuckProcessingRows(inDb, outDb, session, 'container not running (confirmed by consecutive probes)');
+}
+
+/** Test seam for the voie-B grace gate: one negative-probe pass at `now`. */
+export function _containerDownProbeForTesting(
+  inDb: InboundMailbox,
+  outDb: OutboundMailbox,
+  session: Session,
+  now: number,
+): void {
+  probeContainerDownAndMaybeReset(inDb, outDb, session, now);
+}
+
 async function maintainSessionMailbox(
   mailbox: InboundMailbox & OutboundMailbox,
   session: Session,
@@ -170,10 +292,13 @@ async function maintainSessionMailbox(
 ): Promise<void> {
   const alive = isContainerRunning(session.id);
   if (alive) {
+    // A live container breaks the negative-probe streak — see
+    // probeContainerDownAndMaybeReset.
+    containerDownSince.delete(session.id);
     await enforceRunningContainerSla(mailbox, mailbox, session, agentGroupId);
   }
   if (!alive) {
-    resetStuckProcessingRows(mailbox, mailbox, session, 'container not running');
+    probeContainerDownAndMaybeReset(mailbox, mailbox, session, Date.now());
   }
 
   // MODULE-HOOK:scheduling-recurrence:start

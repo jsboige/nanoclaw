@@ -24,9 +24,14 @@ import { sessionKey } from './reconcile.js';
 export {
   ABSOLUTE_CEILING_MS,
   CLAIM_STUCK_MS,
+  CONTAINER_DOWN_GRACE_MS,
+  _containerDownProbeForTesting,
+  _resetContainerDownTrackingForTesting,
   _resetStuckProcessingRowsForTesting,
+  decideContainerDownReset,
   decideStuckAction,
   shouldCloseTaskSession,
+  type ContainerDownDecision,
   type StuckDecision,
 } from './reconcile-session.js';
 
