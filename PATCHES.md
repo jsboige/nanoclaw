@@ -515,6 +515,14 @@ If none works, document the patch here with justification.
 - **Exit condition:** Upstream restructures the abort path so claims are only reset after the query is fully dead (or adopts an equivalent between-query sweep). Raise at the next sync — the race is in upstream-owned code (`#26`'s reset ordering vs the follow-up poller).
 - **Lines:** ~18 (one call + comment)
 
+### 48. Container-down grace gate — two consecutive probes + claim-age grace before the voie-B stuck reset
+
+- **Files:** `src/reconcile-session.ts` (new `CONTAINER_DOWN_GRACE_MS=90 s` constant, `ContainerDownDecision` type, `decideContainerDownReset()` pure decision, `containerDownSince` streak map, `probeContainerDownAndMaybeReset()` + test seams, gone-session streak cleanup in `reconcileSession()`, wiring in `maintainSessionMailbox()`'s `!alive` branch) + re-exports in `src/host-sweep.ts`. Tests: `src/reconcile-session.container-down.test.ts`, `src/host-sweep-container-down-grace.test.ts`.
+- **Summary:** The container-not-running stuck reset no longer fires on the FIRST negative `isContainerRunning` probe. It now requires two consecutive negative probes (first only arms, a positive probe in between disarms, a gone session clears the streak; the two probes carry no minimum temporal separation — the gate is the claim's age, not the streak's duration) AND every 'processing' claim older than `CONTAINER_DOWN_GRACE_MS` (90 s). The grace bounds voie B against voie A's floor (`CLAIM_STUCK_MS=60 s`) only, NOT against voie A's widened per-claim tolerance (`max(CLAIM_STUCK_MS, declaredBashMs)`): with a declared 10-min Bash, voie B resets at 90 s a claim voie A would still tolerate at 600 s. Intentional — consecutive negative probes evidence a container that is actually gone, which a running-but-silent container cannot. `resetStuckProcessingRows` itself and the voie A kill paths are untouched.
+- **Why:** jsboige/roo-extensions#3350 (user decision 2026-09-13, Option A). Registry false negatives (host restart while the container survived, docker-runtime transient retries, adoption race) reset a live turn's 'processing' rows on the first miss; retry machinery then woke a second container on the same envelope — the twin TOUR episodes (19 documented occurrences, 23/08 → 07/09). Upstream resets on the first negative probe.
+- **Exit condition:** Upstream's container-not-running reset adopts its own confirmation mechanism (consecutive probes or equivalent liveness re-check) — drop the gate and keep only fleet tuning; OR #3350 is closed as resolved-in-production after the sustained observation window it defines (merge gate: deploy + production observation), in which case retire the entry with the issue reference. Do not drop while #3350 is open.
+- **Lines:** ~70 logic (constant + type + pure decision + streak map + wiring) + ~510 tests.
+
 ---
 
 ## Removed / not needed under v2

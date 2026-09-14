@@ -24,6 +24,7 @@ import { sessionKey } from './reconcile.js';
 export {
   ABSOLUTE_CEILING_MS,
   CLAIM_STUCK_MS,
+  // [PATCH-myia #48] Container-down grace surface (fork drift, see PATCHES.md).
   CONTAINER_DOWN_GRACE_MS,
   _containerDownProbeForTesting,
   _resetContainerDownTrackingForTesting,

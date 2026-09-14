@@ -52,16 +52,22 @@ export const ABSOLUTE_CEILING_MS = 30 * 60 * 1000;
 // Stuck tolerance window applied per 'processing' claim — "did we see any
 // signs of life since this message was claimed?"
 export const CLAIM_STUCK_MS = 60 * 1000;
-// Grace applied to the container-not-running reset path (the `!alive` branch
-// of maintainSessionMailbox). A false negative from the running-container
-// registry (host restart while the container survived, adoption race) used to
-// reset 'processing' rows on the FIRST miss, replaying a live turn envelope
-// into a second container — the #3350 twin episodes. The reset now requires
-// the claim age to exceed this AND two consecutive negative probes (see
-// decideContainerDownReset). Chosen strictly above CLAIM_STUCK_MS and above
-// the 60s sweep floor: voie B can never reset a claim earlier than voie A
-// would judge the same claim on a running-but-silent container, and a claim
-// inside its normal first-sweep working window is never replayed.
+// [PATCH-myia #48] Grace applied to the container-not-running reset path (the
+// `!alive` branch of maintainSessionMailbox). A false negative from the
+// running-container registry (host restart while the container survived,
+// adoption race) used to reset 'processing' rows on the FIRST miss, replaying
+// a live turn envelope into a second container — the #3350 twin episodes. The
+// reset now requires the claim age to exceed this AND two consecutive negative
+// probes (see decideContainerDownReset). Chosen strictly above CLAIM_STUCK_MS
+// and above the 60s sweep floor: voie B is never more eager than voie A's
+// floor tolerance, and a claim inside its normal first-sweep working window is
+// never replayed. This does NOT bound voie B by voie A's widened tolerance:
+// voie A extends its per-claim tolerance with the declared Bash timeout
+// (max(CLAIM_STUCK_MS, declaredBashMs) — a declared 10-min Bash is tolerated
+// 600 s), so with declaredBashMs > 90 s voie B may legitimately reset a claim
+// voie A would still tolerate. Accepted: two consecutive negative probes
+// evidence a container that is actually gone, which a running-but-silent
+// container cannot provide.
 export const CONTAINER_DOWN_GRACE_MS = 90 * 1000;
 const MAX_TRIES = 5;
 const BACKOFF_BASE_MS = 5000;
@@ -133,19 +139,25 @@ export function decideStuckAction(args: {
 }
 
 /**
- * Pure decision for whether the container-not-running stuck-reset may run
- * this pass. The old behavior reset 'processing' rows on the FIRST negative
- * probe, so a single registry false negative replayed a live turn envelope
- * into a second container (#3350 twins: two TOUR posts on the same slot).
- * The reset now requires BOTH:
+ * [PATCH-myia #48] Pure decision for whether the container-not-running
+ * stuck-reset may run this pass. The old behavior reset 'processing' rows on
+ * the FIRST negative probe, so a single registry false negative replayed a
+ * live turn envelope into a second container (#3350 twins: two TOUR posts on
+ * the same slot). The reset now requires BOTH:
  *
  *   1. two consecutive probes concluded "not running" — the first negative
  *      probe only arms, a later one confirms, and a positive probe in
  *      between disarms (the caller clears the streak when the container is
- *      seen running), and
+ *      seen running). The two probes carry no minimum temporal separation:
+ *      consecutive sweep ticks milliseconds apart both count — the gate is
+ *      the claim's age, not the streak's duration. And
  *   2. every 'processing' claim is older than CONTAINER_DOWN_GRACE_MS, so a
- *      claim still inside its normal working window is never replayed and
- *      no reset can fire before voie A would have judged the same claim.
+ *      claim still inside its normal working window is never replayed. The
+ *      grace bounds voie B against voie A's FLOOR (CLAIM_STUCK_MS) only:
+ *      voie A widens its per-claim tolerance with the declared Bash timeout,
+ *      so with declaredBashMs > 90 s voie B can reset a claim voie A would
+ *      still tolerate — accepted, because consecutive negative probes
+ *      evidence a dead container rather than a silent one.
  *
  * Inputs are deterministic; the streak map and mailbox reads stay in the
  * caller. Claims with unparseable timestamps block the reset (unknown age
@@ -227,10 +239,10 @@ async function reconcileActiveSession(session: Session): Promise<void> {
 }
 
 /**
- * SessionId → timestamp of the first "container not running" probe in the
- * current streak. Written by the first negative probe, cleared by any
- * positive probe (or when the session goes away) — so a lone registry false
- * negative can never reach the reset on its own.
+ * [PATCH-myia #48] SessionId → timestamp of the first "container not running"
+ * probe in the current streak. Written by the first negative probe, cleared by
+ * any positive probe (or when the session goes away) — so a lone registry
+ * false negative can never reach the reset on its own.
  */
 const containerDownSince = new Map<string, number>();
 
@@ -298,6 +310,8 @@ async function maintainSessionMailbox(
     await enforceRunningContainerSla(mailbox, mailbox, session, agentGroupId);
   }
   if (!alive) {
+    // [PATCH-myia #48] Two-probe + grace gate replaces the old first-miss
+    // resetStuckProcessingRows call — do not restore the one-probe reset.
     probeContainerDownAndMaybeReset(mailbox, mailbox, session, Date.now());
   }
 
