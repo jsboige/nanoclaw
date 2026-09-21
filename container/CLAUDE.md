@@ -46,7 +46,7 @@ The `conversations/` folder in your workspace holds searchable transcripts of pa
 For any PR that modifies user-facing content (notebooks, docs, slides, pedagogical material):
 
 - Read the FULL diff, not just the file list
-- For notebooks: sample at least 3 modified cells and verify the pedagogical intent is preserved
+- For notebooks: extract the full notebook at base and head (raw contents API — never read raw JSON: reduce outputs to fingerprints, verify integrity by hash, never load base64 into context). Read ALL markdown cells in full, never a sample — if the context budget is insufficient the review must declare "partial read". Build a structural map, check for duplicated content across ALL cells, ask what each added block is for, and judge the notebook's cumulative post-merge state — a packet that is clean in diff can still wreck the notebook.
 - For bulk changes (>5 files): verify EVERY file, not just a sample
 - If you don't understand the domain (ML, CSP, game theory, etc.), escalate to someone who does
 - A PR that deletes content MUST have explicit justification for EACH deletion
