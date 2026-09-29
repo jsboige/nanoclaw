@@ -27,6 +27,13 @@
 # genuinely down (vs. merely stale): one restart fixes the stale case; if it's
 # still down after a restart we back off instead of looping every 5 minutes.
 #
+#   2026-09-29 (#3898 decision (a)): a tools/call TIMEOUT alone no longer
+#   triggers a restart — slow != dead (chronic DriveFS degraded regime;
+#   timeout-restarts were cutting every bot session ~12.5x/day and breaking
+#   the chain mid-probe for the 2-min watchdog next door). A restart now
+#   requires a fast failure, a closed port, or $TimeoutStreakMax consecutive
+#   pure timeouts (sustained hang).
+#
 # Scheduled via Windows Task Scheduler. Typical: every 5 minutes.
 
 $ErrorActionPreference = 'Stop'
@@ -35,6 +42,10 @@ $ContainerName = 'myia-mcp-proxy'
 $LogFile = 'D:\nanoclaw\logs\watchdog-tbxark.log'
 $CooldownFile = 'D:\nanoclaw\logs\.tbxark-last-restart'
 $CooldownMinutes = 20
+# Consecutive pure-timeout main probes tolerated before treating a hang as
+# dead (3 x 5min cadence = 15 min of continuous timeouts). See main flow.
+$TimeoutStreakFile = 'D:\nanoclaw\logs\.tbxark-timeout-streak'
+$TimeoutStreakMax = 3
 # Probe the deepest/slowest backend; if RSM is healthy the shallow ones are too.
 $ProbeServer = 'roo-state-manager'
 
@@ -63,6 +74,13 @@ function Write-Log($msg) {
     # the bus down for the whole cooldown window with no verdict logged.
     try { Add-Content -Path $LogFile -Value $line -Encoding UTF8 } catch { }
     Write-Output $line
+}
+
+function Get-TimeoutStreak {
+    try { return [int](Get-Content $TimeoutStreakFile -Raw) } catch { return 0 }
+}
+function Reset-TimeoutStreak {
+    try { '0' | Set-Content -Path $TimeoutStreakFile -Encoding ASCII -NoNewline } catch { }
 }
 
 # Full MCP handshake against one server through TBXark.
@@ -123,6 +141,12 @@ function Test-McpBackend($server, $callTimeoutSec = 40) {
     #    healthy backend answers in well under a second; a stalled one hangs
     #    until timeout. toolsOk above stays diagnostic-only.
     $callTimeout = $callTimeoutSec
+    # 2026-09-29 (#3898 decision (a)): time the call so the caller can tell a
+    # TIMEOUT (chain slow — chronic DriveFS degraded regime; restarting here is
+    # what cut every bot session ~12.5x/day) from a FAST failure (error status
+    # or isError body — the actually-dead shapes that need the restart).
+    # Elapsed-vs-budget is locale-independent, unlike the exception message.
+    $swCall = [System.Diagnostics.Stopwatch]::StartNew()
     try {
         $h3 = @{ 'Authorization' = "Bearer $AuthToken"; 'Content-Type' = 'application/json'; 'Accept' = $accept }
         if ($sid) { $h3['Mcp-Session-Id'] = $sid }
@@ -131,14 +155,17 @@ function Test-McpBackend($server, $callTimeoutSec = 40) {
     }
     catch {
         $status = $_.Exception.Response.StatusCode.value__
-        return @{ httpOk = $true; toolsOk = ($tools -gt 0); callOk = $false; tools = $tools; detail = "$tools tools; tools/call failed (HTTP $status / $($_.Exception.Message))" }
+        $timedOut = $swCall.Elapsed.TotalSeconds -ge ($callTimeout - 1)
+        $detail = if ($timedOut) { "tools/call timed out after $([int]$swCall.Elapsed.TotalSeconds)s (budget ${callTimeout}s)" }
+                  else { "tools/call failed fast (HTTP $status / $($_.Exception.Message))" }
+        return @{ httpOk = $true; toolsOk = ($tools -gt 0); callOk = $false; callTimedOut = $timedOut; tools = $tools; detail = "$tools tools; $detail" }
     }
     $callContent = "$($r3.Content)"
     # roosync_dashboard list answers with a "dashboards" array; a dead RSM
     # instance answers isError:true with an empty text payload instead.
     $callOk = $callContent -match 'dashboards' -and $callContent -notmatch '"isError"\s*:\s*true'
-    $callDetail = if ($callOk) { 'tools/call ok' } else { 'tools/call returned no result body (isError/empty)' }
-    return @{ httpOk = $true; toolsOk = ($tools -gt 0); callOk = $callOk; tools = $tools; detail = "$tools tools; $callDetail" }
+    $callDetail = if ($callOk) { "tools/call ok ($([int]$swCall.Elapsed.TotalSeconds)s)" } else { 'tools/call returned no result body (isError/empty)' }
+    return @{ httpOk = $true; toolsOk = ($tools -gt 0); callOk = $callOk; callTimedOut = $false; tools = $tools; detail = "$tools tools; $callDetail" }
 }
 
 function Restart-McpStack($reason) {
@@ -228,15 +255,38 @@ try {
     # End-to-end RSM probe — decided by the real tools/call, not tools/list.
     $probe = Test-McpBackend $ProbeServer
     if ($probe.callOk) {
+        Reset-TimeoutStreak
         Write-Log "OK: RSM healthy via TBXark ($($probe.detail))"
         exit 0
     }
 
     if (-not $probe.httpOk) {
+        # Front door down = fast failure of the whole proxy — restart (unchanged).
+        Reset-TimeoutStreak
         Restart-McpStack "TBXark front door down ($($probe.detail))"
+    } elseif ($probe.callTimedOut) {
+        # 2026-09-29 (#3898 decision (a)): a tools/call that hangs to its
+        # budget means the chain is SLOW, not dead — the chronic DriveFS
+        # degraded regime (latencies 4-17s, 40s+ under evening load). The bots
+        # route around it (measured 2026-09-26: deliveries and dashboard
+        # writes continued through a 4h probe-timeout episode). Restarting the
+        # stack here cut every active bot session ~12.5x/day and caused 49 of
+        # the 61 fast-failure readings on roo-extensions' 2-min watchdog (each
+        # restart breaks the chain mid-probe). So: log, do NOT restart, and
+        # only escalate after $TimeoutStreakMax consecutive pure timeouts
+        # (15+ min of continuous hang = the genuinely-dead shape).
+        $streak = (Get-TimeoutStreak) + 1
+        try { "$streak" | Set-Content -Path $TimeoutStreakFile -Encoding ASCII -NoNewline } catch { }
+        if ($streak -ge $TimeoutStreakMax) {
+            Reset-TimeoutStreak
+            Restart-McpStack "$TimeoutStreakMax consecutive tools/call timeouts — sustained hang, treating as dead ($($probe.detail))"
+        } else {
+            Write-Log "WARN: tools/call timed out ($($probe.detail)) — SLOW, not dead: no restart (#3898 a). Timeout streak $streak/$TimeoutStreakMax."
+        }
     } else {
-        # Backend serving handshakes but not executing (stale session, hung
-        # sparfenyuk, GDrive stall) — the silent-failure modes.
+        # Backend answering fast with errors (isError body, 404 route-drop,
+        # stale session) — the silent-failure shapes a restart actually fixes.
+        Reset-TimeoutStreak
         Restart-McpStack "TBXark up but RSM not executing tools/call ($($probe.detail))"
     }
 }
