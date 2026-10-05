@@ -79,16 +79,24 @@ export function readSetting(key: (typeof SETTINGS)[number], env: NodeJS.ProcessE
  * states the intent, this realizes it, and nothing rides between them.
  */
 function dockerNetworkArgs(spec: SessionSpec): string[] {
-  if (ensureEgressNetwork()) {
+  if (spec.networkAccess.target.kind === 'session-container') return [];
+  if (ensureEgressNetwork(spec.networkAccess)) {
     log.info('Egress lockdown active', { containerName: agentContainerName(spec), network: EGRESS_NETWORK });
     return egressNetworkArgs();
   }
-  return os.platform() === 'linux' ? ['--add-host=host.docker.internal:host-gateway'] : [];
+  return os.platform() === 'linux' ? [`--add-host=${spec.networkAccess.endpoint}:host-gateway`] : [];
 }
 
 registerSessionDriver(
   DEFAULT_DRIVER_KIND,
-  (policy) => new DockerSessionDriver({ ...policy, networkArgsFor: dockerNetworkArgs }),
+  (policy) =>
+    new DockerSessionDriver({
+      ...policy,
+      networkArgsFor: dockerNetworkArgs,
+      reconcileNetworkAccess: (access) => {
+        if (access.target.kind !== 'session-container') ensureEgressNetwork(access);
+      },
+    }),
 );
 
 export function configuredDriverKind(env: NodeJS.ProcessEnv = process.env): DriverKind {
@@ -128,6 +136,7 @@ export function mountPolicy(env: NodeJS.ProcessEnv = process.env): MountPolicy {
     // composeSessionSpec injects from src/env-passthrough.ts, so validateSpec
     // sanctions exactly what composition adds and nothing more.
     passthroughEnvKeys: Object.keys(passthroughEnv()),
+    gatewayTrustRoot: path.join(DATA_DIR, 'gateway-trust'),
   };
 }
 

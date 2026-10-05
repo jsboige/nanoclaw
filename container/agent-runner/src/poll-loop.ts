@@ -16,10 +16,9 @@ import { getAgentMailbox } from './mailbox/index.js';
 import { recordTaskRun } from './db/task-run-logs.js'; // [PATCH-myia #9]
 import {
   clearContinuation,
-  clearCurrentInReplyTo,
   migrateLegacyContinuation,
   setContinuation,
-  setCurrentInReplyTo,
+  setCurrentReplyRoute,
   resetBatchSendCount, // [PATCH-myia #37]
 } from './db/session-state.js';
 import {
@@ -39,6 +38,22 @@ import { stripHarnessTagArtifacts } from './harness-tag-strip.js';
 import { isUploadTraceCommand, uploadTrace } from './upload-trace.js';
 import type { AgentProvider, AgentQuery, ProviderEvent, ProviderExchange } from './providers/types.js';
 import type { ProviderRuntimeContract } from './provider-contracts/registry.js';
+
+/** Publish `routing` as the reply stamp the MCP tools read (null route clears it).
+ * Adopted from upstream v2.4.0 (renamed API) — same intent as the old
+ * setCurrentInReplyTo stamp this fork shipped. */
+function publishReplyRoute(routing: RoutingContext): void {
+  setCurrentReplyRoute(
+    routing.inReplyTo
+      ? {
+          inReplyTo: routing.inReplyTo,
+          channelType: routing.channelType,
+          platformId: routing.platformId,
+          threadId: routing.threadId,
+        }
+      : null,
+  );
+}
 
 const POLL_INTERVAL_MS = 1000;
 const ACTIVE_POLL_INTERVAL_MS = 500;
@@ -683,7 +698,9 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
     let stalledAborted = false; // [PATCH-myia #26]
     // Publish the batch's in_reply_to so MCP tools (send_message, send_file)
     // can stamp it on outbound rows — needed for a2a return-path routing.
-    setCurrentInReplyTo(routing.inReplyTo);
+    // (Upstream v2.4.0 renamed the API to a full ReplyRoute stamp; the
+    // helper below carries the same intent.)
+    publishReplyRoute(routing);
     // [PATCH-myia #37] Reset the per-batch send_message counter at batch start.
     // The counter is DB-backed now (session-state) because send_message runs in
     // a separate stdio MCP subprocess; reset here bounds it to one batch.
@@ -868,7 +885,7 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
         log(`Errored batch will be acked completed — ${processingIds.length} message(s), no redelivery`);
       }
     } finally {
-      clearCurrentInReplyTo();
+      setCurrentReplyRoute(null); // clears the stamp (was clearCurrentInReplyTo)
       config.signal?.removeEventListener('abort', abortActiveQuery);
     }
 
@@ -1460,7 +1477,7 @@ export async function processQuery(
         // shape as the mcpRegistryLost signal. The error text still flows to
         // deliverErrorResult below, where #40's telemetry guard suppresses
         // it from the channel; the NEXT turn starts a fresh session.
-        if (event.isError === true && THRASH_RE.test(event.text ?? '')) {
+        if (event.isError === true && THRASH_RE.test(event.text ?? event.error ?? '')) {
           log(`Autocompact thrash detected — dropping continuation so the next turn starts a fresh session`);
           queryContinuation = undefined;
           thrashCleared = true;
@@ -1484,13 +1501,17 @@ export async function processQuery(
         }
         awaitingResult = false;
         lastResultAt = Date.now(); // [PATCH-myia #27]
-        if (event.text) {
+        // [PATCH-myia #50] Upstream's provider carries non-retryable error
+        // notices (403 billing_error et al.) in the dedicated `error` field
+        // with `text` null — read both through the same paths so the notice
+        // is delivered (chat) or logged (task runs), never silently dropped.
+        if (event.text ?? event.error) {
           // [PATCH-myia #19] isError so dispatchResultText's routing-source
           // fallback stands down for error turns — those flow through the
           // dedicated deliverErrorResult path below (single delivery, status
           // 'error' archived). #19 keeps owning normal unwrapped output.
           const { sent, hasUnwrapped, taskBlocks, resultBlocks } = await dispatchResultText(
-            event.text,
+            event.text ?? event.error ?? "",
             routing,
             event.isError === true,
             {
@@ -1515,16 +1536,16 @@ export async function processQuery(
           // Errors included: a failed run's text belongs in its log, not chat.
           // A corrective retry handles delivery only; its result is not a
           // second run summary.
-          if (routing.taskRun && !taskBlockNudged) await autoAppendTaskLog(event.text);
+          if (routing.taskRun && !taskBlockNudged) await autoAppendTaskLog(event.text ?? event.error ?? "");
           if (resultBlocks === 0 && event.isError === true && !routing.taskRun) {
             // Non-retryable error turn (e.g. a 403 billing_error) with no
             // <message> envelope: deliver the notice instead of dropping it as
             // scratchpad, and skip the re-wrap nudge — it would just re-hammer
             // the failing gateway turn after turn.
-            await deliverErrorResult(event.text, routing);
+            await deliverErrorResult(event.text ?? event.error ?? "", routing);
             notifyExchangeComplete(onExchangeComplete, {
               prompt: archivePrompts[0] ?? initialPrompt,
-              result: event.text,
+              result: event.text ?? event.error ?? null,
               continuation: queryContinuation ?? initialContinuation,
               status: 'error',
             });
