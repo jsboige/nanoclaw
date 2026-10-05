@@ -62,3 +62,12 @@ docs/maintainer-guide.md
 docs/drafts/
 forks.md
 .worktrees/
+
+# Local ops & scratch (per-installation, never committed)
+.claude/local/
+.claude/commands/
+.claude/scheduled_tasks.lock
+.playwright-mcp/
+.v1-backup/
+deploy/
+/*.png
