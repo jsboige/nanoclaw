@@ -71,11 +71,23 @@ describe('createPairing', () => {
   });
 
   it('does not collide with active codes', async () => {
-    const codes = new Set<string>();
-    for (let i = 0; i < 20; i++) {
-      const r = await createPairing('main');
-      expect(codes.has(r.code)).toBe(false);
-      codes.add(r.code);
+    // [PATCH-myia] Deterministic seed: same-intent createPairing calls
+    // SUPERSEDE the previous pending pairing (freeing its code), so the
+    // 10^4 code space admits birthday collisions across 20 truly-random
+    // draws (~2% per run — observed flaking CI). A strictly-descending
+    // sequence keeps every draw distinct while still exercising the
+    // active-code exclusion loop.
+    let seq = 1;
+    const rand = vi.spyOn(Math, 'random').mockImplementation(() => (seq -= 0.0001));
+    try {
+      const codes = new Set<string>();
+      for (let i = 0; i < 20; i++) {
+        const r = await createPairing('main');
+        expect(codes.has(r.code)).toBe(false);
+        codes.add(r.code);
+      }
+    } finally {
+      rand.mockRestore();
     }
   });
 });
