@@ -1,6 +1,8 @@
 import fs from 'fs';
 import path from 'path';
 
+import { Pool } from 'pg';
+
 import { readEnvFile } from './env.js';
 
 const env = readEnvFile([
@@ -9,12 +11,17 @@ const env = readEnvFile([
   'ROOSYNC_WORKSPACE',
   'ROOSYNC_INBOX_POLL_INTERVAL',
   'ROOSYNC_INBOX_EXTRA_TARGETS',
+  'ROOSYNC_RSM_ENV_DIR',
 ]);
 
 const SHARED = process.env.ROOSYNC_SHARED_PATH || env.ROOSYNC_SHARED_PATH || '';
 const MACHINE = process.env.ROOSYNC_MACHINE_ID || env.ROOSYNC_MACHINE_ID || '';
 const WORKSPACE = process.env.ROOSYNC_WORKSPACE || env.ROOSYNC_WORKSPACE || '';
 const EXTRA_TARGETS_RAW = process.env.ROOSYNC_INBOX_EXTRA_TARGETS || env.ROOSYNC_INBOX_EXTRA_TARGETS || '';
+// Directory holding the shared RSM .env (the one the roo-state-manager MCP
+// server loads). The PG-unified-store flags live THERE — the fleet flips them
+// per machine (pilot #4131), not in this repo's .env. Empty = file-only mode.
+const RSM_ENV_DIR = process.env.ROOSYNC_RSM_ENV_DIR || env.ROOSYNC_RSM_ENV_DIR || '';
 const POLL_MS = Math.max(
   1000,
   parseInt(process.env.ROOSYNC_INBOX_POLL_INTERVAL || env.ROOSYNC_INBOX_POLL_INTERVAL || '15000', 10) || 15000,
@@ -41,6 +48,49 @@ const EXPECTED_TARGETS = new Set<string>(
     (t) => t.length > 0 && t.includes(':'),
   ),
 );
+
+// #4131 B7 — PG read path. When the shared RSM .env turns the unified store on
+// (UNIFIED_STORE_CHANNEL_READ_PG=1, or PG_PRIMARY=1 which implies it — same
+// gate as roosync-channel-read.ts in RSM), DMs from flipped machines land only
+// in PG `roosync_messages`, never as inbox files. The file scan stays on as a
+// transition fallback: senders flip per machine, so files keep arriving until
+// the whole fleet is PG-primary, and `processedIds` dedups the overlap (a
+// message present in both places is injected once).
+const RSM_ENV_KEYS = [
+  'UNIFIED_STORE_CHANNEL_READ_PG',
+  'UNIFIED_STORE_CHANNEL_PG_PRIMARY',
+  'UNIFIED_STORE_PG_URL',
+] as const;
+
+function resolvePgMode(): { enabled: boolean; url: string } {
+  const rsm = RSM_ENV_DIR ? readEnvFile([...RSM_ENV_KEYS], RSM_ENV_DIR) : {};
+  const flag =
+    process.env.UNIFIED_STORE_CHANNEL_READ_PG || rsm.UNIFIED_STORE_CHANNEL_READ_PG;
+  const primary =
+    process.env.UNIFIED_STORE_CHANNEL_PG_PRIMARY || rsm.UNIFIED_STORE_CHANNEL_PG_PRIMARY;
+  const url = process.env.UNIFIED_STORE_PG_URL || rsm.UNIFIED_STORE_PG_URL || '';
+  return { enabled: (flag === '1' || primary === '1') && url.length > 0, url };
+}
+
+let pgPool: Pool | null = null;
+let pgPoolUrl = '';
+
+async function getPgPool(url: string): Promise<Pool> {
+  if (pgPool && pgPoolUrl === url) return pgPool;
+  if (pgPool) await pgPool.end().catch(() => {});
+  // max:1 — a sidecar poller needs one connection; a bigger pool just holds
+  // slots the RSM server may need (B11b keeps a reserve for G: reads).
+  pgPool = new Pool({ connectionString: url, max: 1 });
+  pgPoolUrl = url;
+  return pgPool;
+}
+
+async function dropPgPool(): Promise<void> {
+  const pool = pgPool;
+  pgPool = null;
+  pgPoolUrl = '';
+  if (pool) await pool.end().catch(() => {});
+}
 const IPC_MESSAGES_DIR = path.join(DATA_DIR, 'ipc', MAIN_GROUP_FOLDER, 'messages');
 const STATE_FILE = path.join(DATA_DIR, 'roosync-inbox-processed.json');
 
@@ -109,6 +159,125 @@ let processedIds = loadProcessed();
 let missingDirLogged = false;
 let stopped = false;
 
+type InboxMessage = {
+  id?: string;
+  from?: string;
+  to?: string;
+  subject?: string;
+  body?: string;
+  tags?: string[];
+  timestamp?: string;
+  priority?: string;
+  status?: string;
+};
+
+/** Write the synthetic-message IPC file for one accepted inbox message. */
+function deliverToIpc(msg: InboxMessage, source: string): boolean {
+  const ipcPayload = {
+    type: 'inject_synthetic_message',
+    inboxMsg: msg,
+    enqueued_at: new Date().toISOString(),
+  };
+  const ipcFile = path.join(IPC_MESSAGES_DIR, `roosync-${msg.id}.json`);
+  try {
+    const tmp = `${ipcFile}.tmp`;
+    fs.writeFileSync(tmp, JSON.stringify(ipcPayload, null, 2));
+    fs.renameSync(tmp, ipcFile);
+    log('info', {
+      msg: 'ipc file written',
+      msgId: msg.id,
+      from: msg.from,
+      subject: msg.subject,
+      source,
+      ipcFile,
+    });
+    return true;
+  } catch (err) {
+    log('error', {
+      msg: 'ipc write failed',
+      source,
+      err: err instanceof Error ? err.message : String(err),
+    });
+    return false;
+  }
+}
+
+/**
+ * One PG poll cycle (#4131 B7). Reads recent `roosync_messages` rows addressed
+ * to any machine this watcher serves, filters by the same EXPECTED_TARGETS set
+ * as the file path, and injects unseen ones through the same IPC write.
+ * Mirrors RSM's roosync-channel-read gate: PG failure logs and waits for the
+ * next cycle (the file scan below still runs as the transition fallback).
+ */
+async function pollPgOnce(): Promise<void> {
+  const { enabled, url } = resolvePgMode();
+  if (!enabled) return;
+
+  const machines = [...new Set([...EXPECTED_TARGETS].map((t) => t.split(':')[0]))];
+  if (machines.length === 0) return;
+
+  const cutoff = new Date(Date.now() - CUTOFF_DAYS * 24 * 60 * 60 * 1000).toISOString();
+
+  let rows: Array<{
+    id: string;
+    from_machine: string;
+    from_workspace: string | null;
+    to_machine: string;
+    to_workspace: string | null;
+    subject: string | null;
+    body: string | null;
+    priority: string | null;
+    status: string | null;
+    created_at: string;
+    tags: string[] | null;
+  }>;
+  try {
+    const pool = await getPgPool(url);
+    const result = await pool.query(
+      `SELECT id, from_machine, from_workspace, to_machine, to_workspace,
+              subject, body, priority, status, created_at, tags
+       FROM roosync_messages
+       WHERE to_machine = ANY($1::text[])
+         AND created_at > $2
+         AND status <> 'destroyed'
+       ORDER BY created_at ASC
+       LIMIT 500`,
+      [machines, cutoff],
+    );
+    rows = result.rows;
+  } catch (err) {
+    log('error', {
+      msg: 'pg inbox query failed; will retry next cycle',
+      err: err instanceof Error ? err.message : String(err),
+    });
+    await dropPgPool();
+    return;
+  }
+
+  for (const row of rows) {
+    const id = row.id;
+    if (processedIds.has(id)) continue;
+
+    const msg: InboxMessage = {
+      id: row.id,
+      from: row.from_workspace ? `${row.from_machine}:${row.from_workspace}` : row.from_machine,
+      to: row.to_workspace ? `${row.to_machine}:${row.to_workspace}` : row.to_machine,
+      subject: row.subject ?? undefined,
+      body: row.body ?? undefined,
+      priority: row.priority ?? undefined,
+      status: row.status ?? undefined,
+      timestamp: row.created_at,
+      ...(row.tags && row.tags.length > 0 ? { tags: row.tags } : {}),
+    };
+
+    if (!msg.to || !EXPECTED_TARGETS.has(msg.to)) {
+      processedIds.add(id);
+      continue;
+    }
+    if (deliverToIpc(msg, 'pg')) processedIds.add(id);
+  }
+}
+
 function pollOnce(): void {
   if (!fs.existsSync(INBOX_DIR)) {
     if (!missingDirLogged) {
@@ -156,17 +325,7 @@ function pollOnce(): void {
       continue;
     }
 
-    let msg: {
-      id?: string;
-      from?: string;
-      to?: string;
-      subject?: string;
-      body?: string;
-      tags?: string[];
-      timestamp?: string;
-      priority?: string;
-      status?: string;
-    };
+    let msg: InboxMessage;
     try {
       msg = JSON.parse(raw);
     } catch (err) {
@@ -187,33 +346,7 @@ function pollOnce(): void {
       continue;
     }
 
-    const ipcPayload = {
-      type: 'inject_synthetic_message',
-      inboxMsg: msg,
-      enqueued_at: new Date().toISOString(),
-    };
-    const ipcFile = path.join(IPC_MESSAGES_DIR, `roosync-${msg.id}.json`);
-    try {
-      const tmp = `${ipcFile}.tmp`;
-      fs.writeFileSync(tmp, JSON.stringify(ipcPayload, null, 2));
-      fs.renameSync(tmp, ipcFile);
-      log('info', {
-        msg: 'ipc file written',
-        msgId: msg.id,
-        from: msg.from,
-        subject: msg.subject,
-        ipcFile,
-      });
-    } catch (err) {
-      log('error', {
-        msg: 'ipc write failed',
-        file: f,
-        err: err instanceof Error ? err.message : String(err),
-      });
-      continue;
-    }
-
-    processedIds.add(id);
+    if (deliverToIpc(msg, f)) processedIds.add(id);
   }
 
   if (processedIds.size > PROCESSED_MAX) {
@@ -254,8 +387,16 @@ function archiveCorrupt(fullPath: string, filename: string, err: unknown): void 
   }
 }
 
-function loop(): void {
+async function loop(): Promise<void> {
   if (stopped) return;
+  try {
+    await pollPgOnce();
+  } catch (err) {
+    log('error', {
+      msg: 'pg poll loop error',
+      err: err instanceof Error ? err.message : String(err),
+    });
+  }
   try {
     pollOnce();
   } catch (err) {
@@ -264,7 +405,7 @@ function loop(): void {
       err: err instanceof Error ? err.message : String(err),
     });
   }
-  setTimeout(loop, POLL_MS);
+  setTimeout(() => void loop(), POLL_MS);
 }
 
 log('info', {
@@ -275,6 +416,8 @@ log('info', {
   cutoffDays: CUTOFF_DAYS,
   ipcDir: IPC_MESSAGES_DIR,
   processedLoaded: processedIds.size,
+  rsmEnvDir: RSM_ENV_DIR || '(none — file-only mode)',
+  pgMode: resolvePgMode().enabled ? 'on' : 'off (flag/URL absent from RSM env)',
 });
 
 process.on('SIGINT', () => {
