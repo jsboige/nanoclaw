@@ -84,7 +84,15 @@ exit ${actionExit}
   };
 }
 
-describe('restart.sh restart_darwin', () => {
+/**
+ * Native Windows only: `bash` resolves to the WSL launcher (C:\Windows\System32\bash.exe),
+ * which rewrites the embedded Windows path into its fullwidth form (U+F03A / U+F05C) and
+ * writes the stub's call log into the repo root instead of the temp dir — polluting the
+ * worktree with one `calls.log` per test. The test pins the macOS launchctl branch, so it
+ * cannot pass here anyway. On WSL2 (upstream's supported Windows path) platform is 'linux'
+ * and the test still runs.
+ */
+describe.skipIf(process.platform === 'win32')('restart.sh restart_darwin', () => {
   it('kickstarts -k when the service is loaded (previous behavior preserved)', () => {
     const { calls, status } = runRestartDarwin(0, true);
     expect(status).toBe(0);
