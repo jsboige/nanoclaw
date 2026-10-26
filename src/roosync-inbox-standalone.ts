@@ -64,10 +64,8 @@ const RSM_ENV_KEYS = [
 
 function resolvePgMode(): { enabled: boolean; url: string } {
   const rsm = RSM_ENV_DIR ? readEnvFile([...RSM_ENV_KEYS], RSM_ENV_DIR) : {};
-  const flag =
-    process.env.UNIFIED_STORE_CHANNEL_READ_PG || rsm.UNIFIED_STORE_CHANNEL_READ_PG;
-  const primary =
-    process.env.UNIFIED_STORE_CHANNEL_PG_PRIMARY || rsm.UNIFIED_STORE_CHANNEL_PG_PRIMARY;
+  const flag = process.env.UNIFIED_STORE_CHANNEL_READ_PG || rsm.UNIFIED_STORE_CHANNEL_READ_PG;
+  const primary = process.env.UNIFIED_STORE_CHANNEL_PG_PRIMARY || rsm.UNIFIED_STORE_CHANNEL_PG_PRIMARY;
   const url = process.env.UNIFIED_STORE_PG_URL || rsm.UNIFIED_STORE_PG_URL || '';
   return { enabled: (flag === '1' || primary === '1') && url.length > 0, url };
 }
