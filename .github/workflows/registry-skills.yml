@@ -19,6 +19,14 @@ on:
 permissions:
   contents: read
 
+env:
+  # The registry branches (channels / providers) live on the upstream remote. A
+  # fork's own origin does not carry them, so every job that resolves a registry
+  # ref adds this remote first; scripts/update-skills.ts then picks it up while
+  # scanning the configured remotes. Point this at another remote by changing the
+  # value, or by exporting NANOCLAW_REGISTRY_REMOTE_URL in the job env.
+  NANOCLAW_REGISTRY_REMOTE_URL: https://github.com/qwibitai/nanoclaw.git
+
 jobs:
   discover:
     runs-on: ubuntu-latest
@@ -31,6 +39,10 @@ jobs:
       - uses: actions/checkout@v4
         with:
           ref: ${{ inputs.core_sha || github.sha }}
+      - name: Add the registry remote
+        run: |
+          git remote remove registry 2>/dev/null || true
+          git remote add registry "$NANOCLAW_REGISTRY_REMOTE_URL"
       - uses: pnpm/action-setup@v4
       - uses: actions/setup-node@v4
         with:
@@ -60,15 +72,15 @@ jobs:
           if [ -n "$providers" ]; then
             case "$providers" in *[!0-9a-fA-F]*|'') exit 1;; esac
             test ${#providers} -eq 40
-            git fetch origin "$providers"
+            git fetch registry "$providers"
             git cat-file -e "$providers^{commit}"
           else
-            git fetch origin providers
-            providers=$(git rev-parse origin/providers)
+            git fetch registry providers
+            providers=$(git rev-parse registry/providers)
           fi
-          git fetch origin channels
+          git fetch registry channels
           echo "core=$core" >> "$GITHUB_OUTPUT"
-          echo "channels=$(git rev-parse origin/channels)" >> "$GITHUB_OUTPUT"
+          echo "channels=$(git rev-parse registry/channels)" >> "$GITHUB_OUTPUT"
           echo "providers=$providers" >> "$GITHUB_OUTPUT"
 
   test:
@@ -84,6 +96,10 @@ jobs:
       - uses: actions/checkout@v4
         with:
           ref: ${{ needs.discover.outputs.core }}
+      - name: Add the registry remote
+        run: |
+          git remote remove registry 2>/dev/null || true
+          git remote add registry "$NANOCLAW_REGISTRY_REMOTE_URL"
       - uses: pnpm/action-setup@v4
       - uses: actions/setup-node@v4
         with:
@@ -108,6 +124,10 @@ jobs:
       - uses: actions/checkout@v4
         with:
           ref: ${{ needs.discover.outputs.core }}
+      - name: Add the registry remote
+        run: |
+          git remote remove registry 2>/dev/null || true
+          git remote add registry "$NANOCLAW_REGISTRY_REMOTE_URL"
       - uses: pnpm/action-setup@v4
       - uses: actions/setup-node@v4
         with:
@@ -131,6 +151,10 @@ jobs:
       - uses: actions/checkout@v4
         with:
           ref: ${{ needs.discover.outputs.core }}
+      - name: Add the registry remote
+        run: |
+          git remote remove registry 2>/dev/null || true
+          git remote add registry "$NANOCLAW_REGISTRY_REMOTE_URL"
       - uses: pnpm/action-setup@v4
       - uses: actions/setup-node@v4
         with:
@@ -151,6 +175,10 @@ jobs:
       - uses: actions/checkout@v4
         with:
           ref: ${{ needs.discover.outputs.core }}
+      - name: Add the registry remote
+        run: |
+          git remote remove registry 2>/dev/null || true
+          git remote add registry "$NANOCLAW_REGISTRY_REMOTE_URL"
       - uses: pnpm/action-setup@v4
       - uses: actions/setup-node@v4
         with:
