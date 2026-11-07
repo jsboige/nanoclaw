@@ -5,6 +5,8 @@ import { AsyncLocalStorage } from 'node:async_hooks';
 
 import { getAgentMailbox } from '../mailbox/index.js';
 import type { OutboundMessage } from '../mailbox/types.js';
+import { recordTaskDelivery } from './task-delivery-ledger.js';
+import { getCurrentTaskExec } from './session-state.js';
 
 export interface MessageOutRow {
   id: string;
@@ -92,7 +94,7 @@ function messageRow(message: OutboundMessage): MessageOutRow {
 }
 
 export function writeMessageOut(msg: WriteMessageOut): Promise<number> {
-  return getAgentMailbox().operations.writeMessageOut({
+  const write = getAgentMailbox().operations.writeMessageOut({
     id: msg.id,
     inReplyTo: msg.in_reply_to,
     deliverAfter: msg.deliver_after,
@@ -102,6 +104,18 @@ export function writeMessageOut(msg: WriteMessageOut): Promise<number> {
     channelType: msg.channel_type,
     threadId: msg.thread_id,
     content: decorateContent(msg),
+  });
+  // [PATCH-myia #51] Chat rows written while a task execution is live are
+  // attributed to that execution in the task_delivery_ledger, so a later
+  // re-claim of the same task id is recognized as already-delivered and
+  // skipped. Every chat writer (poll loop, MCP send_message/send_file, error
+  // fallbacks) funnels through here. Recorded only after the write succeeds.
+  if (msg.kind !== 'chat') return write;
+  const exec = getCurrentTaskExec();
+  if (!exec || exec.taskIds.length === 0) return write;
+  return write.then((seq) => {
+    recordTaskDelivery(exec.taskIds, msg.platform_id ?? msg.thread_id ?? msg.channel_type ?? 'default', exec.token);
+    return seq;
   });
 }
 
