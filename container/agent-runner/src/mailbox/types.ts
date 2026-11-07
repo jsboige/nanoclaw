@@ -64,6 +64,10 @@ export interface MailboxOperations {
   setContainerToolInFlight(tool: string, declaredTimeoutMs: number | null): void;
   clearContainerToolInFlight(): void;
   clearStaleProcessingAcks(): void;
+  /** [PATCH-myia #51] Upsert delivery-ledger rows for task ids this execution published for. */
+  recordTaskDelivery(taskIds: string[], destination: string, token: string): void;
+  /** [PATCH-myia #51] Which of the given task ids a previous execution already delivered. */
+  getDeliveredTaskIds(taskIds: string[]): string[];
   /** Release processing claims for the given message ids ("reset to pending" for a retry). */
   resetProcessingAcks(ids: string[]): void;
 }

@@ -16,6 +16,7 @@ import {
   sqliteGetMessageIn,
   sqliteGetMessageIdBySeq,
   sqliteGetPendingMessages,
+  sqliteGetDeliveredTaskIds,
   sqliteGetRoutingBySeq,
   sqliteGetSessionRouting,
   sqliteGetState,
@@ -24,6 +25,7 @@ import {
   sqliteMarkFailed,
   sqliteMarkProcessing,
   sqliteMarkScriptSkipped,
+  sqliteRecordTaskDelivery,
   sqliteSetState,
   sqliteTimestamp,
   sqliteWriteMessageOut,
@@ -225,6 +227,9 @@ export class SqliteAgentMailbox implements AgentMailbox {
 
   clearContainerToolInFlight = sqliteClearContainerToolInFlight;
   clearStaleProcessingAcks = sqliteClearStaleProcessingAcks;
+  // [PATCH-myia #51] Delivery ledger for the claim-time idempotence guard.
+  recordTaskDelivery = sqliteRecordTaskDelivery;
+  getDeliveredTaskIds = sqliteGetDeliveredTaskIds;
   // [PATCH-myia #18] Release processing claims for a retry after a push-mode
   // stall (see db/messages-in.ts). Same table clearStaleProcessingAcks owns.
   resetProcessingAcks(ids: string[]): void {

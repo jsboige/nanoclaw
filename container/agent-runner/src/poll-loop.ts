@@ -14,12 +14,14 @@ import { getContainerToolInFlight } from './mailbox/sqlite/connection.js';
 import { touchHeartbeat } from './heartbeat.js';
 import { getAgentMailbox } from './mailbox/index.js';
 import { recordTaskRun } from './db/task-run-logs.js'; // [PATCH-myia #9]
+import { getDeliveredTaskIds } from './db/task-delivery-ledger.js'; // [PATCH-myia #51]
 import {
   clearContinuation,
   migrateLegacyContinuation,
   setContinuation,
   setCurrentReplyRoute,
   resetBatchSendCount, // [PATCH-myia #37]
+  setCurrentTaskExec, // [PATCH-myia #51]
 } from './db/session-state.js';
 import {
   formatMessages,
@@ -443,6 +445,11 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
   // in flight survived the restart and tripped #28.)
   clearContainerToolInFlight();
 
+  // [PATCH-myia #51] Clear any leftover task-exec attribution from a
+  // container killed mid-batch (same rationale as the reply-route stamp):
+  // a fresh container attributes nothing until its first batch publishes.
+  setCurrentTaskExec(null);
+
   let pollCount = 0;
   // [PATCH-myia #30] Idle keep-alive bookkeeping. Timestamp of when the
   // current uninterrupted idle stretch began (0 = not currently idle).
@@ -623,6 +630,39 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
     }
     // MODULE-HOOK:scheduling-pre-task:end
 
+    // [PATCH-myia #51] Claim-time idempotence guard (roo-extensions#3350
+    // class b). A task row whose id already has a delivery-ledger row was
+    // delivered by a previous execution — the run died after publishing, the
+    // host reset the claim to pending, and this is a re-claim. Never re-
+    // execute it: skip the row (ack completed, like the script gate), log a
+    // 'skipped' run, publish nothing. Legitimate re-runs are unaffected:
+    // a host retry of a run that failed BEFORE publishing has no ledger row,
+    // `ncl tasks run` and recurrence both mint fresh ids.
+    {
+      const keptTasks = keep.filter((m) => m.kind === 'task');
+      if (keptTasks.length > 0) {
+        const delivered = new Set(getDeliveredTaskIds(keptTasks.map((t) => t.id)));
+        if (delivered.size > 0) {
+          const dupes = keptTasks.filter((t) => delivered.has(t.id));
+          const dupeSkips = dupes.map((t) => ({ id: t.id, reason: 'already-delivered' }));
+          markScriptSkipped(dupeSkips);
+          skipped.push(...dupeSkips);
+          for (const task of dupes) {
+            recordTaskRun({
+              task_id: task.id,
+              series_id: task.series_id,
+              run_at: new Date().toISOString(),
+              duration_ms: 0,
+              status: 'skipped',
+              result: JSON.stringify({ skipped: 'already-delivered' }),
+            });
+          }
+          log(`[PATCH #51] Skipped ${dupes.length} already-delivered task(s): ${dupes.map((t) => t.id).join(', ')}`);
+          keep = keep.filter((m) => !delivered.has(m.id));
+        }
+      }
+    }
+
     if (keep.length === 0) {
       log(`All ${normalMessages.length} non-command message(s) gated by script, skipping query`);
       continue;
@@ -705,6 +745,20 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
     // The counter is DB-backed now (session-state) because send_message runs in
     // a separate stdio MCP subprocess; reset here bounds it to one batch.
     resetBatchSendCount();
+    // [PATCH-myia #51] Publish this batch's task ids + a fresh exec token so
+    // writeMessageOut can attribute chat deliveries to THIS execution in the
+    // task_delivery_ledger. Non-task batches publish null — a chat turn must
+    // not mark surrounding tasks as delivered. Re-published at every
+    // follow-up push (see processQuery), unlike the reply-route stamp which
+    // freezes on the leading batch — in_reply_to cannot serve as attribution.
+    setCurrentTaskExec(
+      tasksKept.length > 0
+        ? {
+            token: `exec-${batchStartedAt}-${Math.random().toString(36).slice(2, 8)}`,
+            taskIds: tasksKept.map((t) => t.id),
+          }
+        : null,
+    );
     // Forward a loop stop to the ACTIVE query. The stream deliberately stays
     // open between turns, so the loop can be parked inside processQuery when
     // config.signal fires; without this, the "stopped" loop's query — and its
@@ -886,6 +940,7 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
       }
     } finally {
       setCurrentReplyRoute(null); // clears the stamp (was clearCurrentInReplyTo)
+      setCurrentTaskExec(null); // [PATCH-myia #51] end of batch — stop ledger attribution
       config.signal?.removeEventListener('abort', abortActiveQuery);
     }
 
@@ -1094,6 +1149,30 @@ export async function processQuery(
   const pendingFollowUpAcks: string[] = [];
   let stalledAborted = false;
 
+  // [PATCH-myia #51] Run-log substrate for pushed follow-ups. Task rows are
+  // stashed here at push time so their execution gets a task_run_logs row
+  // when the batch drains (or a 'failed' row when it is reset). Without
+  // this, only the leading batch's tasks ever get rows — recordTaskRun sits
+  // in the outer loop's end-of-batch block, which never sees follow-ups
+  // (measured 2026-11-06: run-logs stopped at the leading task at 15:15Z
+  // while publications continued to 17:16Z inside the same query).
+  const followUpTasks = new Map<string, { series_id: string | null; pushedAt: number }>();
+  const recordFollowUpRuns = (ids: string[], status: 'completed' | 'failed', error: string | null): void => {
+    for (const id of ids) {
+      const meta = followUpTasks.get(id);
+      if (!meta) continue;
+      followUpTasks.delete(id);
+      recordTaskRun({
+        task_id: id,
+        series_id: meta.series_id,
+        run_at: new Date().toISOString(),
+        duration_ms: Date.now() - meta.pushedAt,
+        status,
+        error,
+      });
+    }
+  };
+
   // `awaitingResult` tracks whether a pushed prompt (initial batch or a
   // follow-up) is still waiting for its `result` event. It gates the stall
   // watchdog (#26) and the idle-with-pending watchdog (#27). Starts true
@@ -1206,6 +1285,36 @@ export async function processQuery(
         }
         // MODULE-HOOK:scheduling-pre-task-followup:end
 
+        // [PATCH-myia #51] Same claim-time guard on follow-ups: an already-
+        // delivered task pushed into a live query would re-execute and
+        // re-publish for nothing. The rows were claimed by markProcessing
+        // above; markScriptSkipped finalizes the guarded ones instead.
+        {
+          const pushedTasks = keep.filter((m) => m.kind === 'task');
+          if (pushedTasks.length > 0) {
+            const delivered = new Set(getDeliveredTaskIds(pushedTasks.map((t) => t.id)));
+            if (delivered.size > 0) {
+              const dupes = pushedTasks.filter((t) => delivered.has(t.id));
+              markScriptSkipped(dupes.map((t) => ({ id: t.id, reason: 'already-delivered' })));
+              for (const task of dupes) {
+                recordTaskRun({
+                  task_id: task.id,
+                  series_id: task.series_id,
+                  run_at: new Date().toISOString(),
+                  duration_ms: 0,
+                  status: 'skipped',
+                  result: JSON.stringify({ skipped: 'already-delivered' }),
+                });
+              }
+              log(
+                `[PATCH #51] Skipped ${dupes.length} already-delivered follow-up task(s): ` +
+                  dupes.map((t) => t.id).join(', '),
+              );
+              keep = keep.filter((m) => !delivered.has(m.id));
+            }
+          }
+        }
+
         if (keep.length === 0) return;
         // Re-check done — the outer query may have finished while the script
         // was awaited. Pushing into a closed stream is wasted work; the
@@ -1225,6 +1334,25 @@ export async function processQuery(
         // `processing` state and are either drained on the next result event,
         // or reset+retried by the stall watchdog below.
         pendingFollowUpAcks.push(...keptIds);
+        // [PATCH-myia #51] Re-publish exec attribution for THIS push: chat
+        // rows written during this turn belong to these task ids, not the
+        // query's leading batch. A pure-chat push publishes null so the
+        // interleave cannot mark surrounding tasks as delivered. Stash the
+        // task rows for the drain-time run-log (followUpTasks above).
+        {
+          const pushedTasks = keep.filter((m) => m.kind === 'task');
+          setCurrentTaskExec(
+            pushedTasks.length > 0
+              ? {
+                  token: `exec-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+                  taskIds: pushedTasks.map((t) => t.id),
+                }
+              : null,
+          );
+          for (const task of pushedTasks) {
+            followUpTasks.set(task.id, { series_id: task.series_id, pushedAt: Date.now() });
+          }
+        }
         // Track the follow-up prompt for the exchange-archive hook
         // (upstream onExchangeComplete); the matching shift() fires when its
         // result event lands. This replaces upstream's immediate
@@ -1327,6 +1455,7 @@ export async function processQuery(
       } catch (err) {
         log(`Failed to reset processing acks during stall: ${err instanceof Error ? err.message : String(err)}`);
       }
+      recordFollowUpRuns(pendingFollowUpAcks, 'failed', 'stall-aborted'); // [PATCH-myia #51]
       pendingFollowUpAcks.length = 0;
     }
     try {
@@ -1424,6 +1553,7 @@ export async function processQuery(
       } catch (err) {
         log(`Failed to reset processing acks during tool-stuck: ${err instanceof Error ? err.message : String(err)}`);
       }
+      recordFollowUpRuns(pendingFollowUpAcks, 'failed', 'tool-stuck-aborted'); // [PATCH-myia #51]
       pendingFollowUpAcks.length = 0;
     }
     try {
@@ -1497,6 +1627,8 @@ export async function processQuery(
         // result.
         if (pendingFollowUpAcks.length > 0) {
           markCompleted(pendingFollowUpAcks);
+          // [PATCH-myia #51] Run-log rows for the drained follow-up tasks.
+          recordFollowUpRuns(pendingFollowUpAcks, 'completed', null);
           pendingFollowUpAcks.length = 0;
         }
         awaitingResult = false;
@@ -1658,6 +1790,7 @@ export async function processQuery(
       } catch (err) {
         log(`Failed to reset processing acks at stream end: ${err instanceof Error ? err.message : String(err)}`);
       }
+      recordFollowUpRuns(pendingFollowUpAcks, 'failed', 'stream-ended-undelivered'); // [PATCH-myia #51]
       pendingFollowUpAcks.length = 0;
     }
   }

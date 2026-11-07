@@ -166,3 +166,45 @@ export function checkAndIncrementSendCount(): boolean {
 export function resetBatchSendCount(): void {
   deleteValue(BATCH_SEND_COUNT_KEY);
 }
+
+/**
+ * [PATCH-myia #51] The task execution currently live in this session: a
+ * fresh token per batch (and per follow-up push), plus the task ids that
+ * batch claims. `writeMessageOut` reads it to attribute chat deliveries to
+ * the producing execution in the task_delivery_ledger.
+ *
+ * Same cross-process rationale as BATCH_SEND_COUNT_KEY: the nanocloud MCP
+ * tools run in a separate stdio subprocess, so the poll loop publishes this
+ * through outbound.db, not module state. Unlike the reply-route stamp it is
+ * re-published at every follow-up push, so attribution stays on the batch
+ * that is actually being processed instead of freezing on the query's
+ * leading batch. A non-task turn publishes null, which disables ledger
+ * attribution for its duration (a user-chat interleave must not mark the
+ * surrounding tasks as delivered).
+ */
+const TASK_EXEC_KEY = 'current_task_exec';
+
+export interface TaskExec {
+  token: string;
+  taskIds: string[];
+}
+
+export function setCurrentTaskExec(exec: TaskExec | null): void {
+  if (exec === null) {
+    deleteValue(TASK_EXEC_KEY);
+    return;
+  }
+  setValue(TASK_EXEC_KEY, JSON.stringify({ token: exec.token, taskIds: exec.taskIds }));
+}
+
+export function getCurrentTaskExec(): TaskExec | null {
+  const row = getAgentMailbox().operations.getState(TASK_EXEC_KEY);
+  if (!row) return null;
+  try {
+    const parsed = JSON.parse(row.value) as Partial<TaskExec>;
+    if (typeof parsed.token !== 'string' || !Array.isArray(parsed.taskIds)) return null;
+    return { token: parsed.token, taskIds: parsed.taskIds.filter((id): id is string => typeof id === 'string') };
+  } catch {
+    return null;
+  }
+}
