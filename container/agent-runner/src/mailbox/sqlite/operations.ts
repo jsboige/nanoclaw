@@ -171,6 +171,54 @@ export function sqliteWriteMessageOut(message: OutboundWrite): number {
   }
 }
 
+// [PATCH-myia #51] Ledger retention window. Recurrence mints a fresh task id
+// per occurrence and `ncl tasks run` mints a fresh id per invocation, so a
+// ledger row only ever matters while its task id can still be re-claimed —
+// bounded by host retry policy, far under 90 days. Pruned opportunistically.
+const TASK_DELIVERY_RETENTION_MS = 90 * 24 * 60 * 60 * 1000;
+
+/**
+ * [PATCH-myia #51] Record that this execution (token) published a chat row
+ * on behalf of each task id. Upsert: a multi-destination turn keeps one row
+ * per task (last destination wins — the guard only checks existence).
+ */
+export function sqliteRecordTaskDelivery(taskIds: string[], destination: string, token: string): void {
+  if (taskIds.length === 0) return;
+  const outbound = getOutboundDb();
+  const publishedAt = new Date().toISOString();
+  const insert = outbound.prepare(
+    `INSERT OR REPLACE INTO task_delivery_ledger (task_id, destination, token, published_at)
+     VALUES ($task_id, $destination, $token, $published_at)`,
+  );
+  outbound.exec('BEGIN IMMEDIATE');
+  try {
+    for (const taskId of taskIds) {
+      insert.run({ $task_id: taskId, $destination: destination, $token: token, $published_at: publishedAt });
+    }
+    outbound
+      .prepare('DELETE FROM task_delivery_ledger WHERE published_at < ?')
+      .run(new Date(Date.now() - TASK_DELIVERY_RETENTION_MS).toISOString());
+    outbound.exec('COMMIT');
+  } catch (error) {
+    outbound.exec('ROLLBACK');
+    throw error;
+  }
+}
+
+/**
+ * [PATCH-myia #51] Which of the given task ids already have a delivery-
+ * ledger row (i.e. a previous execution published for them). Consumed by
+ * the claim-time guard in the poll loop.
+ */
+export function sqliteGetDeliveredTaskIds(taskIds: string[]): string[] {
+  if (taskIds.length === 0) return [];
+  const placeholders = taskIds.map(() => '?').join(',');
+  const rows = getOutboundDb()
+    .prepare(`SELECT task_id FROM task_delivery_ledger WHERE task_id IN (${placeholders})`)
+    .all(...taskIds) as Array<{ task_id: string }>;
+  return rows.map((r) => r.task_id);
+}
+
 export function sqliteGetMessageIdBySeq(sequence: number): string | null {
   const inbound = getInboundDb();
   const inboundRow = inbound.prepare('SELECT id FROM messages_in WHERE seq = ?').get(sequence) as

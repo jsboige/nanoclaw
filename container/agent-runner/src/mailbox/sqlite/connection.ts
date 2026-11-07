@@ -135,6 +135,23 @@ export function getOutboundDb(): Database {
       CREATE INDEX IF NOT EXISTS idx_task_run_logs_task   ON task_run_logs(task_id, run_at);
       CREATE INDEX IF NOT EXISTS idx_task_run_logs_series ON task_run_logs(series_id, run_at);
     `);
+    // [PATCH-myia #51] task_delivery_ledger: one row per task id that a
+    // completed execution has already published a chat message for. The
+    // claim-time idempotence guard consults it so a re-claimed task (run
+    // died after publishing, host reset it to pending) is skipped instead
+    // of re-published. task_id is the PK: only existence matters for the
+    // guard; destination/token/published_at are forensics. Pruned at 90
+    // days inside sqliteRecordTaskDelivery.
+    _outbound.exec(`
+      CREATE TABLE IF NOT EXISTS task_delivery_ledger (
+        task_id      TEXT PRIMARY KEY,
+        destination  TEXT NOT NULL,
+        token        TEXT NOT NULL,
+        published_at TEXT NOT NULL
+      );
+      CREATE INDEX IF NOT EXISTS idx_task_delivery_ledger_published
+        ON task_delivery_ledger(published_at);
+    `);
   }
   return _outbound;
 }
@@ -281,6 +298,22 @@ export function initTestSessionDb(): { inbound: Database; outbound: Database } {
       tool_declared_timeout_ms INTEGER,
       tool_started_at          TEXT,
       updated_at               TEXT NOT NULL
+    );
+    CREATE TABLE task_run_logs (
+      id           INTEGER PRIMARY KEY AUTOINCREMENT,
+      task_id      TEXT NOT NULL,
+      series_id    TEXT,
+      run_at       TEXT NOT NULL,
+      duration_ms  INTEGER NOT NULL,
+      status       TEXT NOT NULL,
+      result       TEXT,
+      error        TEXT
+    );
+    CREATE TABLE task_delivery_ledger (
+      task_id      TEXT PRIMARY KEY,
+      destination  TEXT NOT NULL,
+      token        TEXT NOT NULL,
+      published_at TEXT NOT NULL
     );
   `);
 
