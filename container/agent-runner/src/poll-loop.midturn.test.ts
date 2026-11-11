@@ -5,6 +5,7 @@ import { getUndeliveredMessages } from './db/messages-out.js';
 import { processQuery } from './poll-loop.js';
 import { MockProvider } from './providers/mock.js';
 import type { AgentQuery, ProviderEvent } from './providers/types.js';
+import { GENERIC_FAILURE_NOTICE } from './formatter.js';
 
 beforeEach(() => {
   initTestSessionDb();
@@ -273,7 +274,7 @@ describe.skip('mid-turn <message> block delivery', () => {
     const out = getUndeliveredMessages();
     expect(out).toHaveLength(2);
     expect(JSON.parse(out[0].content).text).toBe('Started on it.');
-    expect(JSON.parse(out[1].content).text).toBe('The agent run failed. Check the logs for details.');
+    expect(JSON.parse(out[1].content).text).toBe(GENERIC_FAILURE_NOTICE);
     expect(pushes).toHaveLength(0);
   });
 
@@ -291,7 +292,7 @@ describe.skip('mid-turn <message> block delivery', () => {
 
     expect(getUndeliveredMessages().map((row) => JSON.parse(row.content).text)).toEqual([
       'Partial progress report.',
-      'The agent run failed. Check the logs for details.',
+      GENERIC_FAILURE_NOTICE,
     ]);
     expect(pushes).toHaveLength(0);
   });

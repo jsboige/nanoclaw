@@ -27,7 +27,11 @@ vi.mock('../log.js', () => ({
 
 // The driver re-checks mount sources exist; fixture paths are not real files
 // on the test host. A vi.fn so single tests can flip it to "missing".
-vi.mock('fs', () => ({ default: { existsSync: vi.fn(() => true) } }));
+// `constants` stays real: anchored-dir reads open flags at load time.
+vi.mock('fs', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('fs')>();
+  return { default: { constants: actual.constants, existsSync: vi.fn(() => true) } };
+});
 
 import fs from 'fs';
 
@@ -464,6 +468,47 @@ describe('idempotency and adoption', () => {
     expect(cli.callMatching(/^create /)).toBeUndefined();
   });
 
+  it('replaces an existing session that is not on the network the spec requires', async () => {
+    cli.responses = [
+      { match: /^inspect --format \{\{json \.NetworkSettings\.Networks\}\}/, output: '{"bridge":{}}' },
+      { match: /^inspect /, output: 'spike|g1|s1\n' },
+    ];
+    const reconcile = vi.fn((_access: unknown, networks: () => string[]) =>
+      networks().includes('bridge') ? ('restart' as const) : ('kept' as const),
+    );
+
+    await new DockerSessionDriver({ ...FIXTURE_POLICY, cli, reconcileNetworkAccess: reconcile }).prepare(fixtureSpec());
+
+    const removed = cli.callMatching(/^rm --force ncl-spike-s1$/);
+    expect(removed).toBeDefined();
+    expect(createArgs()).toBeDefined();
+    expect(cli.callMatching(/^create /)!.seq).toBeGreaterThan(removed!.seq);
+  });
+
+  it('replaces an existing session whose networks cannot be read', async () => {
+    cli.responses = [
+      { match: /^inspect --format \{\{json \.NetworkSettings\.Networks\}\}/, throws: 'Error response from daemon' },
+      { match: /^inspect /, output: 'spike|g1|s1\n' },
+    ];
+    const reconcile = (_access: unknown, networks: () => string[]) => (networks().length ? 'kept' : 'restart');
+
+    await new DockerSessionDriver({ ...FIXTURE_POLICY, cli, reconcileNetworkAccess: reconcile }).prepare(fixtureSpec());
+
+    expect(cli.callMatching(/^rm --force ncl-spike-s1$/)).toBeDefined();
+    expect(createArgs()).toBeDefined();
+  });
+
+  it('reuses an existing session the network policy keeps', async () => {
+    cli.responses = [{ match: /^inspect /, output: 'spike|g1|s1\n' }];
+
+    await new DockerSessionDriver({ ...FIXTURE_POLICY, cli, reconcileNetworkAccess: () => 'kept' }).prepare(
+      fixtureSpec(),
+    );
+
+    expect(cli.callMatching(/^rm /)).toBeUndefined();
+    expect(cli.callMatching(/^create /)).toBeUndefined();
+  });
+
   it('refuses a name collision with a container that is not this session', async () => {
     // The name is key-derived, but a foreign container can wear it — another
     // install whose truncated identity collides, or an operator's hand-made
@@ -542,15 +587,36 @@ describe('idempotency and adoption', () => {
     cli.responses = [
       {
         match: /^ps --filter/,
-        output: 'nanoclaw-v2-agent-one-1700000000000||\nnanoclaw-gateway||gateway\nncl-spike-s1|s1|agent\n',
+        output:
+          'nanoclaw-v2-agent-one-1700000000000||\nnanoclaw-gateway||gateway\nncl-spike-s1|s1|agent\nbare-proxy||proxy\n',
       },
     ];
 
     await driver().reapResidue('spike');
 
     expect(cli.joined()).toContain('rm --force nanoclaw-v2-agent-one-1700000000000');
+    // Only GATEWAY_ROLE is spared: the running pass matches the exited pass.
+    expect(cli.joined()).toContain('rm --force bare-proxy');
     expect(cli.joined().some((c) => c === 'rm --force nanoclaw-gateway')).toBe(false);
     expect(cli.joined().some((c) => c === 'rm --force ncl-spike-s1')).toBe(false);
+  });
+
+  it('removes exited session residue but keeps a stopped gateway-owned container', async () => {
+    // Removing the gateway leaves nothing to recreate it; every later spawn
+    // would fail until the gateway's setup is re-run.
+    cli.responses = [
+      {
+        match: /^ps -a/,
+        output: 'ncl-spike-s1-aux|s1|mcp\ngateway-spike||gateway\nold-residue||\nbare-proxy||proxy\n',
+      },
+    ];
+
+    await driver().reapResidue('spike');
+
+    expect(cli.joined()).toContain('rm --force ncl-spike-s1-aux');
+    expect(cli.joined()).toContain('rm --force old-residue');
+    expect(cli.joined()).toContain('rm --force bare-proxy');
+    expect(cli.joined().some((c) => c === 'rm --force gateway-spike')).toBe(false);
   });
 
   it('reaps install-owned networks whose containers are gone', async () => {

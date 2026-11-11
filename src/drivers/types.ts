@@ -20,16 +20,13 @@ export interface SessionKey {
  * Not a union, for the same reason `DriverKind` is not: this tree composes
  * `['agent']` and must not enumerate roles it does not ship. An overlay that
  * composes auxiliary containers (a per-session proxy, say) brings its own role
- * names; the seam's rules key only on 'agent' — the one required role.
+ * names; the seam's rules key only on 'agent' — the one required role — and,
+ * for install-wide sweeps, on `GATEWAY_ROLE`.
  */
 export type ContainerRole = string;
 
 export type MountClass =
-  | 'group-state'
-  | 'install-surface'
-  | 'identity-material'
-  | 'gateway-trust'
-  | 'allowlisted-extra';
+  'group-state' | 'install-surface' | 'identity-material' | 'gateway-trust' | 'allowlisted-extra';
 
 export interface MountSpec {
   /**
@@ -258,6 +255,9 @@ export interface SessionHandle {
   execSpec(command: string[]): SessionExecSpec;
 }
 
+/** Outcome of reconciling an adopted session's network; see `reconcileNetworkAccess`. */
+export type NetworkReconcile = 'kept' | 'restart';
+
 export interface DriverCapabilities {
   isolationTiers: ('container' | 'vm')[];
   admissionEnforced: boolean;
@@ -307,8 +307,12 @@ export interface SessionDriver {
   capabilities(): DriverCapabilities;
   /** Fatal-at-startup reachability check. Agents cannot run without a runtime. */
   ensureReady?(): Promise<void>;
-  /** Restore gateway network realization when adopting an existing session. */
-  reconcileNetworkAccess?(access: NetworkAccessIntent): Promise<void>;
+  /**
+   * Restore gateway network realization when adopting an existing session.
+   * 'restart' means the runtime is not on the network a new session would get
+   * (the policy changed while it ran); core stops it so the next wake respawns.
+   */
+  reconcileNetworkAccess?(access: NetworkAccessIntent, handle: SessionHandle): Promise<NetworkReconcile | void>;
   /** Allocate everything, start nothing. Idempotent on key: an existing live session returns its handle. */
   prepare(spec: SessionSpec): Promise<SessionHandle>;
   /**
@@ -344,6 +348,18 @@ export const LABELS = {
   session: 'nanoclaw-session',
   role: 'nanoclaw-role',
 } as const;
+
+/** Role a gateway skill stamps on the session-less containers it owns (docs/gateway-seam.md). */
+export const GATEWAY_ROLE = 'gateway';
+
+/**
+ * A session-less `GATEWAY_ROLE` container is a gateway's own long-lived
+ * container. Install-wide sweeps (residue reaping, update drain) leave it
+ * alone: only the gateway's setup recreates it.
+ */
+export function isGatewayOwned(sessionId: string | undefined, role: string | undefined): boolean {
+  return !sessionId && role === GATEWAY_ROLE;
+}
 
 /**
  * The group-folder label (D9). Deliberately NOT part of `LABELS`: adoption

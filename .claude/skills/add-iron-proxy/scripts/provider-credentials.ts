@@ -7,7 +7,7 @@ import type {
 } from '../../../../setup/gateways/credential-store.js';
 import { getInstallSlug } from '../../../../src/install-slug.js';
 import { controlPaths, controlRequest, grantSecret, IronControlRequestError } from './control.js';
-import { run, statePaths } from './setup.js';
+import { prepareLocalModel, run, statePaths } from './setup.js';
 import { assertCredentialIsolation, ironHeaderName } from './credential-isolation.js';
 
 export async function allowModelHost(host: string, root: string): Promise<void> {
@@ -16,8 +16,32 @@ export async function allowModelHost(host: string, root: string): Promise<void> 
   await run(['--allow-host', host], root);
 }
 
+/**
+ * Names no public CA certifies, with their subdomains: IANA special-use names and the
+ * TLDs ICANN will never delegate (home, corp, mail). Iron trusts only public roots,
+ * so an https endpoint on one would pass setup and then fail every turn.
+ */
+const PRIVATE_NAME = /(?:^|\.)(?:internal|local|localhost|home\.arpa|home|corp|mail)$/;
+
+/** Docker's name for the machine running the containers. */
+const HOST_MACHINE = 'host.docker.internal';
+
 export function ironModelEndpoint(raw: string, root: string) {
+  if (/^http:\/\/host\.docker\.internal:80(?:[/?#]|$)/i.test(raw.trim()))
+    throw new Error(
+      `Port 80 is not supported for a model on this machine; use the model server's own port, for example http://${HOST_MACHINE}:11434/v1.`,
+    );
   const url = new URL(raw);
+  // Keys and replies of a keyless model on this machine never cross the network,
+  // so plain HTTP is allowed there, pinned to its port.
+  if (url.protocol === 'http:' && url.hostname === HOST_MACHINE) {
+    if (!url.port || url.username || url.password || url.search || url.hash || !/^\/v1\/?$/.test(url.pathname))
+      throw new Error(
+        `A model on this machine must be http://${HOST_MACHINE}:<port>/... with its port written out, the path /v1, and no credentials, query or fragment.`,
+      );
+    const origin = `${HOST_MACHINE}:${url.port}`;
+    return { configure: () => prepareLocalModel(origin, root) };
+  }
   if (
     !/^(?:[a-z0-9](?:[a-z0-9-]*[a-z0-9])?\.)+[a-z]{2,}$/.test(url.hostname) ||
     url.protocol !== 'https:' ||
@@ -28,7 +52,11 @@ export function ironModelEndpoint(raw: string, root: string) {
     url.hash
   )
     throw new Error(
-      'Iron Proxy requires an HTTPS model endpoint on port 443. Put a TLS endpoint in front of a local model server before configuring it.',
+      "NanoClaw's Iron gateway needs the model endpoint as https://<dns-name> on port 443, with a certificate Iron trusts (public CAs by default). Plain HTTP is refused so keys and model replies never cross the network unencrypted; the one exception is a keyless model on this machine at http://host.docker.internal:<port>. IP addresses are not supported. The add-iron-proxy skill explains how to serve a local model.",
+    );
+  if (PRIVATE_NAME.test(url.hostname))
+    throw new Error(
+      `${url.hostname} is a private name. No public CA issues certificates for it and Iron trusts only public CAs, so every request would fail. The add-iron-proxy skill explains how to serve a local model.`,
     );
   return { configure: () => allowModelHost(url.hostname, root) };
 }
@@ -66,6 +94,11 @@ export function createIronCredentialConnection(
     !/^(?:[a-z0-9](?:[a-z0-9-]*[a-z0-9])?\.)+[a-z]{2,}$/.test(target.host)
   )
     throw new Error('Iron credentials require a name, a runtime placeholder, and an exact DNS hostname');
+  // Iron injects by host whatever the scheme, and this host is reachable over plain HTTP.
+  if (target.host.toLowerCase() === HOST_MACHINE)
+    throw new Error(
+      `Iron sends keys only over HTTPS. A model at http://${HOST_MACHINE} must be keyless; use an https endpoint for a model that needs a key.`,
+    );
   const injection = target.kind === 'oauth' ? BEARER : target.injection;
   if (!/^[a-zA-Z0-9-]+$/.test(injection.headerName) || !['{value}', 'Bearer {value}'].includes(injection.valueFormat))
     throw new Error('Unsupported Iron credential injection scheme');
@@ -94,6 +127,8 @@ export function createIronCredentialConnection(
         ownedForeignIds: [foreignId, foreignId + '-account'],
       }),
   };
+  // Iron rules carry their own path globs; an exact path is a glob without wildcards.
+  const paths = target.path ? [target.path] : [];
   const replaceConfig = (header = injection.headerName) => ({
     proxy_value: target.proxyValue,
     match_headers: [ironHeaderName(header)],
@@ -108,7 +143,7 @@ export function createIronCredentialConnection(
     }
   };
   // The record find() observed. Its id never leaves this adapter: keep() and
-  // save() act on it, and both refuse an entry that changed since the lookup.
+  // save() act on it, and both reread the entry and refuse a changed ID or metadata.
   let observed: any | null | undefined;
   let oauthObserved: { broker: any; account: any } | undefined;
   let expectedHost = target.host;
@@ -129,7 +164,7 @@ export function createIronCredentialConnection(
       record.rules?.length !== 1 ||
       rule.host !== host ||
       rule.cidr ||
-      (rule.paths?.length ?? 0) ||
+      !isDeepStrictEqual(rule.paths ?? [], paths) ||
       !isDeepStrictEqual(rule.http_methods, ['*']) ||
       record.source?.source_type !== (target.kind === 'oauth' ? 'token_broker' : 'control_plane') ||
       (target.kind === 'api-key' && Object.keys(record.source.config ?? {}).length)
@@ -162,7 +197,7 @@ export function createIronCredentialConnection(
         account.rules?.length !== 1 ||
         rule.host !== target.host ||
         rule.cidr ||
-        (rule.paths?.length ?? 0) ||
+        !isDeepStrictEqual(rule.paths ?? [], paths) ||
         !isDeepStrictEqual(rule.http_methods, ['*']))
     )
       throw new Error('The Iron OAuth account has unexpected metadata; inspect it in Iron Control');
@@ -336,7 +371,7 @@ export function createIronCredentialConnection(
           source,
           inject_config: {},
           replace_config: config,
-          rules: [{ host: target.host, http_methods: ['*'] }],
+          rules: [{ host: target.host, http_methods: ['*'], ...(paths.length ? { paths } : {}) }],
           ...(login ? { labels: { [LOGIN_LABEL]: login } } : {}),
         });
       let source: unknown;
