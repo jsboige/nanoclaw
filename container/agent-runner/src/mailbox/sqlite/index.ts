@@ -2,6 +2,7 @@ import {
   closeSessionDb,
   getInboundDb,
   getOutboundDb,
+  readInbound,
   sqliteClearContainerToolInFlight,
   sqliteClearStaleProcessingAcks,
   sqliteSetContainerToolInFlight,
@@ -13,6 +14,7 @@ import {
   sqliteFindCliResponse,
   sqliteFindQuestionResponse,
   sqliteGetAllDestinations,
+  sqliteGetDeliveryStatus,
   sqliteGetMessageIn,
   sqliteGetMessageIdBySeq,
   sqliteGetPendingMessages,
@@ -169,18 +171,25 @@ export class SqliteAgentMailbox implements AgentMailbox {
   }
 
   getLatestInboundRoute(channelType: string, platformId: string) {
-    const row = getInboundDb()
-      .prepare(
-        `SELECT id, thread_id FROM messages_in
-         WHERE channel_type = ? AND platform_id = ?
-         ORDER BY seq DESC LIMIT 1`,
-      )
-      .get(channelType, platformId) as { id: string; thread_id: string | null } | undefined;
+    const row = readInbound(
+      (db) =>
+        db
+          .prepare(
+            `SELECT id, thread_id FROM messages_in
+             WHERE channel_type = ? AND platform_id = ?
+             ORDER BY seq DESC LIMIT 1`,
+          )
+          .get(channelType, platformId) as { id: string; thread_id: string | null } | undefined,
+    );
     return row ? { threadId: row.thread_id, inReplyTo: row.id } : null;
   }
 
   getUndeliveredMessages(): OutboundMessage[] {
     return sqliteGetUndeliveredMessages().map(outboundMessage);
+  }
+
+  getDeliveryStatus(messageOutId: string) {
+    return sqliteGetDeliveryStatus(messageOutId);
   }
 
   getState(key: string) {

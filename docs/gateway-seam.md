@@ -90,7 +90,10 @@ interface GatewayProviderDefinition {
 **`ensure` is idempotent.** Core calls it for new and adopted sessions. The
 `disposition` distinguishes creation from adoption: an adapter must not create
 replacement identity for a runtime that survived a host restart. Core invokes
-optional `reapOrphans` only after it has considered surviving runtimes.
+optional `reapOrphans` only after it has considered surviving runtimes. A new
+runtime's input also names the agent `provider` it runs (the session's pinned
+provider, else the group's); a gateway that grants model credentials per agent
+keys on it.
 
 The signal stops the current host's observation. Existing install-scoped
 adapters can retain their signal cleanup. Adapters owning per-session resources
@@ -145,6 +148,12 @@ hosted app/MCP traffic. Other destinations and explicit policy holds retain huma
 approval. Missing declarations never imply open access. Provider packages declare
 their own domains; gateway adapters must not keep model-host lists or interpret
 presentation text to make approval decisions.
+
+A provider may also declare `modelAuthorities`: exact `host:port` pairs for an
+operator-configured model endpoint that is not a public HTTPS domain, such as a
+model server on the host. A request to exactly that authority is approved like a
+model domain; another port or a subdomain is not. Core does not decide which
+schemes reach it; the selected gateway does.
 
 Core validates identity, session ownership, freshness, expiry, and bridge health
 before approving. Network restrictions and credential grants still apply. Native
@@ -221,9 +230,9 @@ is not behind.
 
 ## How a gateway gets installed
 
-Gateway skills are the one skill type that keeps its implementation on `main`,
-in the skill's own `payload/` directory, rather than on a registry branch. The
-reason is bootstrapping: a channel can be added later, but an install with no
+Gateway skills keep their implementation on `main`, in the skill's own
+`payload/` directory, rather than on a registry branch. For a gateway this is
+required, not a choice: a channel can be added later, but an install with no
 gateway cannot start at all, so the payload has to be present in the checkout
 that setup is running from.
 
@@ -251,6 +260,18 @@ The payload lands in ordinary paths — `src/gateway-providers/<kind>.ts`,
 `container/skills/<kind>-gateway/` — and registration is one appended line in
 `src/gateway-providers/installed.ts`. Nothing outside that directory is
 rewritten to install a gateway.
+
+## Gateway-owned containers
+
+A gateway skill that runs its own long-lived containers labels them
+`nanoclaw-install=<slug>` and `nanoclaw-role=gateway` (`GATEWAY_ROLE` in
+`src/drivers/types.ts`), with no `nanoclaw-session`. Core never stops or reaps
+those in install-wide sweeps (host residue reaping, the update cutover drain);
+only the gateway's setup recreates them. After an update rollback restores
+`data/`, core restarts them so their bind mounts point at the restored
+directories. Uninstall still removes them with the rest of the install. Do not
+add these labels to a gateway's existing Compose volumes or networks: Compose
+then asks to recreate them, which loses their data.
 
 ## Mount class `gateway-trust`
 
@@ -292,6 +313,11 @@ owns:
 
 - `name` — one connection per name;
 - `host` — the exact DNS hostname the credential is scoped to;
+- `path` (optional) — an exact URL path on that host the credential is limited
+  to, for a runtime that sends other tokens to the same host. It starts with
+  `/` and uses only letters, digits and `._~/-`, since gateways may read other
+  characters as glob syntax. Core accepts it only from a gateway whose store
+  declares `connectionPaths`;
 - `proxyValue` — the non-secret marker the runtime presents in place of the
   credential, which gateways doing selective replacement match on;
 - for `kind: 'api-key'`, the `injection` header scheme;
@@ -318,15 +344,16 @@ Codex file shape that record expects. Iron stores it as a token broker plus a
 separate account-header secret. Parsing a provider's own login file stays in
 the provider; converting to a gateway's storage format stays in the gateway.
 
-`modelEndpoint(url)` is the one network hook. It validates an endpoint before
-setup prompts for anything, and its `configure()` routes the endpoint through
-the gateway once prompts complete. Iron uses it to permit the model host in its
-front proxy — needed even for a keyless local model, which creates no
-credential — and to refuse plaintext endpoints early. OneCLI declares nothing.
+`modelEndpoint(url)` is the one network hook. A provider calls it when the
+operator enters an endpoint, so a refused URL can be corrected at the prompt;
+`configure()` routes the endpoint through the gateway once prompts complete.
+A gateway refuses an endpoint it can never serve by throwing, with the reason
+in the message. A gateway that keeps no network allowlist declares nothing.
 
 `PROVIDER_CREDENTIAL_CONNECTION_SEAM_VERSION` gates a provider skill whose
 install needs `connection()`; an older core's store lacks it and the skill must
-refuse before copying any payload.
+refuse before copying any payload. Version 2 adds the optional `path`; a skill
+that sets it requires version 2 or later.
 
 ## Account connection is separate from request approval
 
@@ -363,6 +390,32 @@ match. Changing `.env` applies to subsequent requests; restart the host when
 changing a process-environment override. OneCLI's explicit native policy holds
 remain authoritative.
 
+### Uncredentialed reads
+
+`NANOCLAW_GATEWAY_UNCREDENTIALED_READS=true` lets a `default` hold skip the card
+when the gateway attaches no stored credential to it. It is off by default and
+applies only when all of these hold:
+
+- the method is GET or HEAD;
+- the adapter sets `destination.sendsPayload: false`, attesting that the request
+  has no body and asks for no protocol upgrade;
+- the gateway's `approvals.credentialScope(destination)` answers `'none'` within
+  five seconds.
+
+A gateway derives `credentialScope` from its own credential rules. It may
+over-report and must never under-report, so it answers `'none'` only from rules
+at least as fresh as the ones its proxy enforces. A missing hook, an error, a
+timeout or any other answer keeps the card; a request whose deadline passes
+during the lookup is denied. Each card-free approval is logged with the
+request's audit metadata.
+
+This trades a human check for the egress allowlist. A request with no credential
+can still carry data out in its URL and headers to any allowed host, and GET is
+not proof of a read: some services act on a GET, such as publishing a
+notification or submitting a form. Other methods, bodies, upgrades, explicit
+policy holds and credentialed requests keep their cards. Configured read-only
+hosts and model domains are decided first and are unaffected.
+
 ### Approval presentation
 
 Gateways may supply `summary` with `agent`, `action`, `resource`, `reason`,
@@ -395,7 +448,9 @@ responses, timeouts and session revocation fail closed. Iron listens only on
 loopback in the same container, with dial-time loopback restrictions preventing
 backend access through DNS aliases. Control-plane sync cannot replace the front.
 Credentialed application traffic uses HTTPS; the Iron adapter preserves the
-request scheme and rejects plaintext HTTP rather than treating it as HTTPS. Its helper receives a 16 KiB body prefix and no authorization headers;
+request scheme and rejects plaintext HTTP rather than treating it as HTTPS. The
+one exception is a keyless model endpoint on the host, pinned by host and port
+and refused any credential. Its helper receives a 16 KiB body prefix and no authorization headers;
 only the resulting summary crosses the approval channel. The original request
 stream is preserved. The source is checksum-verified, its upstream tests run in
 the image build, and a version mismatch against OneCLI's gateway pin fails the

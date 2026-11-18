@@ -8,6 +8,7 @@ import { getSessionRouting } from './db/session-routing.js';
 import { MockProvider } from './providers/mock.js';
 import type { ProviderExchange } from './providers/types.js';
 import { runPollLoop } from './poll-loop.js';
+import { GENERIC_FAILURE_NOTICE } from './formatter.js';
 
 const MOCK_PROVIDER_CONTRACT = {
   textDelivery: 'mid-turn-complete',
@@ -159,23 +160,26 @@ describe('poll loop integration', () => {
   it('unknown destination is dropped, valid destination is sent', async () => {
     insertMessage('m1', { sender: 'Alice', text: 'hi' }, { platformId: 'chan-1', channelType: 'discord' });
 
-    const provider = new MockProvider(
-      {},
-      () => '<message to="nonexistent">dropped</message><message to="discord-test">delivered</message>',
-    );
+    let turns = 0;
+    const provider = new MockProvider({}, () => {
+      turns++;
+      return '<message to="nonexistent">dropped</message><message to="discord-test">delivered</message>';
+    });
     const controller = new AbortController();
     const loopPromise = runPollLoopWithTimeout(provider, controller.signal, 2000);
 
-    await waitFor(() => getUndeliveredMessages().length > 0, 2000);
+    // Wait for the nudged retry to be answered too.
+    await waitFor(() => turns >= 2, 2000);
+    await new Promise((resolve) => setTimeout(resolve, 50));
     controller.abort();
+    await loopPromise.catch(() => {});
 
+    // Only the valid destination gets output. The dropped block is nudged and
+    // this mock answers the retry identically: the repeat is not sent again.
     const out = getUndeliveredMessages();
-    // Only the valid destination should produce output
     expect(out).toHaveLength(1);
     expect(JSON.parse(out[0].content).text).toBe('delivered');
     expect(out[0].platform_id).toBe('chan-1');
-
-    await loopPromise.catch(() => {});
   });
 
   it('multiple <message> blocks each produce an outbound message', async () => {
@@ -237,7 +241,7 @@ describe('poll loop integration', () => {
     await loopPromise.catch(() => {});
   });
 
-  it('resolves most recent thread_id when destination has multiple inbound messages', async () => {
+  it('replies in the thread of the message the batch is answering when the batch spans threads', async () => {
     // Two messages from same destination, different threads
     insertMessage('m-old', { sender: 'Alice', text: 'old' }, { platformId: 'chan-1', channelType: 'discord', threadId: 'thread-old' });
     insertMessage('m-new', { sender: 'Alice', text: 'new' }, { platformId: 'chan-1', channelType: 'discord', threadId: 'thread-new' });
@@ -251,8 +255,8 @@ describe('poll loop integration', () => {
 
     const out = getUndeliveredMessages();
     expect(out).toHaveLength(1);
-    expect(out[0].thread_id).toBe('thread-new');
-    expect(out[0].in_reply_to).toBe('m-new');
+    expect(out[0].thread_id).toBe('thread-old');
+    expect(out[0].in_reply_to).toBe('m-old');
 
     await loopPromise.catch(() => {});
   });
@@ -452,8 +456,8 @@ describe('poll loop — provider error recovery', () => {
 
     const out = getUndeliveredMessages();
     expect(out).toHaveLength(1);
-    expect(JSON.parse(out[0].content).text).toContain('Error:');
-    expect(JSON.parse(out[0].content).text).toContain('API rate limit exceeded');
+    expect(JSON.parse(out[0].content).text).toBe(GENERIC_FAILURE_NOTICE);
+    expect(out[0].content).not.toContain('API rate limit exceeded');
 
     // Input message should be marked completed despite the error
     const pending = getPendingMessages();
@@ -486,7 +490,9 @@ describe('poll loop — stale session recovery', () => {
     // against retry timing and was flaky on main too (the deployed a80081e
     // where #31/#35 already live).
     const out = getUndeliveredMessages();
-    expect(out.some((m) => JSON.parse(m.content).text.includes('Transient session error'))).toBe(true);
+    expect(out).toHaveLength(1);
+    expect(JSON.parse(out[0].content).text).toBe(GENERIC_FAILURE_NOTICE);
+    expect(out[0].content).not.toContain('session not found');
 
     // Continuation was cleared (isSessionInvalid returned true)
     expect(getContinuation('mock')).toBeUndefined();
