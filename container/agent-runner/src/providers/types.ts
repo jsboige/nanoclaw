@@ -136,8 +136,15 @@ export type McpServerConfig =
        * (cwd-shim.ts) or drop it — never launch in the wrong directory.
        */
       cwd?: string;
+      /** Per-server tool-call timeout in **milliseconds** (the SDK's unit). */
+      timeout?: number;
     }
-  | { type: 'http'; url: string; headers?: Record<string, string> };
+  | {
+      type: 'http';
+      url: string;
+      headers?: Record<string, string>;
+      /** Per-server tool-call timeout in **milliseconds**. */ timeout?: number;
+    };
 
 export interface AgentQuery {
   /** Push a follow-up message into the active query. */

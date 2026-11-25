@@ -65,6 +65,8 @@ export interface McpStdioServerConfig {
   // server stays wired but its absence won't stop the agent. See
   // container/agent-runner/src/mcp-health.ts.
   required?: boolean;
+  /** Per-server tool-call timeout, **milliseconds** (the SDK's unit). Optional. */
+  timeout?: number;
 }
 
 export interface McpHttpServerConfig {
@@ -74,6 +76,8 @@ export interface McpHttpServerConfig {
   /** See McpStdioServerConfig.plugin — same ownership marker. */
   plugin?: string;
   instructions?: string;
+  /** Per-server tool-call timeout, **milliseconds** (the SDK's unit). Optional. */
+  timeout?: number;
 }
 
 export type McpServerConfig = McpStdioServerConfig | McpHttpServerConfig;
@@ -149,6 +153,8 @@ export function parseMcpServerConfig(input: Record<string, unknown>): McpServerC
     throw new Error('MCP instructions must be a string');
   }
 
+  const timeout = parseMcpTimeoutMs(input.timeout);
+
   if (url !== undefined) {
     if (command !== undefined) throw new Error('Provide exactly one of command or url');
     if (input.args !== undefined || input.env !== undefined || input.cwd !== undefined) {
@@ -178,6 +184,7 @@ export function parseMcpServerConfig(input: Record<string, unknown>): McpServerC
       url,
       ...(headers === undefined ? {} : { headers }),
       ...(instructions === undefined ? {} : { instructions }),
+      ...(timeout === undefined ? {} : { timeout }),
     };
   }
   if (command === undefined) throw new Error('Provide exactly one of command or url');
@@ -200,7 +207,28 @@ export function parseMcpServerConfig(input: Record<string, unknown>): McpServerC
     env,
     ...(cwd === undefined ? {} : { cwd }),
     ...(instructions === undefined ? {} : { instructions }),
+    ...(timeout === undefined ? {} : { timeout }),
   };
+}
+
+/**
+ * Per-server tool-call timeout, in **milliseconds** — the unit the Claude Agent
+ * SDK's `McpServerConfig.timeout` is documented in ("Per-server tool-call
+ * timeout in milliseconds. Overrides the MCP_TOOL_TIMEOUT environment
+ * variable"). A provider whose runtime wants seconds must convert at its own
+ * boundary; the stored value never changes unit.
+ *
+ * Below the SDK's own 1000 ms floor the value is ignored there, which would
+ * silently fall back to the default — reject instead, so a config read-back
+ * always means what it says.
+ */
+function parseMcpTimeoutMs(value: unknown): number | undefined {
+  if (value === undefined || value === null) return undefined;
+  if (typeof value !== 'number' || !Number.isFinite(value) || !Number.isInteger(value)) {
+    throw new Error('timeout must be an integer number of milliseconds');
+  }
+  if (value < 1000) throw new Error('timeout must be at least 1000 ms (the SDK ignores smaller values)');
+  return value;
 }
 
 function parseStringRecord(value: unknown, flag: string): Record<string, string> | undefined {

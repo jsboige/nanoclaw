@@ -20,7 +20,14 @@ import {
 // read the SDK's on-disk .jsonl, which no other provider has.
 import { archiveClaudeTranscript, rotateClaudeContinuation } from './claude-history.js';
 import { registerProvider } from './provider-registry.js';
-import type { AgentProvider, AgentQuery, McpServerConfig, ProviderEvent, ProviderOptions, QueryInput } from './types.js';
+import type {
+  AgentProvider,
+  AgentQuery,
+  McpServerConfig,
+  ProviderEvent,
+  ProviderOptions,
+  QueryInput,
+} from './types.js';
 
 function log(msg: string): void {
   console.error(`[claude-provider] ${msg}`);
@@ -127,6 +134,30 @@ class MessageStream {
  * fresh from tool start. Defense-in-depth: if SDK_DISALLOWED_TOOLS slips
  * through somehow, block the call here instead of letting the agent hang.
  */
+/**
+ * The tool's declared timeout in **milliseconds**, as fed to the tool-stuck
+ * watchdog's budget. Bash's `tool_input.timeout` is already ms. An MCP server's
+ * `timeout` is also ms — the SDK's own wording: "Per-server tool-call timeout in
+ * milliseconds. Overrides the MCP_TOOL_TIMEOUT environment variable".
+ *
+ * It used to be multiplied by 1000 as if it were seconds: a 5-minute value
+ * (300000) armed the stuck-budget hint for ~3.5 days, which DISABLES the
+ * watchdog instead of widening it. Never rescale at this boundary.
+ */
+export function declaredToolTimeoutMs(
+  toolName: string,
+  toolInput: Record<string, unknown> | undefined,
+  mcpServers: Record<string, McpServerConfig>,
+): number | null {
+  if (toolName === 'Bash' && typeof toolInput?.timeout === 'number') return toolInput.timeout;
+  if (toolName.startsWith('mcp__')) {
+    const serverName = toolName.split('__')[1];
+    const serverCfg = serverName ? mcpServers[serverName] : undefined;
+    if (typeof serverCfg?.timeout === 'number') return serverCfg.timeout;
+  }
+  return null;
+}
+
 function createPreToolUseHook(mcpServers: Record<string, McpServerConfig>): HookCallback {
   return async (input) => {
     const i = input as { tool_name?: string; tool_input?: Record<string, unknown> };
@@ -137,15 +168,7 @@ function createPreToolUseHook(mcpServers: Record<string, McpServerConfig>): Hook
         stopReason: `Tool '${toolName}' is not available in this environment — use the nanoclaw equivalent.`,
       } as unknown as ReturnType<HookCallback>;
     }
-    let declaredTimeoutMs: number | null = null;
-    if (toolName === 'Bash' && typeof i.tool_input?.timeout === 'number') {
-      declaredTimeoutMs = i.tool_input.timeout as number;
-    } else if (toolName.startsWith('mcp__')) {
-      const serverName = toolName.split('__')[1];
-      const serverCfg = serverName ? mcpServers[serverName] : undefined;
-      const cfgTimeout = (serverCfg as { timeout?: number } | undefined)?.timeout;
-      if (typeof cfgTimeout === 'number') declaredTimeoutMs = cfgTimeout * 1000;
-    }
+    const declaredTimeoutMs = declaredToolTimeoutMs(toolName, i.tool_input, mcpServers);
     try {
       setContainerToolInFlight(toolName, declaredTimeoutMs);
       touchHeartbeat();
@@ -239,7 +262,8 @@ const CLAUDE_CODE_AUTO_COMPACT_WINDOW = process.env.CLAUDE_CODE_AUTO_COMPACT_WIN
 // it here lets the poll-loop's result path (which already clears the
 // continuation on isSessionInvalid) recover a thrashing session in one turn
 // instead of looping forever. See poll-loop.ts result-path handler.
-const STALE_SESSION_RE = /no conversation found|ENOENT.*\.jsonl|session.*not found|MCP servers not connected at init|MCP registry lost mid-session|autocompact is thrashing/i;
+const STALE_SESSION_RE =
+  /no conversation found|ENOENT.*\.jsonl|session.*not found|MCP servers not connected at init|MCP registry lost mid-session|autocompact is thrashing/i;
 
 /**
  * Match the synthetic tool_result text the SDK injects when the model
@@ -313,9 +337,7 @@ export function detectMissingMcpTool(
  *
  * Exported for testability, mirroring detectMissingMcpTool.
  */
-export function detectAutocompactThrash(assistantMessage: {
-  message?: { content?: unknown };
-}): string | null {
+export function detectAutocompactThrash(assistantMessage: { message?: { content?: unknown } }): string | null {
   const content = assistantMessage?.message?.content;
   if (!Array.isArray(content)) return null;
   for (const block of content) {
@@ -479,13 +501,12 @@ export class ClaudeProvider implements AgentProvider {
         // tells us all we need) and stop the stream so the poll-loop can
         // clear the continuation and let the host respawn fresh.
         if (!mcpRegistryLostEmitted && message.type === 'user') {
-          const missing = detectMissingMcpTool(
-            message as { message?: { content?: unknown } },
-            requiredServerSet,
-          );
+          const missing = detectMissingMcpTool(message as { message?: { content?: unknown } }, requiredServerSet);
           if (missing) {
             mcpRegistryLostEmitted = true;
-            log(`MCP registry lost mid-session: ${missing.toolName} not in SDK registry — aborting turn for fresh respawn`);
+            log(
+              `MCP registry lost mid-session: ${missing.toolName} not in SDK registry — aborting turn for fresh respawn`,
+            );
             yield { type: 'mcp_tool_missing', toolName: missing.toolName, serverName: missing.serverName };
             return;
           }
@@ -504,8 +525,12 @@ export class ClaudeProvider implements AgentProvider {
         if (message.type === 'assistant') {
           const thrash = detectAutocompactThrash(message as { message?: { content?: unknown } });
           if (thrash) {
-            log('Autocompact thrash detected in assistant message — aborting turn so the outer loop clears the continuation and preserves the batch for a fresh session');
-            throw new Error(`autocompact is thrashing (session too large to compact — resetting): ${thrash.slice(0, 160)}`);
+            log(
+              'Autocompact thrash detected in assistant message — aborting turn so the outer loop clears the continuation and preserves the batch for a fresh session',
+            );
+            throw new Error(
+              `autocompact is thrashing (session too large to compact — resetting): ${thrash.slice(0, 160)}`,
+            );
           }
         }
 

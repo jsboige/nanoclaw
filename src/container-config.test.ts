@@ -93,6 +93,31 @@ describe('resolveGroupTimezone', () => {
 });
 
 describe('parseMcpServerConfig', () => {
+  it('carries the per-server tool-call timeout in MILLISECONDS, unchanged (roo-extensions#1357)', () => {
+    // The SDK's own contract: "Per-server tool-call timeout in milliseconds.
+    // Overrides the MCP_TOOL_TIMEOUT environment variable". A 5-minute budget
+    // is therefore 300000 — and it must reach the stored config as 300000, not
+    // be dropped (unknown field) nor silently rescaled.
+    expect(parseMcpServerConfig({ command: 'npx', args: ['-y', 'mcp-remote'], timeout: 300000 })).toEqual({
+      command: 'npx',
+      args: ['-y', 'mcp-remote'],
+      env: {},
+      timeout: 300000,
+    });
+    expect(parseMcpServerConfig({ url: 'https://mcp.example.com/mcp', timeout: 300000 })).toEqual({
+      type: 'http',
+      url: 'https://mcp.example.com/mcp',
+      timeout: 300000,
+    });
+    // Absent stays absent: no default is invented.
+    expect(parseMcpServerConfig({ command: 'npx' }).timeout).toBeUndefined();
+    // Below the SDK's own 1000 ms floor the value is ignored by the SDK and
+    // would silently fall back to the default — reject instead.
+    for (const bad of [999, 0, -5000, 1.5, '300000', Number.NaN]) {
+      expect(() => parseMcpServerConfig({ command: 'npx', timeout: bad as number })).toThrow();
+    }
+  });
+
   it('preserves stdio config and accepts HTTPS Streamable HTTP config', () => {
     expect(parseMcpServerConfig({ command: 'pnpm', args: ['dlx', 'server'], env: { TOKEN: 'stub' } })).toEqual({
       command: 'pnpm',
@@ -228,6 +253,16 @@ describe('sanitizeStoredMcpServers', () => {
     );
     expect(sanitized.planted).not.toHaveProperty('cwd');
     expect(sanitized.plugin).toMatchObject({ cwd: '${PLUGIN_DATA}/x' });
+  });
+
+  it('survives the read-back path: a stored timeout reaches the materialized config in ms (#1357)', () => {
+    // Stored blob → sanitizeStoredMcpServers → container.json. This is the
+    // value the coordinateur's criterion reads back: 5 minutes = 300000 ms.
+    const out = sanitizeStoredMcpServers(
+      { 'roo-state-manager': { command: 'npx', args: ['-y', 'mcp-remote'], env: {}, timeout: 300000 } },
+      'test-group',
+    );
+    expect(out['roo-state-manager'].timeout).toBe(300000);
   });
 
   it('returns empty on a non-object blob', () => {
