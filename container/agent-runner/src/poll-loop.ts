@@ -353,6 +353,31 @@ export function evaluateMidLifeRotation(args: {
   return { checked: true, reason: probe(continuation) };
 }
 
+/**
+ * [PATCH-myia #52] Batch-boundary twin of `evaluateMidLifeRotation`.
+ *
+ * #41 re-checks the continuation-rotation guard in the idle branch only. A
+ * session that never idles — turns chained as follow-ups into the open
+ * stream, each stream then ended by #27 straight into the next batch — never
+ * runs it: measured 2026-11-25, one transcript rode to 16.6 MB in 11h46 with
+ * zero idle iterations (wedge #7 died at 21 MB). The start of a batch is the
+ * other point where no query holds the live `.jsonl` (the previous stream has
+ * returned, the next query has not started), so the probe's rename-aside is
+ * just as safe there.
+ *
+ * Not throttled: one `stat` per batch is noise, and a batch is exactly the
+ * moment the next turn would resume whatever the transcript has grown to.
+ * `reason` is the non-null rotate reason when a rotation should fire.
+ */
+export function evaluateBatchBoundaryRotation(args: {
+  continuation: string | undefined;
+  probe: ((continuation: string) => string | null) | undefined;
+}): { checked: boolean; reason: string | null } {
+  const { continuation, probe } = args;
+  if (!continuation || !probe) return { checked: false, reason: null };
+  return { checked: true, reason: probe(continuation) };
+}
+
 function log(msg: string): void {
   console.error(`[poll-loop] ${msg}`);
 }
@@ -461,6 +486,13 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
   // rotation guard (0 = never this container). Throttled by
   // ROTATE_CHECK_INTERVAL_MS.
   let lastRotateCheckAt = 0;
+  // [PATCH-myia #41/#52] The provider's transcript-size/age cold-resume
+  // guard, bound once for both re-evaluation points: while idle (#41) and at
+  // each batch boundary (#52).
+  const rotationProbe: ((continuation: string) => string | null) | undefined =
+    config.provider.maybeRotateContinuation
+      ? (c) => config.provider.maybeRotateContinuation!(c, config.cwd)
+      : undefined;
   // [PATCH-myia #29] When we last posted a 🛑 BLOCKED notice (0 = never).
   // Throttles the user-visible message while the MCP chain is flapping.
   let lastBlockedNoticeAt = 0;
@@ -502,14 +534,13 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
       // thrash wedge (#2177; wedge #7 hit 21MB). On a hit, drop the
       // continuation so the next turn starts a fresh transcript — the same
       // reset the manual zombie recovery performs, done pre-emptively.
+      // (#52 covers the sessions that never reach this branch.)
       const rot = evaluateMidLifeRotation({
         continuation,
         nowMs: nowIdle,
         lastCheckMs: lastRotateCheckAt,
         intervalMs: ROTATE_CHECK_INTERVAL_MS,
-        probe: config.provider.maybeRotateContinuation
-          ? (c) => config.provider.maybeRotateContinuation!(c, config.cwd)
-          : undefined,
+        probe: rotationProbe,
       });
       if (rot.checked) lastRotateCheckAt = nowIdle;
       if (rot.reason) {
@@ -538,6 +569,20 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
     // [PATCH-myia #30] Real work this iteration — reset the idle keep-alive
     // budget so the next quiet stretch gets the full IDLE_KEEPALIVE_MS window.
     idleSince = 0;
+
+    // [PATCH-myia #52] Batch-boundary rotation (see
+    // evaluateBatchBoundaryRotation). #41's idle-branch check never runs for
+    // a session that chains its turns, so a transcript can cross the cap and
+    // keep growing from batch to batch. Right here the previous stream has
+    // returned and the next query has not started: no query holds the
+    // `.jsonl`. On a hit, drop the continuation so THIS batch starts a fresh
+    // transcript.
+    const boundary = evaluateBatchBoundaryRotation({ continuation, probe: rotationProbe });
+    if (boundary.reason) {
+      log(`Rotating session at batch boundary — ${boundary.reason}; this batch starts fresh`);
+      clearContinuation(config.providerName);
+      continuation = undefined;
+    }
 
     const ids = messages.map((m) => m.id);
     markProcessing(ids);
