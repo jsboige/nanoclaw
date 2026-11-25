@@ -147,7 +147,7 @@ If none works, document the patch here with justification.
 - **Why:** v2 has no per-group env passthrough mechanism. `container.json:McpServerConfig.env` only applies to MCP subprocesses, not the agent runtime. Several features need host env inside the container:
   - `ANTHROPIC_*` — z.ai credentials read directly by the Claude SDK (bypasses optional OneCLI gateway — see patch #2 notes below)
   - `GH_TOKEN_*` — `multi-identity-github` skill switches `gh auth` per repo owner
-  - `MCP_PROXY_BEARER`, `MCP_TOOL_TIMEOUT_MS` — roo-state-manager HTTP MCP via `mcp-remote` stdio wrapper
+  - `MCP_PROXY_BEARER` — roo-state-manager HTTP MCP via `mcp-remote` stdio wrapper. (`MCP_TOOL_TIMEOUT_MS` is still passed through, but **nothing reads it**: the SDK reads `MCP_TOOL_TIMEOUT` and the per-server `timeout` field — see patch #7.)
   - `ASR_*` — voice-transcription integration (host-side Whisper endpoint)
   - `LOCAL_MEDIUM_*`, `LOCAL_MINI_*` — internal vLLM endpoints
 - **Exit condition:** Upstream adds a `container.json:env` field (per-group env passthrough) or a `src/container-runner.ts` hook for supplementary env.
@@ -468,10 +468,10 @@ If none works, document the patch here with justification.
 
 ### 7. Per-MCP tool timeout
 
-- **Status:** DEFERRED.
-- **Context:** `@anthropic-ai/claude-agent-sdk@0.2.116` has no per-MCP `timeout` field on `McpServerConfig`. Production need: 1800000 ms (30 min) for roo-state-manager dashboard condense (local LLM calls).
-- **Plan:** Open upstream PR on `claude-agent-sdk` adding `McpServerConfig.timeout?: number`. Until merged, long-running MCP tools may hit default 60s timeout.
-- **Workaround:** `MCP_TOOL_TIMEOUT_MS` env var is already passed through to the container via patch #1 for when the SDK surface gains support.
+- **Status:** APPLIED (2026-11-25, jsboige/nanoclaw#85) — criterion 1 of roo-extensions#1357.
+- **Context:** the SDK (`@anthropic-ai/claude-agent-sdk@0.3.197`) exposes `McpServerConfig.timeout` in **milliseconds** ("Per-server tool-call timeout in milliseconds. Overrides the MCP_TOOL_TIMEOUT environment variable"). Our host used to drop the unknown field, and our PreToolUse hook multiplied it by 1000 as if it were seconds.
+- **How to use:** set `timeout` in **milliseconds** on the server entry in `container_configs.mcp_servers` (e.g. `roo-state-manager` 600000 = 10 min, `sk-agent` 300000 = 5 min). Values below the SDK's 1000 ms floor are rejected and the whole server entry is dropped (`sanitizeStoredMcpServers`) — check the unit before writing.
+- **Obsolete:** the `MCP_TOOL_TIMEOUT_MS` env var documented here earlier was never read by anything; do not use it.
 
 ### 8. Docker network per agent_group
 

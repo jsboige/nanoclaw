@@ -123,18 +123,6 @@ class MessageStream {
 }
 
 /**
- * PreToolUse hook factory: record the current tool + its declared timeout so
- * the host sweep can widen its stuck tolerance while a long tool runs. The
- * declared timeout is read from `tool_input.timeout` for Bash, and from the
- * MCP server config for `mcp__<server>__*` tools — without it, an MCP that
- * legitimately takes >30 min racing against the absolute-ceiling kill (see
- * incident 2026-04-26: sk-agent.list_agents hung in mcp-remote bridge,
- * heartbeat stalled, host killed at the same instant the SDK would have
- * timed out internally). Also touches the heartbeat so the kill clock starts
- * fresh from tool start. Defense-in-depth: if SDK_DISALLOWED_TOOLS slips
- * through somehow, block the call here instead of letting the agent hang.
- */
-/**
  * The tool's declared timeout in **milliseconds**, as fed to the tool-stuck
  * watchdog's budget. Bash's `tool_input.timeout` is already ms. An MCP server's
  * `timeout` is also ms — the SDK's own wording: "Per-server tool-call timeout in
@@ -158,6 +146,18 @@ export function declaredToolTimeoutMs(
   return null;
 }
 
+/**
+ * PreToolUse hook factory: record the current tool + its declared timeout so
+ * the host sweep can widen its stuck tolerance while a long tool runs. The
+ * declared timeout is read from `tool_input.timeout` for Bash, and from the
+ * MCP server config for `mcp__<server>__*` tools — without it, an MCP that
+ * legitimately takes >30 min racing against the absolute-ceiling kill (see
+ * incident 2026-04-26: sk-agent.list_agents hung in mcp-remote bridge,
+ * heartbeat stalled, host killed at the same instant the SDK would have
+ * timed out internally). Also touches the heartbeat so the kill clock starts
+ * fresh from tool start. Defense-in-depth: if SDK_DISALLOWED_TOOLS slips
+ * through somehow, block the call here instead of letting the agent hang.
+ */
 function createPreToolUseHook(mcpServers: Record<string, McpServerConfig>): HookCallback {
   return async (input) => {
     const i = input as { tool_name?: string; tool_input?: Record<string, unknown> };
