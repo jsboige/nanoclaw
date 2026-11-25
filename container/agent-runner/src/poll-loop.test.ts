@@ -11,8 +11,10 @@ import {
   GENERIC_FAILURE_NOTICE,
 } from './formatter.js';
 // [PATCH-myia #28] evaluateToolStuckBudget, [PATCH-myia #35] evaluateStaleRetryCap,
-// [PATCH-myia #40] isProviderStatusNoise, [PATCH-myia #41] evaluateMidLifeRotation
+// [PATCH-myia #40] isProviderStatusNoise, [PATCH-myia #41] evaluateMidLifeRotation,
+// [PATCH-myia #52] evaluateBatchBoundaryRotation
 import {
+  evaluateBatchBoundaryRotation,
   evaluateMidLifeRotation,
   evaluateStaleRetryCap,
   evaluateToolStuckBudget,
@@ -1040,6 +1042,60 @@ describe('[PATCH-myia #41] evaluateMidLifeRotation', () => {
       },
     });
     expect(seen).toBe('sess-live-123');
+  });
+});
+
+// [PATCH-myia #52] Batch-boundary twin of #41. #41 lives in the idle branch,
+// and a session that chains its turns (follow-ups pushed into the open
+// stream, then #27 ending the stream straight into the next batch) never
+// idles — measured 2026-11-25: one transcript rode to 16.6 MB in 11h46 with
+// zero idle iterations. The batch start is the other no-active-query point.
+// Same approach as #41: test the pure policy with the probe injected.
+describe('[PATCH-myia #52] evaluateBatchBoundaryRotation', () => {
+  it('does not check when there is no continuation to rotate', () => {
+    const probe = () => 'transcript 21.0MB > 12MB cap';
+    const r = evaluateBatchBoundaryRotation({ continuation: undefined, probe });
+    expect(r).toEqual({ checked: false, reason: null });
+  });
+
+  it('does not check when the provider has no rotation guard', () => {
+    const r = evaluateBatchBoundaryRotation({ continuation: 'sess-a', probe: undefined });
+    expect(r).toEqual({ checked: false, reason: null });
+  });
+
+  it('is not throttled — two back-to-back batches both probe', () => {
+    let calls = 0;
+    const probe = () => {
+      calls++;
+      return null;
+    };
+    evaluateBatchBoundaryRotation({ continuation: 'sess-a', probe });
+    const second = evaluateBatchBoundaryRotation({ continuation: 'sess-a', probe });
+    expect(second).toEqual({ checked: true, reason: null });
+    expect(calls).toBe(2);
+  });
+
+  it('checks but does not rotate when the transcript is under the cap', () => {
+    const r = evaluateBatchBoundaryRotation({ continuation: 'sess-a', probe: () => null });
+    expect(r).toEqual({ checked: true, reason: null });
+  });
+
+  it('surfaces the rotate reason when the transcript is over the cap (the never-idle case)', () => {
+    const reason = 'transcript 16.6MB > 3MB cap';
+    const r = evaluateBatchBoundaryRotation({ continuation: 'sess-a', probe: () => reason });
+    expect(r).toEqual({ checked: true, reason });
+  });
+
+  it('passes the live continuation id to the probe', () => {
+    let seen: string | undefined;
+    evaluateBatchBoundaryRotation({
+      continuation: 'sess-live-456',
+      probe: (c) => {
+        seen = c;
+        return null;
+      },
+    });
+    expect(seen).toBe('sess-live-456');
   });
 });
 
